@@ -1,4 +1,5 @@
 #include "app/App.h"
+#include "app/Headless.h"
 #include "app/SelfTest.h"
 #include "util/Cli.h"
 #include "util/Log.h"
@@ -46,8 +47,7 @@ int main(int argc, char **argv)
 			swe::vkc::Context ctx({.validation = opts.validation, .syncValidation = opts.syncValidation, .forcedGpu = opts.gpu});
 			if (opts.selftest)
 				return swe::runSelfTest(ctx) ? EXIT_SUCCESS : EXIT_FAILURE;
-			swe::log::error("headless mode needs --selftest (solver runs arrive with milestone M1)");
-			return EXIT_FAILURE;
+			return swe::runHeadless(opts, ctx);
 		}
 
 		swe::App app(opts);

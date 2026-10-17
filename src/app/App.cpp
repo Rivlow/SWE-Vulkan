@@ -1,5 +1,7 @@
 #include "app/App.h"
 
+#include "app/Headless.h"
+#include "cases/Cases.h"
 #include "util/Log.h"
 
 #include <GLFW/glfw3.h>
@@ -47,6 +49,12 @@ App::App(Options const &opts) :
 	}
 
 	initImGui();
+
+	auto data = makeCase(opts_.caseName, resolveAssetDir(opts_.assetDir));
+	if (!opts_.scheme.empty())
+		data.scheme = opts_.scheme;
+	solver_ = std::make_unique<Solver>(*ctx_);
+	solver_->load(data);
 }
 
 App::~App()
@@ -55,6 +63,7 @@ App::~App()
 		ctx_->device.waitIdle();
 	shutdownImGui();
 	// Vulkan objects must die before the window/GLFW.
+	solver_.reset();
 	for (auto &f : frames_)
 		f = Frame{};
 	swapchain_.reset();
@@ -155,21 +164,71 @@ void App::drawGui()
 	auto &io = ImGui::GetIO();
 	ImGui::DockSpaceOverViewport(0, nullptr, ImGuiDockNodeFlags_PassthruCentralNode);
 
-	ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_FirstUseEver);
-	ImGui::SetNextWindowSize(ImVec2(340, 180), ImGuiCond_FirstUseEver);
-	if (ImGui::Begin("Contrôles"))
-	{
-		ImGui::TextUnformatted(ctx_->properties.deviceName.data());
-		ImGui::Text("%.1f fps  (%.2f ms)", io.Framerate, 1000.0f / io.Framerate);
-		ImGui::Text("swapchain %ux%u, %u images", swapchain_->extent.width, swapchain_->extent.height, swapchain_->imageCount());
-		ImGui::Separator();
-		ImGui::TextDisabled("Solveur : jalon M1");
-		ImGui::Checkbox("Démo ImGui", &showDemo_);
-	}
-	ImGui::End();
+	if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_Space, false))
+		paused_ = !paused_;
+
+	drawControls();
 
 	if (showDemo_)
 		ImGui::ShowDemoWindow(&showDemo_);
+}
+
+void App::drawControls()
+{
+	auto &io = ImGui::GetIO();
+	ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(360, 330), ImGuiCond_FirstUseEver);
+	if (!ImGui::Begin("Contrôles"))
+	{
+		ImGui::End();
+		return;
+	}
+
+	auto const &c = solver_->caseData();
+	ImGui::Text("t = %.3f s   (%u pas)", scalars_.t, scalars_.n_steps);
+	ImGui::Text("dt = %.2e s   s_max = %.3f m/s", scalars_.dt, scalars_.s_max);
+	ImGui::Text("%.0f pas/s   %.1f fps", stepsPerSec_, io.Framerate);
+	if (!std::isfinite(scalars_.t) || !std::isfinite(scalars_.dt))
+		ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "La simulation a divergé : Reset simulation");
+
+	ImGui::Separator();
+	ImGui::Checkbox("Pause  (Espace)", &paused_);
+	ImGui::SliderInt("Pas / rendu", &stepsPerFrame_, 1, 500, "%d", ImGuiSliderFlags_AlwaysClamp);
+	if (ImGui::Button("Reset simulation"))
+		resetSimulation();
+
+	ImGui::SeparatorText("Schéma numérique");
+	if (ImGui::BeginCombo("Runge-Kutta", schemes().at(solver_->schemeName()).label.c_str()))
+	{
+		for (auto const &[name, tableau] : schemes())
+		{
+			bool selected = name == solver_->schemeName();
+			if (ImGui::Selectable(tableau.label.c_str(), selected) && !selected)
+				solver_->setScheme(name);
+			if (selected)
+				ImGui::SetItemDefaultFocus();
+		}
+		ImGui::EndCombo();
+	}
+	float cfl = static_cast<float>(c.cfl);
+	if (ImGui::SliderFloat("CFL", &cfl, 0.05f, 0.9f, "%.2f"))
+		solver_->setCfl(cfl);
+	float manning = static_cast<float>(c.manning_n);
+	if (ImGui::SliderFloat("Manning n", &manning, 0.0f, 0.1f, "%.3f"))
+		solver_->setManning(manning);
+
+	ImGui::SeparatorText("Cas");
+	ImGui::Text("%s : %u x %u mailles (%.3g m)", c.name.c_str(), c.nx, c.ny, c.dx());
+	ImGui::TextDisabled("%s", ctx_->properties.deviceName.data());
+	ImGui::Checkbox("Démo ImGui", &showDemo_);
+	ImGui::End();
+}
+
+void App::resetSimulation()
+{
+	solver_->reset();
+	scalars_   = {};
+	prevSteps_ = 0;
 }
 
 void App::drawFrame()
@@ -177,6 +236,17 @@ void App::drawFrame()
 	auto &frame = frames_[frameIndex_];
 	if (ctx_->device.waitForFences(*frame.inFlight, vk::True, UINT64_MAX) != vk::Result::eSuccess)
 		throw std::runtime_error("waitForFences failed");
+
+	// The fence covered the solver batch of this slot too: its scalar readback is complete.
+	auto s = solver_->readback(frameIndex_);
+	if (s.n_steps >= prevSteps_ && s.n_steps > 0)
+	{
+		double dtFrame = ImGui::GetIO().DeltaTime;
+		if (dtFrame > 0)
+			stepsPerSec_ = 0.9 * stepsPerSec_ + 0.1 * (s.n_steps - prevSteps_) / dtFrame;
+		prevSteps_ = s.n_steps;
+		scalars_   = s;
+	}
 
 	auto [acquire, imageIndex] = swapchain_->swapchain.acquireNextImage(UINT64_MAX, *frame.imageAvailable, nullptr);
 	if (acquire == vk::Result::eErrorOutOfDateKHR)
@@ -189,16 +259,22 @@ void App::drawFrame()
 
 	recordFrame(frame, imageIndex);
 
+	// One submission, two batches, one fence: [N solver steps + scalar readback] then [frame rendering].
+	std::vector<vk::CommandBufferSubmitInfo> solverCmds;
+	solver_->appendSteps(solverCmds, paused_ ? 0u : static_cast<uint32_t>(stepsPerFrame_), frameIndex_);
+
 	vk::SemaphoreSubmitInfo     waitInfo{.semaphore = *frame.imageAvailable, .stageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput};
 	vk::SemaphoreSubmitInfo     signalInfo{.semaphore = *swapchain_->renderFinished[imageIndex], .stageMask = vk::PipelineStageFlagBits2::eAllCommands};
 	vk::CommandBufferSubmitInfo cbInfo{.commandBuffer = *frame.cmd};
-	ctx_->queue.submit2(vk::SubmitInfo2{.waitSemaphoreInfoCount   = 1,
-	                                    .pWaitSemaphoreInfos      = &waitInfo,
-	                                    .commandBufferInfoCount   = 1,
-	                                    .pCommandBufferInfos      = &cbInfo,
-	                                    .signalSemaphoreInfoCount = 1,
-	                                    .pSignalSemaphoreInfos    = &signalInfo},
-	                    *frame.inFlight);
+	std::array<vk::SubmitInfo2, 2> batches{
+	    vk::SubmitInfo2{.commandBufferInfoCount = static_cast<uint32_t>(solverCmds.size()), .pCommandBufferInfos = solverCmds.data()},
+	    vk::SubmitInfo2{.waitSemaphoreInfoCount   = 1,
+	                    .pWaitSemaphoreInfos      = &waitInfo,
+	                    .commandBufferInfoCount   = 1,
+	                    .pCommandBufferInfos      = &cbInfo,
+	                    .signalSemaphoreInfoCount = 1,
+	                    .pSignalSemaphoreInfos    = &signalInfo}};
+	ctx_->queue.submit2(batches, *frame.inFlight);
 
 	vk::PresentInfoKHR presentInfo{.waitSemaphoreCount = 1,
 	                               .pWaitSemaphores    = &*swapchain_->renderFinished[imageIndex],
