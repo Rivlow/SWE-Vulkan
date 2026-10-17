@@ -97,9 +97,10 @@ void App::drawGui()
 		auto *vp  = ImGui::GetMainViewport();
 		ImVec2 sc = ImGui::GetIO().DisplayFramebufferScale;
 		viewRect_ = glm::vec4(0.0f, 0.0f, vp->Size.x * sc.x, vp->Size.y * sc.y);
-		if (map_)
-			if (auto outcome = map_->takeOutcome())
-				loadImport(std::move(*outcome));
+		if (auto outcome = map_->takeOutcome())
+			loadImport(std::move(*outcome));
+		if (auto edit = map_->takeBedEdit())
+			applyBedEdit(*edit);
 		drawLegend();
 		drawProbeMarkers();
 		return;
@@ -129,20 +130,16 @@ void App::drawGui()
 		drawDisplayPanel();
 	if (showProbes_)
 		drawProbesPanel();
-	if (showEdit_)
-		drawEditPanel();
 	if (showPlots_)
 		drawPlotsPanel();
 	if (showPerf_)
 		drawPerfPanel();
-	if (showMap_)
-	{
-		map_->draw(&showMap_, frameCount_);
-		if (auto outcome = map_->takeOutcome())
-			loadImport(std::move(*outcome));
-		if (auto edit = map_->takeBedEdit())
-			applyBedEdit(*edit);
-	}
+	// the map and the edit tools live inside the Simulation panel (collapsing sections): their requests are
+	// polled here whatever their state
+	if (auto outcome = map_->takeOutcome())
+		loadImport(std::move(*outcome));
+	if (auto edit = map_->takeBedEdit())
+		applyBedEdit(*edit);
 	drawLegend();
 	drawProbeMarkers();
 	if (showHelp_)
@@ -168,20 +165,18 @@ void App::setupDockLayout(unsigned int dockId)
 	ImGui::DockBuilderSetNodeSize(dock, vp->WorkSize);
 
 	ImGuiID center = dock;
-	ImGuiID left   = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.23f, nullptr, &center);
+	ImGuiID left   = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.30f, nullptr, &center);
 	ImGuiID right  = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.24f, nullptr, &center);
 	ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.30f, nullptr, &center);
 	ImGuiID leftBottom;
-	ImGuiID leftTop = ImGui::DockBuilderSplitNode(left, ImGuiDir_Up, 0.42f, nullptr, &leftBottom);
+	ImGuiID leftTop = ImGui::DockBuilderSplitNode(left, ImGuiDir_Up, 0.64f, nullptr, &leftBottom);        // map lives in the top panel
 
 	ImGui::DockBuilderDockWindow(kSimulation, leftTop);
 	ImGui::DockBuilderDockWindow(kDisplay, leftBottom);
 	ImGui::DockBuilderDockWindow(kScheme, leftBottom);
-	ImGui::DockBuilderDockWindow(kEdit, right);
 	ImGui::DockBuilderDockWindow(kProbes, right);
 	ImGui::DockBuilderDockWindow(kPerf, right);
 	ImGui::DockBuilderDockWindow(kPlots, bottom);
-	ImGui::DockBuilderDockWindow("Carte", bottom);
 	ImGui::DockBuilderFinish(dock);
 }
 
@@ -232,10 +227,11 @@ void App::drawMenuBar()
 		ImGui::MenuItem(kScheme, nullptr, &showScheme_);
 		ImGui::MenuItem(kDisplay, nullptr, &showDisplay_);
 		ImGui::MenuItem(kProbes, nullptr, &showProbes_);
-		ImGui::MenuItem(kEdit, nullptr, &showEdit_);
 		ImGui::MenuItem(kPlots, nullptr, &showPlots_);
-		ImGui::MenuItem("Carte (import géographique)", nullptr, &showMap_);
 		ImGui::MenuItem(kPerf, nullptr, &showPerf_);
+		ImGui::Separator();
+		ImGui::MenuItem("Section Carte dépliée", nullptr, &showMap_);
+		ImGui::MenuItem("Section Édition dépliée", nullptr, &showEdit_);
 		ImGui::Separator();
 		if (ImGui::MenuItem("Recadrer la caméra", "Origine"))
 			camera_.reset();
@@ -260,7 +256,8 @@ void App::drawMenuBar()
 
 void App::drawSimulationPanel()
 {
-	if (!ImGui::Begin(kSimulation, &showSimulation_))
+	// the main panel cannot be closed: the map and the edit tools live in it
+	if (!ImGui::Begin(kSimulation, nullptr))
 	{
 		ImGui::End();
 		return;
@@ -317,6 +314,25 @@ void App::drawSimulationPanel()
 	ImGui::Text("Emprise    %s", formatArea(scalars_.wetCells * c.dx() * c.dy()).c_str());
 	ImGui::Text("h max      %.3f m", scalars_.hMax);
 	ImGui::Text("|u| max    %.3f m/s", scalars_.uMax);
+
+	// --- always-present, collapsible sections
+	ImGui::Spacing();
+	ImGui::SetNextItemOpen(showMap_, ImGuiCond_Always);
+	bool mapOpen = ImGui::CollapsingHeader("Import géographique (carte)");
+	if (mapOpen != showMap_)
+		showMap_ = mapOpen;
+	if (mapOpen)
+	{
+		float w = ImGui::GetContentRegionAvail().x;
+		map_->drawEmbedded(frameCount_, std::clamp(w * 0.9f, 240.0f, 700.0f));
+	}
+	ImGui::Spacing();
+	ImGui::SetNextItemOpen(showEdit_, ImGuiCond_Always);
+	bool editOpen = ImGui::CollapsingHeader(kEdit);
+	if (editOpen != showEdit_)
+		showEdit_ = editOpen;
+	if (editOpen)
+		drawEditContents();
 	ImGui::End();
 }
 
@@ -531,14 +547,10 @@ void App::drawProbesPanel()
 	ImGui::End();
 }
 
-// Edit panel: top view, cell selection in the 3D view, water blocks and per-cell zones
-void App::drawEditPanel()
+// Edit section: top view, cell selection in the 3D view, water blocks and per-cell zones
+void App::drawEditContents()
 {
-	if (!ImGui::Begin(kEdit, &showEdit_))
-	{
-		ImGui::End();
-		return;
-	}
+	ImGui::PushID("edit");
 	auto const &c = solver_->caseData();
 	if (ImGui::Button("Vue du dessus"))
 		topView();
@@ -661,8 +673,8 @@ void App::drawEditPanel()
 	ImGui::Checkbox("Eau mince visible", &render_.thinWater);
 	tip("Donne une opacité minimale aux lames d'eau de quelques cm, sinon invisibles");
 	if (caseGeo_)
-		ImGui::TextDisabled("« Enregistrer le cas » (Simulation) garde l'eau initiale et les zones.");
-	ImGui::End();
+		ImGui::TextDisabled("« Enregistrer le cas » (en haut) garde l'eau initiale et les zones.");
+	ImGui::PopID();
 }
 
 void App::drawPlotsPanel()

@@ -55,6 +55,8 @@ class MapPanel
 
 	// ImGui window; `frame` = monotonically increasing frame counter (texture lifetime)
 	void draw(bool *open, uint64_t frame);
+	// Same content inside the current window (collapsing section): toolbar, map of `mapHeight` px, controls below
+	void drawEmbedded(uint64_t frame, float mapHeight);
 
 	// An import finished since the last call (consumed once)
 	std::optional<ImportOutcome> takeOutcome();

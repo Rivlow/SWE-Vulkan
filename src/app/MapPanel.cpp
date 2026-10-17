@@ -285,10 +285,24 @@ void MapPanel::draw(bool *open, uint64_t frame)
 	ImGui::End();
 }
 
+void MapPanel::drawEmbedded(uint64_t frame, float mapHeight)
+{
+	pollJob();
+	collectGarbage(frame);
+	ImGui::PushID("map-embedded");
+	drawToolbar();
+	ImGui::BeginChild("map", ImVec2(0, mapHeight), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	drawMap(frame);
+	ImGui::EndChild();
+	drawSidebar();
+	ImGui::PopID();
+}
+
 void MapPanel::drawToolbar()
 {
 	auto const &layers = tiles_.layers();
-	ImGui::SetNextItemWidth(220);
+	bool        narrow = ImGui::GetContentRegionAvail().x < 760.0f;
+	ImGui::SetNextItemWidth(narrow ? -1.0f : 220.0f);
 	if (ImGui::BeginCombo("##layer", layers[static_cast<size_t>(layer_)].name.c_str()))
 	{
 		for (int k = 0; k < int(layers.size()); ++k)
@@ -296,12 +310,17 @@ void MapPanel::drawToolbar()
 				layer_ = k;
 		ImGui::EndCombo();
 	}
-	ImGui::SameLine();
-	ImGui::SetNextItemWidth(360);
-	bool go = ImGui::InputTextWithHint("##loc", "lat, lon  |  lien Google Maps / OSM  |  x, y Lambert 72", locationText_, sizeof(locationText_),
+	if (!narrow)
+		ImGui::SameLine();
+	ImGui::SetNextItemWidth(narrow ? -60.0f : 360.0f);
+	bool go = ImGui::InputTextWithHint("##loc", "lat, lon | lien Google Maps | x, y L72", locationText_, sizeof(locationText_),
 	                                   ImGuiInputTextFlags_EnterReturnsTrue);
 	ImGui::SameLine();
 	go |= ImGui::Button("Aller");
+	if (narrow)
+		ImGui::NewLine(), ImGui::SameLine(0, 0);
+	else
+		ImGui::SameLine();
 	if (go)
 	{
 		geo::LonLat ll;
@@ -314,7 +333,6 @@ void MapPanel::drawToolbar()
 		else
 			locationError_ = "Position non reconnue";
 	}
-	ImGui::SameLine();
 	if (ImGui::Button(tool_ == Tool::Box ? "Zone : cliquer-glisser sur la carte" : "Tracer une zone"))
 		tool_ = tool_ == Tool::Box ? Tool::None : Tool::Box;
 	if (box_)
@@ -430,6 +448,8 @@ void MapPanel::drawMap(uint64_t frame)
 	ImGui::InvisibleButton("canvas", mapSize_, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
 	bool hovered = ImGui::IsItemHovered();
 	auto &io     = ImGui::GetIO();
+	if (hovered)
+		ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);        // the wheel zooms the map, it must not scroll the panel
 	if (hovered && io.MouseWheel != 0.0f)
 	{
 		// zoom around the cursor

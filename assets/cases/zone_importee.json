@@ -16,21 +16,21 @@
       "wall"
     ]
   },
-  "cell": 2.0,
+  "cell": 10.0,
   "cfl": 0.4,
   "crs": "EPSG:31370",
   "data": "data/zone_importee.npz",
-  "eta_0": 4.962947845458984,
+  "eta_0": 5.003512859344482,
   "label": "zone_importee",
   "manning_n": 0.029999999329447746,
   "origin": [
-    234449.0,
-    145665.0
+    823259.0,
+    -794290.0
   ],
   "orthophoto": "data/zone_importee_ortho.png",
   "render": {
-    "depth_ref": 4.0,
-    "z_scale_0": 4.0
+    "depth_ref": 5.0,
+    "z_scale_0": 5.0
   },
   "scheme": "ssprk2",
   "sources": [
@@ -38,5 +38,6 @@
   ],
   "type": "imported",
   "vertical_datum": "DNG (approx. for foreign sources)",
-  "z_ref": 55.0
+  "z_ref": 6.0,
+  "zones": []
 }

@@ -109,7 +109,7 @@ class App
 	void drawSchemePanel();
 	void drawDisplayPanel();
 	void drawProbesPanel();
-	void drawEditPanel();
+	void drawEditContents();
 	void drawPlotsPanel();
 	void drawPerfPanel();
 	void drawLegend();
