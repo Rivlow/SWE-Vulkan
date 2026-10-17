@@ -4,6 +4,7 @@
 #include "util/Log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <format>
 
@@ -40,7 +41,8 @@ std::vector<SourceReport> TerrainBuilder::probe(BBox const &box, int epsg, Progr
 	{
 		auto        *s = all[k];
 		SourceReport r{.id = s->info().id, .name = s->info().name, .footprint = s->footprintCoverage(box, epsg)};
-		if (fetchCoarse && r.footprint > 0.0)
+		// light probe: only local rasters are read (cheap); online services answer at the import
+		if (fetchCoarse && r.footprint > 0.0 && !s->info().online)
 		{
 			progress.set(float(k) / float(all.size()), "Sondage : " + s->info().name);
 			std::string err;
@@ -79,8 +81,11 @@ ImportResult TerrainBuilder::build(ImportRequest const &req, Progress &progress,
 		{
 			progress.set(float(step) / float(steps), s->info().name);
 			std::string err;
-			Grid        g = s->fetch(req.box, req.cell, req.epsg, progress, &err);
-			r.error       = err;
+			auto        t0 = std::chrono::steady_clock::now();
+			Grid        g  = s->fetch(req.box, req.cell, req.epsg, progress, &err);
+			r.error        = err;
+			log::info("  {:<40} {:.1f} s{}", s->info().name, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+			          err.empty() ? "" : " : " + err);
 			if (!g.v.empty())
 			{
 				r.data        = g.coverage();

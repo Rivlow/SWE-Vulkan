@@ -602,7 +602,7 @@ void MapPanel::drawSidebar()
 			startProbe();
 		ImGui::EndDisabled();
 		ImGui::SameLine();
-		ImGui::TextDisabled("(couverture réelle)");
+		ImGui::TextDisabled("(données locales lues, services en ligne : emprise)");
 		drawSourcesTable();
 
 		ImGui::SeparatorText("Cas");

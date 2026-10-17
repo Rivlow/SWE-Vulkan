@@ -7,8 +7,11 @@
 #include <cpl_vsi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <format>
+#include <mutex>
+#include <thread>
 
 namespace swe::geo {
 
@@ -98,11 +101,32 @@ std::string OgcSource::requestUrl(BBox const &b, uint32_t w, uint32_t h, bool ou
 	return {};
 }
 
+namespace {
+
+// Runs `job(k)` for k in [0, n) on at most `workers` threads (I/O bound: several HTTP requests in flight).
+template <class Job>
+void parallelFor(uint32_t n, unsigned workers, Job const &job)
+{
+	std::atomic<uint32_t>      next{0};
+	std::vector<std::jthread>  threads;
+	unsigned                   count = std::min<unsigned>(std::max(1u, workers), std::max(1u, n));
+	for (unsigned t = 0; t < count; ++t)
+		threads.emplace_back([&] {
+			for (uint32_t k = next.fetch_add(1); k < n; k = next.fetch_add(1))
+				job(k);
+		});
+}
+
+constexpr unsigned kParallelRequests = 6;
+
+}        // namespace
+
 Grid OgcSource::fetch(BBox const &box, double cell, int epsg, Progress &progress, std::string *error)
 {
 	Grid out(box, cell, epsg);
-	// request resolution: never finer than the native product, never coarser than the target
-	double reqRes = std::max(service_.nativeRes, std::min(cell, service_.nativeRes * 4.0));
+	// request resolution: never finer than the native product; twice the target resolution is enough for
+	// the "average" warp onto the grid (cell 5 m -> 2.5 m requested instead of 1 m: 6x fewer bytes)
+	double reqRes = std::max(service_.nativeRes, cell / 2.0);
 	// request box in the server's CRS (hull of the target box) with a margin for the warp
 	BBox   reqBox = transformBox(box, epsg, service_.requestEpsg);
 	double m      = 2.0 * reqRes;
@@ -110,55 +134,106 @@ Grid OgcSource::fetch(BBox const &box, double cell, int epsg, Progress &progress
 	// the server reprojects for us only when the target is Lambert 72 and it supports it
 	bool outputL72 = service_.outputL72 && epsg == EPSG_LAMBERT72;
 
-	// tiling under the pixel limit; a WCS 2.0.1 GetCoverage without scaling returns the native resolution
-	bool     native = service_.protocol == OgcService::Protocol::Wcs201;
-	if (native)
+	// WCS 2.0.1: the scaling extension (SCALEFACTOR) gives the requested resolution; without it (or when the
+	// server rejects it, remembered in scaling_) the answer is at native resolution and tiles must be smaller
+	bool wcs2    = service_.protocol == OgcService::Protocol::Wcs201;
+	bool scaled  = !wcs2 || scaling_.load() != Scaling::Unsupported;
+	if (wcs2 && !scaled)
 		reqRes = service_.nativeRes;
-	double   tileM = service_.maxPixels * reqRes * 0.98;
+	// tiles of at most 1024 px: several moderate requests in parallel finish sooner than one large one
+	double   tileM = std::min(service_.maxPixels, 1024) * reqRes * 0.98;
 	uint32_t tx    = static_cast<uint32_t>(std::ceil(reqBox.width() / tileM));
 	uint32_t ty    = static_cast<uint32_t>(std::ceil(reqBox.height() / tileM));
-	uint32_t total = tx * ty, done = 0;
-	bool     any   = false;
-	for (uint32_t a = 0; a < tx; ++a)
-		for (uint32_t b = 0; b < ty; ++b)
+	uint32_t total = tx * ty;
+
+	std::mutex            mutex;        // out, error
+	std::atomic<uint32_t> done{0};
+	std::atomic<bool>     any{false};
+	int                   srcEpsg = outputL72 ? EPSG_LAMBERT72 : service_.requestEpsg;
+
+	auto fetchTile = [&](BBox const &t, uint32_t w, uint32_t h, double res, bool useScaling, uint32_t k) -> bool {
+		auto url = requestUrl(t, w, h, outputL72);
+		if (wcs2 && useScaling)
+			url += std::format("&SCALEFACTOR={:.6f}", service_.nativeRes / res);
+		auto r = http::get(url);
+		if (!r.ok())
 		{
-			if (progress.cancelled())
-				return {};
-			BBox t{reqBox.xmin + a * tileM, reqBox.ymin + b * tileM, std::min(reqBox.xmin + (a + 1) * tileM, reqBox.xmax),
-			       std::min(reqBox.ymin + (b + 1) * tileM, reqBox.ymax)};
-			auto w   = static_cast<uint32_t>(std::max(1.0, std::round(t.width() / reqRes)));
-			auto h   = static_cast<uint32_t>(std::max(1.0, std::round(t.height() / reqRes)));
-			auto url = requestUrl(t, w, h, outputL72);
-			progress.set(float(done) / float(total), std::format("{} : tuile {}/{}", info_.name, done + 1, total));
-			auto r = http::get(url);
-			++done;
-			if (!r.ok())
-			{
-				if (error)
-					*error = r.error.empty() ? std::format("HTTP {}", r.status) : r.error;
-				continue;
-			}
-			auto tiff = extractTiff(r.body);
-			if (tiff.empty())
-			{
-				// probably an XML exception: keep it short in the log
-				std::string head(r.body.begin(), r.body.begin() + std::min<size_t>(r.body.size(), 300));
-				log::warn("{}: réponse non TIFF: {}", info_.name, head);
-				if (error)
-					*error = "réponse du serveur non exploitable";
-				continue;
-			}
-			std::string err;
-			Grid        part = gridFromBytes(tiff, info_.id, box, cell, epsg, outputL72 ? EPSG_LAMBERT72 : service_.requestEpsg, &err);
-			if (part.v.empty())
-			{
-				log::warn("{}: {}", info_.name, err);
-				continue;
-			}
-			out.fillFrom(part);
-			any = true;
+			std::lock_guard lock(mutex);
+			if (error)
+				*error = r.error.empty() ? std::format("HTTP {}", r.status) : r.error;
+			return false;
 		}
-	if (!any)
+		auto tiff = extractTiff(r.body);
+		if (tiff.empty())
+		{
+			std::string head(r.body.begin(), r.body.begin() + std::min<size_t>(r.body.size(), 300));
+			if (wcs2 && useScaling)
+			{
+				// the server does not implement the scaling extension: native tiles from now on
+				if (scaling_.exchange(Scaling::Unsupported) != Scaling::Unsupported)
+					log::info("{}: pas de mise à l'échelle côté serveur, tuiles natives", info_.name);
+				return false;
+			}
+			log::warn("{}: réponse non TIFF: {}", info_.name, head);
+			std::lock_guard lock(mutex);
+			if (error)
+				*error = "réponse du serveur non exploitable";
+			return false;
+		}
+		if (wcs2 && useScaling)
+			scaling_.store(Scaling::Supported);
+		std::string err;
+		Grid        part = gridFromBytes(tiff, std::format("{}_{}", info_.id, k), box, cell, epsg, srcEpsg, &err);
+		if (part.v.empty())
+		{
+			log::warn("{}: {}", info_.name, err);
+			return false;
+		}
+		std::lock_guard lock(mutex);
+		out.fillFrom(part);
+		any.store(true);
+		return true;
+	};
+
+	auto tileBox = [&](uint32_t k, double tm) {
+		uint32_t a = k % tx, b = k / tx;
+		return BBox{reqBox.xmin + a * tm, reqBox.ymin + b * tm, std::min(reqBox.xmin + (a + 1) * tm, reqBox.xmax),
+		            std::min(reqBox.ymin + (b + 1) * tm, reqBox.ymax)};
+	};
+
+	parallelFor(total, kParallelRequests, [&](uint32_t k) {
+		if (progress.cancelled())
+			return;
+		BBox t = tileBox(k, tileM);
+		auto w = static_cast<uint32_t>(std::max(1.0, std::round(t.width() / reqRes)));
+		auto h = static_cast<uint32_t>(std::max(1.0, std::round(t.height() / reqRes)));
+		fetchTile(t, w, h, reqRes, scaled && wcs2, k);
+		uint32_t d = ++done;
+		progress.set(float(d) / float(total), std::format("{} : tuile {}/{}", info_.name, d, total));
+	});
+
+	// scaling refused by a WCS 2.0.1 server: redo the whole area with native tiles (same code path, no scaling)
+	if (wcs2 && scaled && scaling_.load() == Scaling::Unsupported && !progress.cancelled())
+	{
+		double   nres = service_.nativeRes, ntile = service_.maxPixels * nres * 0.98;
+		uint32_t ntx = static_cast<uint32_t>(std::ceil(reqBox.width() / ntile)), nty = static_cast<uint32_t>(std::ceil(reqBox.height() / ntile));
+		uint32_t ntotal = ntx * nty;
+		done.store(0);
+		parallelFor(ntotal, kParallelRequests, [&](uint32_t k) {
+			if (progress.cancelled())
+				return;
+			uint32_t a = k % ntx, b = k / ntx;
+			BBox t{reqBox.xmin + a * ntile, reqBox.ymin + b * ntile, std::min(reqBox.xmin + (a + 1) * ntile, reqBox.xmax),
+			       std::min(reqBox.ymin + (b + 1) * ntile, reqBox.ymax)};
+			auto w = static_cast<uint32_t>(std::max(1.0, std::round(t.width() / nres)));
+			auto h = static_cast<uint32_t>(std::max(1.0, std::round(t.height() / nres)));
+			fetchTile(t, w, h, nres, false, 100000 + k);
+			uint32_t d = ++done;
+			progress.set(float(d) / float(ntotal), std::format("{} : tuile native {}/{}", info_.name, d, ntotal));
+		});
+	}
+
+	if (progress.cancelled() || !any.load())
 		return {};
 	if (info_.verticalOffset != 0.0f)
 		out.shift(info_.verticalOffset);
@@ -190,28 +265,30 @@ Grid CopernicusSource::fetch(BBox const &box, double cell, int epsg, Progress &p
 	BBox ll = transformBox(box, epsg, EPSG_WGS84);
 	int  lon0 = static_cast<int>(std::floor(ll.xmin)), lon1 = static_cast<int>(std::floor(ll.xmax));
 	int  lat0 = static_cast<int>(std::floor(ll.ymin)), lat1 = static_cast<int>(std::floor(ll.ymax));
-	int  total = (lon1 - lon0 + 1) * (lat1 - lat0 + 1), done = 0;
-	bool any = false;
-	for (int lat = lat0; lat <= lat1; ++lat)
-		for (int lon = lon0; lon <= lon1; ++lon)
+	uint32_t nlon = static_cast<uint32_t>(lon1 - lon0 + 1), total = nlon * static_cast<uint32_t>(lat1 - lat0 + 1);
+	bool     any  = false;
+	// Sequential on purpose: a GDAL /vsicurl read performed in a short-lived thread deadlocks that thread's exit
+	// on Windows (DLL thread-detach, observed with GDAL 3.12 + curl/schannel); the few 1-degree tiles are read
+	// by windowed HTTP range requests and take a second or two each anyway.
+	for (uint32_t k = 0; k < total && !progress.cancelled(); ++k)
+	{
+		int         lon  = lon0 + int(k % nlon), lat = lat0 + int(k / nlon);
+		std::string name = std::format("Copernicus_DSM_COG_10_{}{:02d}_00_{}{:03d}_00_DEM", lat >= 0 ? "N" : "S", std::abs(lat),
+		                               lon >= 0 ? "E" : "W", std::abs(lon));
+		std::string path = std::format("/vsicurl/https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com/{}/{}.tif", name, name);
+		progress.set(float(k) / float(total), std::format("Copernicus : dalle {}", name.substr(23)));
+		std::string err;
+		Grid        part = readWindow(path, box, cell, epsg, &err);
+		if (part.v.empty())
 		{
-			if (progress.cancelled())
-				return {};
-			std::string name = std::format("Copernicus_DSM_COG_10_{}{:02d}_00_{}{:03d}_00_DEM", lat >= 0 ? "N" : "S", std::abs(lat),
-			                               lon >= 0 ? "E" : "W", std::abs(lon));
-			std::string path = std::format("/vsicurl/https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com/{}/{}.tif", name, name);
-			progress.set(float(done) / float(total), std::format("Copernicus : dalle {}", name.substr(23)));
-			std::string err;
-			Grid        part = readWindow(path, box, cell, epsg, &err);
-			++done;
-			if (part.v.empty())
-			{
-				log::info("Copernicus {}: {}", name, err);        // missing tiles over the sea are normal
-				continue;
-			}
-			out.fillFrom(part);
-			any = true;
+			log::info("Copernicus {}: {}", name, err);        // missing tiles over the sea are normal
+			continue;
 		}
+		out.fillFrom(part);
+		any = true;
+	}
+	if (progress.cancelled())
+		return {};
 	if (!any)
 	{
 		if (error)

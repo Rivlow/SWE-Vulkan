@@ -111,6 +111,14 @@ Copernicus 30 m partout ; l'orthophoto vient du service régional (SPW, Flandre,
 le monde, de **Sentinel-2 cloudless** (EOX, 10 m). La carte propose aussi un fond satellite Sentinel-2 mondial.
 Exemple : `swe --import-ll 12.455,41.885,12.505,41.915 --cell 10 --name rome --ortho` (Rome, UTM 33N).
 
+**Vitesse de téléchargement.** Les flux WCS sont interrogés à la résolution utile (la moitié de la maille demandée,
+jamais plus fin que le produit : à 5 m on demande 2,5 m, soit 6 fois moins d'octets qu'à 1 m ; WCS 2.0.1 via
+`SCALEFACTOR`, avec repli automatique sur des tuiles natives si le serveur le refuse), par tuiles de 1024 px au plus,
+six requêtes en parallèle ; les mosaïques d'orthophotos sont téléchargées de la même façon. Le sondage (« Sonder »)
+ne lit plus que les rasters locaux : les services en ligne n'y figurent que par leur emprise. Toutes les réponses
+HTTP sont mises en cache dans `cache/http` (une zone déjà importée se recharge sans réseau). Ordres de grandeur :
+5 × 4,5 km à 5 m en Flandre ≈ 3 s, en NRW ≈ 30 s (serveur plus lent), une dalle Copernicus 1 à 2 s.
+
 La Wallonie n'a **pas de flux d'altitude** : ses services WMS ne servent que des images 8 bits. Le MNT LiDAR
 wallon (1 m 2013-2014, 0,5 m 2021-2022) se télécharge par province sur le portail SPW (zips GeoTIFF, 13 à 43 Go
 pour Liège) et se dépose dans un dossier indexé par « Données locales » ; en attendant, Copernicus 30 m sert de

@@ -35,22 +35,22 @@ std::filesystem::path exeDir()
 	return std::filesystem::current_path();
 }
 
-// Cached transformations between EPSG codes (OGR objects are not cheap to build).
+// Cached transformations between EPSG codes (OGR objects are not cheap to build). One cache per thread:
+// an OGRCoordinateTransformation must not be used concurrently (PROJ contexts are per thread), and the
+// download workers reproject in parallel.
 class Transforms
 {
   public:
 	Transforms() = default;
 	Transforms &operator=(Transforms &&) noexcept
 	{
-		std::lock_guard lock(mutex_);
 		cache_.clear();
 		return *this;
 	}
 
 	OGRCoordinateTransformation *get(int from, int to)
 	{
-		std::lock_guard lock(mutex_);
-		auto            key = std::make_pair(from, to);
+		auto key = std::make_pair(from, to);
 		auto            it  = cache_.find(key);
 		if (it != cache_.end())
 			return it->second.get();
@@ -70,13 +70,12 @@ class Transforms
 	}
 
   private:
-	std::mutex                                                              mutex_;
 	std::map<std::pair<int, int>, std::unique_ptr<OGRCoordinateTransformation>> cache_;
 };
 
 Transforms &transforms()
 {
-	static Transforms t;
+	thread_local Transforms t;
 	return t;
 }
 

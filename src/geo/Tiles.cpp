@@ -12,8 +12,11 @@
 #include "geo/Raster.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <format>
+#include <mutex>
+#include <thread>
 
 namespace swe::geo {
 
@@ -242,34 +245,47 @@ Image fetchMosaic(OrthoService const &s, BBox const &srvBox, double res, std::st
 	out.width  = W;
 	out.height = H;
 	out.rgba.assign(size_t(W) * H * 4, 0);
-	uint32_t const tile = static_cast<uint32_t>(std::min(2048, s.maxPixels));
+	// 1024 px requests in parallel: several moderate requests beat one big one on these servers
+	uint32_t const tile = static_cast<uint32_t>(std::min(1024, s.maxPixels));
 	uint32_t       nx = (W + tile - 1) / tile, ny = (H + tile - 1) / tile;
-	bool           any = false;
-	for (uint32_t ty = 0; ty < ny; ++ty)
-		for (uint32_t tx = 0; tx < nx; ++tx)
-		{
-			uint32_t px0 = tx * tile, py0 = ty * tile;        // py from the top (north)
-			uint32_t w = std::min(tile, W - px0), h = std::min(tile, H - py0);
-			BBox     b{srvBox.xmin + px0 * res, srvBox.ymax - (py0 + h) * res, srvBox.xmin + (px0 + w) * res, srvBox.ymax - py0 * res};
-			auto     resp = http::get(wmsUrl(s.base, s.layer, s.epsg, b, w, h, s.format, s.wms13), true, 120);
-			if (!resp.ok())
-			{
-				if (error)
-					*error = resp.error.empty() ? std::format("HTTP {}", resp.status) : resp.error;
-				continue;
-			}
-			Image part = decodeImage(resp.body);
-			if (part.empty() || part.width != w || part.height != h)
-			{
-				if (error)
-					*error = std::string(s.name) + " : réponse WMS non décodable";
-				continue;
-			}
-			for (uint32_t row = 0; row < h; ++row)
-				std::copy_n(&part.rgba[size_t(row) * w * 4], size_t(w) * 4, &out.rgba[(size_t(py0 + row) * W + px0) * 4]);
-			any = true;
-		}
-	return any ? out : Image{};
+	std::atomic<bool>     any{false};
+	std::atomic<uint32_t> next{0};
+	std::mutex            errMutex;
+	auto                  worker = [&] {
+        for (uint32_t k = next.fetch_add(1); k < nx * ny; k = next.fetch_add(1))
+        {
+            uint32_t tx = k % nx, ty = k / nx;
+            uint32_t px0 = tx * tile, py0 = ty * tile;        // py from the top (north)
+            uint32_t w = std::min(tile, W - px0), h = std::min(tile, H - py0);
+            BBox     b{srvBox.xmin + px0 * res, srvBox.ymax - (py0 + h) * res, srvBox.xmin + (px0 + w) * res, srvBox.ymax - py0 * res};
+            auto     resp = http::get(wmsUrl(s.base, s.layer, s.epsg, b, w, h, s.format, s.wms13), true, 120);
+            if (!resp.ok())
+            {
+                std::lock_guard lock(errMutex);
+                if (error)
+                    *error = resp.error.empty() ? std::format("HTTP {}", resp.status) : resp.error;
+                continue;
+            }
+            Image part = decodeImage(resp.body);
+            if (part.empty() || part.width != w || part.height != h)
+            {
+                std::lock_guard lock(errMutex);
+                if (error)
+                    *error = std::string(s.name) + " : réponse WMS non décodable";
+                continue;
+            }
+            // disjoint pixel rectangles: no lock needed for the copy
+            for (uint32_t row = 0; row < h; ++row)
+                std::copy_n(&part.rgba[size_t(row) * w * 4], size_t(w) * 4, &out.rgba[(size_t(py0 + row) * W + px0) * 4]);
+            any.store(true);
+        }
+	};
+	{
+		std::vector<std::jthread> threads;
+		for (unsigned t = 0; t < std::min<unsigned>(6, std::max(1u, nx * ny)); ++t)
+			threads.emplace_back(worker);
+	}
+	return any.load() ? out : Image{};
 }
 
 bool mostlyBlank(Image const &img)

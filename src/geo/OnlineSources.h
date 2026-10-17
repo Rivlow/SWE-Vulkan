@@ -6,6 +6,8 @@
 // Each request is tiled under the server's pixel limit, cached on disk, warped to the target grid.
 #include "geo/RasterSource.h"
 
+#include <atomic>
+
 namespace swe::geo {
 
 struct OgcService
@@ -35,8 +37,16 @@ class OgcSource : public RasterSource
   private:
 	std::string requestUrl(BBox const &boxReq, uint32_t w, uint32_t h, bool outputL72) const;
 
-	SourceInfo info_;
-	OgcService service_;
+	enum class Scaling
+	{
+		Unknown,
+		Supported,
+		Unsupported,
+	};
+
+	SourceInfo           info_;
+	OgcService           service_;
+	std::atomic<Scaling> scaling_{Scaling::Unknown};        // WCS 2.0.1 scaling extension, learnt at first use
 };
 
 class CopernicusSource : public RasterSource
