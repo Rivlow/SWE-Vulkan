@@ -1,4 +1,5 @@
 #pragma once
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -32,6 +33,9 @@ struct Options
 	double      importCell = 5.0;
 	std::vector<std::string> libraryDirs;
 	std::string importName = "import";
+	bool        importOrtho = false;        // --ortho: also fetch the SPW orthophoto
+	double      importLevel = std::numeric_limits<double>::quiet_NaN();        // --level <m DNG>: still water
+	bool        hideGui     = false;        // --no-gui: 3D view only (F11 toggles)
 	float       zScale         = -1.0f;        // --z-scale (default: case value)
 	bool        help           = false;
 };
@@ -70,6 +74,9 @@ inline Options parseOptions(int argc, char **argv)
 		else if (a == "--cell")              o.importCell = std::stod(next(i));
 		else if (a == "--library")           o.libraryDirs.push_back(next(i));
 		else if (a == "--name")              o.importName = next(i);
+		else if (a == "--ortho")             o.importOrtho = true;
+		else if (a == "--level")             o.importLevel = std::stod(next(i));
+		else if (a == "--no-gui")            o.hideGui = true;
 		else if (a == "--probe")
 		{
 			auto v     = next(i);

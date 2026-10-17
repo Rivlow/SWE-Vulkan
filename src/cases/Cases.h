@@ -21,9 +21,10 @@ CaseData makeCase(std::string const &name, std::string const &assetDir);
 // Geographic origin of an imported case (Lambert 72), when known.
 struct GeoOrigin
 {
-	bool   valid = false;
-	double x0 = 0, y0 = 0;        // lower-left corner (m)
-	double cell = 0;
+	bool        valid = false;
+	double      x0 = 0, y0 = 0;        // lower-left corner (m)
+	double      cell = 0;
+	std::string orthoFile;             // relative to the asset dir, empty if none
 };
 GeoOrigin caseOrigin(std::string const &name, std::string const &assetDir);
 

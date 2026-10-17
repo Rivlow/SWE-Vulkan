@@ -38,6 +38,9 @@ usage: swe [options]
     --library <dir>    folder of local GeoTIFF (SPW DTM / bathymetry), repeatable
     --name <n>         case name                                                 [import]
     --dump <dir>       also write <name>.tif and zb_abs.npy
+    --ortho            also fetch the SPW orthophoto for the drape
+    --level <m>        still water at this elevation (m DNG) as initial state
+  --no-gui             window without panels (F11 toggles)
 )";
 }
 

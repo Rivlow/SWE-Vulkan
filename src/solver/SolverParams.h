@@ -24,7 +24,7 @@ struct SolverParams        // std140 uniform buffer
 	uint32_t nx = 0, ny = 0, n_cells = 0, flags = 0;
 	float    dx = 0, dy = 0, g = 0, cfl_dx = 0;
 	float    h_eps = 0, h_dry = 0, h_dry4 = 0, eps2 = 0;
-	float    g_n2 = 0, _pad0 = 0, _pad1 = 0, _pad2 = 0;
+	float    g_n2 = 0, dt_max = 1e30f, _pad1 = 0, _pad2 = 0;
 	std::array<uint32_t, 4> bc_kind{};        // west, east, south, north
 	std::array<float, 4>    bc_value{};
 };

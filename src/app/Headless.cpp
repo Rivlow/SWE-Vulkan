@@ -2,7 +2,9 @@
 
 #include "cases/Cases.h"
 #include "cases/Npy.h"
+#include "app/Screenshot.h"
 #include "geo/TerrainBuilder.h"
+#include "geo/Tiles.h"
 #include "solver/Solver.h"
 #include "util/Log.h"
 #include "vk/Context.h"
@@ -93,6 +95,14 @@ int runImport(Options const &opts)
 		          r.data < 0 ? std::string("-") : std::format("{:5.1f} %", 100.0 * r.data), r.error.empty() ? "" : "  (" + r.error + ")");
 
 	geo::ImportRequest req{.box = box, .cell = opts.importCell, .name = opts.importName, .label = opts.importName};
+	if (std::isfinite(opts.importLevel))
+	{
+		req.initial = geo::InitialWater::Level;
+		req.level   = opts.importLevel;
+	}
+	double span  = std::max(box.width(), box.height());
+	req.depthRef = span > 5000 ? 5.0 : span > 1000 ? 4.0 : 2.0;
+	req.zScale   = span > 5000 ? 5.0 : span > 1000 ? 4.0 : 2.0;
 	std::string        error;
 	auto               t0  = std::chrono::steady_clock::now();
 	auto               res = builder.build(req, progress, &error);
@@ -114,6 +124,19 @@ int runImport(Options const &opts)
 	for (auto const &r : res.sources)
 		if (r.used)
 			meta.sources.push_back(r.name);
+	if (opts.importOrtho)
+	{
+		std::string err;
+		auto        img = geo::fetchOrthophoto(box, 2048, &err);
+		if (img.empty())
+			log::warn("orthophoto: {}", err);
+		else
+		{
+			meta.orthoFile = "data/" + data.name + "_ortho.png";
+			writePng(std::filesystem::path(resolveAssetDir(opts.assetDir)) / meta.orthoFile, img.rgba.data(), img.width, img.height, false);
+			log::info("orthophoto {}x{} saved", img.width, img.height);
+		}
+	}
 	saveImportedCase(data, meta, resolveAssetDir(opts.assetDir));
 	log::info("case '{}' saved in {}", data.name, resolveAssetDir(opts.assetDir));
 

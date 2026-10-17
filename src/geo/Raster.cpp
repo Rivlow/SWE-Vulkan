@@ -243,6 +243,13 @@ bool readInfo(std::string const &path, RasterInfo &info, std::string *error)
 	}
 	char const *desc = ds->GetDescription();
 	info.description = desc ? desc : "";
+	info.resMetres   = info.resX;
+	if (auto const *srs = ds->GetSpatialRef(); srs && srs->IsGeographic())
+	{
+		// degrees -> metres at the raster's mean latitude
+		double lat     = 0.5 * (info.bounds.ymin + info.bounds.ymax) * 3.14159265358979 / 180.0;
+		info.resMetres = info.resX * 111320.0 * std::cos(lat);
+	}
 	if (info.epsg == EPSG_LAMBERT72)
 		info.boundsL72 = info.bounds;
 	else if (info.epsg != 0)
@@ -285,7 +292,7 @@ Grid readWindow(std::string const &path, BBox const &box, double cell, std::stri
 	BBox     out = target.bounds();
 
 	// Coarsening a fine raster: average; refining: bilinear (smooth relief, no new information)
-	bool        coarsen = cell > 1.5 * std::max(info.resX, 1e-9);
+	bool        coarsen = cell > 1.5 * std::max(info.resMetres, 1e-9);
 	char const *resampling = coarsen ? "average" : "bilinear";
 
 	// GDALWarp to a MEM dataset in Lambert 72 on exactly the target grid

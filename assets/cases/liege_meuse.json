@@ -1,0 +1,44 @@
+{
+  "attributions": [
+    "Source : Service public de Wallonie (SPW)",
+    "© DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved"
+  ],
+  "bc": {
+    "east": [
+      "wall"
+    ],
+    "north": [
+      "wall"
+    ],
+    "south": [
+      "wall"
+    ],
+    "west": [
+      "wall"
+    ]
+  },
+  "cell": 2.0,
+  "cfl": 0.4,
+  "crs": "EPSG:31370",
+  "data": "data/liege_meuse.npz",
+  "eta_0": 8.0,
+  "label": "liege_meuse",
+  "manning_n": 0.03,
+  "origin": [
+    234800.0,
+    145600.0
+  ],
+  "orthophoto": "data/liege_meuse_ortho.png",
+  "render": {
+    "depth_ref": 4.0,
+    "z_scale_0": 4.0
+  },
+  "scheme": "ssprk2",
+  "sources": [
+    "Copernicus DEM GLO-30 (30 m, monde)",
+    "Bathymétrie locale (GeoTIFF)"
+  ],
+  "type": "imported",
+  "vertical_datum": "DNG (approx. for foreign sources)",
+  "z_ref": 52.0
+}

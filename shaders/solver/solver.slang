@@ -51,7 +51,7 @@ void reduce_smax(uint3 tid : SV_DispatchThreadID)
 void finalize_dt()
 {
     float s_max = max(asfloat(scalars[S_SMAX_BITS]), 1e-6f);
-    float dt    = P.cfl_dx / s_max;
+    float dt    = min(P.cfl_dx / s_max, P.dt_max);
     scalars[S_SMAX_BITS] = 0;
     scalars[S_SMAX]      = asuint(s_max);
     scalars[S_DT]        = asuint(dt);

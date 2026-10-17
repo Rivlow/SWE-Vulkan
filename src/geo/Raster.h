@@ -56,7 +56,8 @@ struct RasterInfo
 	int         epsg = 0;      // 0 = unknown / not an EPSG code
 	BBox        bounds;        // in the raster's CRS
 	BBox        boundsL72;     // in Lambert 72
-	double      resX = 0, resY = 0;
+	double      resX = 0, resY = 0;        // in the raster's CRS units (degrees for geographic rasters)
+	double      resMetres = 0;             // approximate ground resolution (m)
 	uint32_t    width = 0, height = 0;
 	float       nodata = std::numeric_limits<float>::quiet_NaN();
 	bool        hasNoData = false;

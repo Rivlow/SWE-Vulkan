@@ -252,6 +252,7 @@ GeoOrigin caseOrigin(std::string const &name, std::string const &assetDir)
 			g.cell  = j["cell"].get<double>();
 			g.valid = true;
 		}
+		g.orthoFile = j.value("orthophoto", std::string{});
 	}
 	catch (std::exception const &)
 	{

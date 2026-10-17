@@ -1,5 +1,8 @@
 #pragma once
+#include "app/MapPanel.h"
 #include "cases/Cases.h"
+#include "geo/LocalLibrary.h"
+#include "geo/TerrainBuilder.h"
 #include "render/Camera.h"
 #include "render/Effects.h"
 #include "render/Renderer.h"
@@ -78,6 +81,7 @@ class App
 	void shutdownImGui();
 	void createTimestamps();
 	void loadCase(std::string const &name);
+	void loadImport(ImportOutcome &&outcome);
 	void resetSimulation();
 	void handleInput();
 	void drawFrame();
@@ -115,6 +119,9 @@ class App
 	std::unique_ptr<Solver>            solver_;
 	std::unique_ptr<Effects>           effects_;
 	std::unique_ptr<Renderer>          renderer_;
+	std::unique_ptr<geo::LocalLibrary>   library_;
+	std::unique_ptr<geo::TerrainBuilder> builder_;
+	std::unique_ptr<MapPanel>            map_;
 	std::array<Frame, kFramesInFlight> frames_;
 	uint32_t                           frameIndex_         = 0;
 	uint64_t                           frameCount_         = 0;
@@ -158,7 +165,8 @@ class App
 	// GUI state
 	std::vector<CaseInfo> caseList_;
 	bool showSimulation_ = true, showScheme_ = true, showDisplay_ = true, showProbes_ = true;
-	bool showPlots_ = true, showPerf_ = false, showHelp_ = false, showDemo_ = false;
+	bool showPlots_ = true, showPerf_ = false, showHelp_ = false, showDemo_ = false, showMap_ = true;
+	bool hideGui_ = false;        // F11: 3D view only
 };
 
 }        // namespace swe

@@ -35,9 +35,10 @@ Renderer::Renderer(vkc::Context const &ctx, Solver const &solver, Effects const 
 	samples_    = (counts & vk::SampleCountFlagBits::e4) ? vk::SampleCountFlagBits::e4 : vk::SampleCountFlagBits::e1;
 
 	auto const graphics = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
-	std::array<vk::DescriptorSetLayoutBinding, 2> bindings{
+	std::array<vk::DescriptorSetLayoutBinding, 3> bindings{
 	    vk::DescriptorSetLayoutBinding{.binding = 0, .descriptorType = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1, .stageFlags = graphics},
-	    vk::DescriptorSetLayoutBinding{.binding = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = graphics}};
+	    vk::DescriptorSetLayoutBinding{.binding = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = graphics},
+	    vk::DescriptorSetLayoutBinding{.binding = 2, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = graphics}};
 	setLayout_ = vk::raii::DescriptorSetLayout(ctx_.device, {.bindingCount = static_cast<uint32_t>(bindings.size()), .pBindings = bindings.data()});
 
 	// set 0 = solver (Q, zb), set 1 = effect fields, set 2 = scene
@@ -45,8 +46,9 @@ Renderer::Renderer(vkc::Context const &ctx, Solver const &solver, Effects const 
 	pipelineLayout_ = vk::raii::PipelineLayout(ctx_.device, {.setLayoutCount = static_cast<uint32_t>(layouts.size()),
 	                                                         .pSetLayouts    = layouts.data()});
 
-	std::array<vk::DescriptorPoolSize, 2> poolSizes{{{vk::DescriptorType::eUniformBuffer, kFrames},
-	                                                 {vk::DescriptorType::eStorageBuffer, kFrames}}};
+	std::array<vk::DescriptorPoolSize, 3> poolSizes{{{vk::DescriptorType::eUniformBuffer, kFrames},
+	                                                 {vk::DescriptorType::eStorageBuffer, kFrames},
+	                                                 {vk::DescriptorType::eCombinedImageSampler, kFrames}}};
 	pool_ = vk::raii::DescriptorPool(ctx_.device, {.flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
 	                                               .maxSets       = kFrames,
 	                                               .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
@@ -68,6 +70,9 @@ Renderer::Renderer(vkc::Context const &ctx, Solver const &solver, Effects const 
 		                                                        .pBufferInfo     = &info},
 		                                nullptr);
 	}
+
+	white_ = vkc::Texture::white(ctx_);
+	writeOrthoDescriptors();
 
 	terrainModule_ = vkc::loadShader(ctx_, "terrain");
 	waterModule_   = vkc::loadShader(ctx_, "water");
@@ -135,9 +140,34 @@ void Renderer::createPipelines()
 	lines_           = vkc::makeGraphicsPipeline(ctx_, d);
 }
 
+void Renderer::writeOrthoDescriptors()
+{
+	auto const &tex = hasOrtho_ ? ortho_ : white_;
+	vk::DescriptorImageInfo info{.sampler = tex.sampler(), .imageView = tex.view(), .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+	for (uint32_t f = 0; f < kFrames; ++f)
+		ctx_.device.updateDescriptorSets(vk::WriteDescriptorSet{.dstSet          = *sets_[f],
+		                                                        .dstBinding      = 2,
+		                                                        .descriptorCount = 1,
+		                                                        .descriptorType  = vk::DescriptorType::eCombinedImageSampler,
+		                                                        .pImageInfo      = &info},
+		                                nullptr);
+}
+
+void Renderer::setOrthophoto(uint32_t width, uint32_t height, uint8_t const *rgba)
+{
+	ctx_.device.waitIdle();
+	hasOrtho_ = rgba != nullptr && width > 0 && height > 0;
+	ortho_    = hasOrtho_ ? vkc::Texture(ctx_, width, height, rgba, true, "orthophoto") : vkc::Texture{};
+	writeOrthoDescriptors();
+}
+
 void Renderer::setCase(CaseData const &c)
 {
 	ctx_.device.waitIdle();
+	// a new case has no orthophoto until the application provides one
+	hasOrtho_ = false;
+	ortho_    = {};
+	writeOrthoDescriptors();
 	S_        = static_cast<float>(10.0 / std::max(c.Lx, c.Ly));
 	depthRef_ = static_cast<float>(c.depth_ref);
 	eta0_     = static_cast<float>(c.eta_0);
@@ -225,7 +255,8 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 	sp.time            = time;
 	sp.Lx              = Lx_;
 	sp.Ly              = Ly_;
-	sp.flags           = flags_;
+	sp.flags           = flags_ | (hasOrtho_ && settings.showOrtho ? SCENE_ORTHO : 0u);
+	sp.ortho_mix       = settings.orthoMix;
 	sp.color_mode      = static_cast<uint32_t>(settings.colorMode);
 	sp.cmap_min        = settings.cmapMin;
 	sp.cmap_max        = settings.cmapMax;

@@ -79,6 +79,44 @@ niveau imposé), le CFL et le Manning se modifient à chaud.
 Note : `vesdre.json` reprend `lake_level = 1000` de `main.py`, ce qui noie tout le bassin (le commentaire du
 Python évoque plutôt ~10 m d'eau sur un lac à 290 m, soit `lake_level ≈ 300`).
 
+## Import géographique (panneau « Carte »)
+
+Choisir une zone sur une carte (tuiles OpenStreetMap ou orthophoto SPW), la sonder, l'importer : le relief le
+plus fin disponible est assemblé par priorité, la bathymétrie SPW des rivières y est fusionnée, une orthophoto
+SPW est drapée sur le terrain, et le cas est sauvé (`assets/cases/<nom>.json` + `assets/data/<nom>.npz` +
+`_ortho.png`) pour un rechargement sans réseau.
+
+| Source | Accès | Résolution | Vertical |
+|---|---|---|---|
+| **MNT / bathymétrie SPW locaux** (dossiers de GeoTIFF ou zips SPW indexés dans « Données locales ») | fichiers | 0,5 – 1 m | DNG |
+| Flandre DHMV II | WCS geo.api.vlaanderen.be | 1 m | TAW ≈ DNG |
+| Pays-Bas AHN4 | WCS PDOK (sortie en Lambert 72) | 0,5 m | NAP → DNG (+2,32 m) |
+| Allemagne NRW DGM1 | WCS geobasis.nrw (sortie en Lambert 72) | 1 m | DHHN2016 → DNG (+2,31 m) |
+| France RGE ALTI | WMS-R IGN (GeoTIFF float) | 1 m | NGF-IGN69 → DNG (+1,82 m) |
+| Monde : Copernicus GLO-30 | COG public S3 (`/vsicurl/`) | 30 m (MNS : bâtiments inclus) | EGM2008 → DNG (≈ +2,3 m) |
+
+La Wallonie n'a **pas de flux d'altitude** : ses services WMS ne servent que des images 8 bits. Le MNT LiDAR
+wallon (1 m 2013-2014, 0,5 m 2021-2022) se télécharge par province sur le portail SPW (zips GeoTIFF, 13 à 43 Go
+pour Liège) et se dépose dans un dossier indexé par « Données locales » ; en attendant, Copernicus 30 m sert de
+repli. La bathymétrie SPW (voies navigables + lacs, 50 cm) est la **seule** source du fond des rivières : le
+LiDAR mesure la surface de l'eau.
+
+Pas de Google Maps : les conditions de Google Maps Platform interdisent de stocker ou d'afficher ses tuiles /
+altitudes hors de leur SDK. Les tuiles OSM sont utilisées selon leur politique (User-Agent, pas de téléchargement
+massif, attribution affichée) ; données SPW sous CC BY 4.0 (« Source : SPW »), DHMV « Bron: Digitaal Vlaanderen »,
+AHN CC0, NRW dl-de/zero, IGN Etalab 2.0, Copernicus avec mention DLR/Airbus/ESA. Les attributions sont écrites
+dans le JSON du cas.
+
+En ligne de commande :
+
+```bat
+swe --import 234800,145600,236400,147200 --cell 2 --library "C:\...\BATHYMETRIE_GEOTIFF_31370_PROV_LIEGE" --name liege --ortho --level 60
+swe --case liege
+```
+
+Validation : `tools\extract_ref.py` (fenêtre rasterio moyennée par blocs) contre `swe --import --dump` :
+écart max 0,9 mm sur la bathymétrie SPW rééchantillonnée à 2 m.
+
 ## Organisation
 
 | Python (`../SWE`)              | C++ / Slang                                        |

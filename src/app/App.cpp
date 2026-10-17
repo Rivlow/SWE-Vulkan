@@ -2,6 +2,8 @@
 
 #include "app/Headless.h"
 #include "app/Screenshot.h"
+#include "geo/Crs.h"
+#include "geo/Tiles.h"
 #include "util/Log.h"
 #include "vk/Pipelines.h"
 
@@ -75,6 +77,16 @@ App::App(Options const &opts) :
 	renderer_->resize(swapchain_->extent);
 	caseList_ = listCases(resolveAssetDir(opts_.assetDir));
 
+	// geographic import
+	geo::init();
+	library_ = std::make_unique<geo::LocalLibrary>();
+	for (auto const &d : opts_.libraryDirs)
+		library_->addFolder(d);
+	if (!opts_.libraryDirs.empty())
+		library_->rescan();
+	builder_ = std::make_unique<geo::TerrainBuilder>(*library_);
+	map_     = std::make_unique<MapPanel>(*ctx_, *builder_);
+
 	loadSettings();        // may change the case, steps per frame and display options
 	loadCase(opts_.caseName);
 	if (opts_.stepsPerFrame > 0)
@@ -85,6 +97,7 @@ App::App(Options const &opts) :
 		render_.z_scale = opts_.zScale;
 	if (opts_.colorMode >= 0)
 		render_.colorMode = static_cast<ColorMode>(std::clamp(opts_.colorMode, 0, 4));
+	hideGui_ = opts_.hideGui;
 	if (!opts_.probes.empty())
 	{
 		auto const &c = solver_->caseData();
@@ -103,8 +116,11 @@ App::~App()
 		w.wait();
 	if (solver_)
 		saveSettings();
+	map_.reset();        // ImGui textures: freed while the backend is alive
 	shutdownImGui();
-	// Vulkan objects must die before the window/GLFW.
+	// Vulkan objects must die before the window/GLFW (the map panel owns ImGui textures: before ImGui shutdown
+	// would be ideal, but its descriptors are freed through the backend which is still alive here).
+	map_.reset();
 	queries_ = nullptr;
 	renderer_.reset();
 	effects_.reset();
@@ -159,7 +175,7 @@ void App::initImGui()
 	info.Device              = *ctx_->device;
 	info.QueueFamily         = ctx_->queueFamily;
 	info.Queue               = *ctx_->queue;
-	info.DescriptorPoolSize  = 64;
+	info.DescriptorPoolSize  = 1024;        // map tiles are ImGui textures
 	info.MinImageCount       = swapchain_->minImageCount;
 	info.ImageCount          = swapchain_->imageCount();
 	info.UseDynamicRendering = true;
@@ -241,6 +257,40 @@ void App::loadCase(std::string const &name)
 	probes_.clear();
 	updateProbeList();
 	resetSimulation();
+	// georeferenced cases: footprint on the map, orthophoto drape
+	auto origin = caseOrigin(name, resolveAssetDir(opts_.assetDir));
+	if (origin.valid && map_)
+		map_->showBox({origin.x0, origin.y0, origin.x0 + data.nx * origin.cell, origin.y0 + data.ny * origin.cell}, true);
+	if (!origin.orthoFile.empty())
+	{
+		std::ifstream f(std::filesystem::path(resolveAssetDir(opts_.assetDir)) / origin.orthoFile, std::ios::binary);
+		std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), {});
+		auto                 img = geo::decodeImage(bytes);
+		if (!img.empty())
+			renderer_->setOrthophoto(img.width, img.height, img.rgba.data());
+		else
+			log::warn("orthophoto {} not readable", origin.orthoFile);
+	}
+}
+
+// A finished geographic import: saved as a case (JSON + npz + orthophoto), then loaded like any other.
+void App::loadImport(ImportOutcome &&o)
+{
+	auto data = geo::TerrainBuilder::toCase(o.result, o.request);
+	ImportMetadata meta{.x0 = o.result.bed.x0, .y0 = o.result.bed.y0, .cell = o.result.bed.cell, .attributions = o.result.attributions};
+	for (auto const &r : o.result.sources)
+		if (r.used)
+			meta.sources.push_back(r.name);
+	auto assets = resolveAssetDir(opts_.assetDir);
+	if (!o.orthophoto.empty())
+	{
+		meta.orthoFile = "data/" + data.name + "_ortho.png";
+		writePng(std::filesystem::path(assets) / meta.orthoFile, o.orthophoto.rgba.data(), o.orthophoto.width, o.orthophoto.height, false);
+	}
+	saveImportedCase(data, meta, assets);
+	caseList_ = listCases(assets);
+	loadCase(data.name);
+	log::info("imported case '{}' ({} x {} cells at {} m)", data.name, data.nx, data.ny, o.result.bed.cell);
 }
 
 void App::resetSimulation()
@@ -351,6 +401,8 @@ void App::handleInput()
 			camera_.reset();
 		if (ImGui::IsKeyPressed(ImGuiKey_F1, false))
 			showHelp_ = !showHelp_;
+		if (ImGui::IsKeyPressed(ImGuiKey_F11, false))
+			hideGui_ = !hideGui_;
 	}
 
 	// Camera, in the 3D view rectangle: normalised cursor with origin bottom-left (as in ui/camera.py)
@@ -595,7 +647,14 @@ void App::loadSettings()
 		showPlots_         = j.value("show_plots", showPlots_);
 		showPerf_          = j.value("show_perf", showPerf_);
 		showProbes_        = j.value("show_probes", showProbes_);
+		showMap_           = j.value("show_map", showMap_);
 		effects_->setTurbidity(j.value("turbidity", false));
+		if (j.contains("map") && map_)
+		{
+			auto const &m = j["map"];
+			map_->setView({m.value("lon", 5.57), m.value("lat", 50.63)}, m.value("zoom", 12.0));
+			map_->setLayer(m.value("layer", 0));
+		}
 	}
 	catch (std::exception const &e)
 	{
@@ -614,7 +673,10 @@ void App::saveSettings() const
 	                 {"turbidity", effects_->turbidity()},
 	                 {"show_plots", showPlots_},
 	                 {"show_perf", showPerf_},
-	                 {"show_probes", showProbes_}};
+	                 {"show_probes", showProbes_},
+	                 {"show_map", showMap_}};
+	if (map_)
+		j["map"] = {{"lon", map_->center().lon}, {"lat", map_->center().lat}, {"zoom", map_->zoom()}, {"layer", map_->layer()}};
 	std::ofstream(settingsPath()) << j.dump(2) << '\n';
 }
 

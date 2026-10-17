@@ -9,6 +9,7 @@ import params;
 
 public static const uint SCENE_LANDCOVER = 1;   // large domains: forests / parcels instead of plain grass
 public static const uint SCENE_OUTSIDE   = 2;   // the `outside` mask is meaningful
+public static const uint SCENE_ORTHO     = 4;   // an orthophoto covers the domain (sampled by terrain.slang)
 
 public static const uint COLOR_REALISTIC = 0;
 public static const uint COLOR_DEPTH     = 1;
@@ -36,12 +37,14 @@ public struct SceneParams           // std140, 160 bytes
     public float    cmap_min;       // colour map range (color_mode != COLOR_REALISTIC)
     public float    cmap_max;
     public float    cmap_opacity;
-    public float    _pad0;
+    public float    ortho_mix;      // 0 = procedural ground, 1 = orthophoto
 };
 
 [[vk::binding(0, 2)]] public ConstantBuffer<SceneParams> SC;
 // cells outside the useful domain (e.g. outside the catchment): greyed out (1 = outside)
 [[vk::binding(1, 2)]] public StructuredBuffer<uint>      outside;
+// orthophoto of the domain, row 0 = north edge; u = x / Lx, v = 1 - y / Ly (physical metres)
+[[vk::binding(2, 2)]] public Sampler2D                   ortho;
 
 public float outside_at(uint k)
 {

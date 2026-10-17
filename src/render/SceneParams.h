@@ -10,6 +10,7 @@ enum SceneFlags : uint32_t
 {
 	SCENE_LANDCOVER = 1,
 	SCENE_OUTSIDE   = 2,
+	SCENE_ORTHO     = 4,
 };
 
 struct SceneParams        // std140 uniform buffer
@@ -21,7 +22,7 @@ struct SceneParams        // std140 uniform buffer
 	float     z_base = 0, time = 0, Lx = 0, Ly = 0;
 	uint32_t  flags = 0, color_mode = 0;
 	float     viewport_w = 1, viewport_h = 1;
-	float     cmap_min = 0, cmap_max = 1, cmap_opacity = 0.9f, _pad0 = 0;
+	float     cmap_min = 0, cmap_max = 1, cmap_opacity = 0.9f, ortho_mix = 0;
 };
 static_assert(sizeof(SceneParams) == 160);
 

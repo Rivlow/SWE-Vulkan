@@ -26,7 +26,7 @@ public struct SolverParams          // std140, 96 bytes
     public float h_dry4;            // h_dry^4
     public float eps2;              // Venkatakrishnan epsilon^2
     public float g_n2;              // g * manning_n^2
-    public float _pad0;
+    public float dt_max;            // cap on the time step (dry domains: s_max -> 0)
     public float _pad1;
     public float _pad2;
     public uint4  bc_kind;          // west, east, south, north: BC_WALL / BC_INFLOW / BC_LEVEL

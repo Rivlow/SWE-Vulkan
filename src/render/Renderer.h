@@ -4,6 +4,7 @@
 #include "render/SceneParams.h"
 #include "vk/Buffer.h"
 #include "vk/Image.h"
+#include "vk/Texture.h"
 
 #include <vulkan/vulkan_raii.hpp>
 
@@ -23,6 +24,8 @@ struct RenderSettings
 	bool      showLines = true;
 	ColorMode colorMode = ColorMode::Realistic;
 	float     cmapMin = 0.0f, cmapMax = 1.0f, cmapOpacity = 0.9f;
+	bool      showOrtho = true;        // when the case has an orthophoto
+	float     orthoMix  = 1.0f;
 	// 3D view rectangle in pixels (the central area left free by the docked panels); empty = whole target
 	glm::vec4 viewport{0.0f};
 };
@@ -38,6 +41,9 @@ class Renderer
 
 	// Rebuilds the per-case resources (index buffer, base depth...). Call after Solver::load.
 	void setCase(CaseData const &data);
+	// Orthophoto covering the whole domain (row 0 = north), or clears it (rgba = nullptr). Waits for the device.
+	void setOrthophoto(uint32_t width, uint32_t height, uint8_t const *rgba);
+	bool hasOrthophoto() const { return hasOrtho_; }
 	// (Re)creates the multisampled colour and depth targets.
 	void resize(vk::Extent2D extent);
 
@@ -73,8 +79,11 @@ class Renderer
 	vk::raii::Pipeline     terrain_ = nullptr, terrainWire_ = nullptr, water_ = nullptr, waterWire_ = nullptr;
 	vk::raii::Pipeline     skirtBed_ = nullptr, skirtWater_ = nullptr, lines_ = nullptr;
 
-	vkc::Image  color_, depth_;
-	vkc::Buffer indices_, outside_;
+	vkc::Image   color_, depth_;
+	vkc::Buffer  indices_, outside_;
+	vkc::Texture ortho_, white_;
+	bool         hasOrtho_ = false;
+	void         writeOrthoDescriptors();
 	uint32_t    indexCount_ = 0, skirtVertexCount_ = 0;
 
 	// case-dependent scene constants

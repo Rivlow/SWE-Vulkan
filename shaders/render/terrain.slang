@@ -97,6 +97,16 @@ float3 terrain_color(TerrainVarying v, float3 n)
     float3 stone = STONE * (0.85f + 0.3f * triplanar_noise(v.disp, n, 6.0f));
     col = lerp(col, stone, sstep(0.75f, 0.45f, n.y));
     col *= 1.0f + 0.15f * min(v.z / SC.depth_ref, 1.0f);
+    // orthophoto drape (geographic imports): real ground cover instead of the procedural one
+    if ((SC.flags & SCENE_ORTHO) != 0 && SC.ortho_mix > 0.0f)
+    {
+        float2 uv  = float2(x / (SC.S * SC.Lx), 1.0f + y / (SC.S * SC.Ly));     // y = -y_phys * S
+        float3 pic = ortho.Sample(uv).rgb;
+        pic = pow(pic, 1.1f) * 1.05f;                                            // a touch of contrast
+        // keep the wet sand under / near the water so the shoreline still reads
+        float3 wetted = lerp(pic, pic * lerp(1.0f, 0.75f, v.wet), shore);
+        col = lerp(col, wetted, SC.ortho_mix);
+    }
     // after the water has passed: darker ground drying slowly, and a light silt deposit over the whole
     // flooded footprint (flood mark)
     float dry = 1.0f - v.wet;

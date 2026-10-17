@@ -41,7 +41,7 @@ void tip(char const *text)
 
 std::string formatTime(double t)
 {
-	if (!std::isfinite(t))
+	if (!std::isfinite(t) || t < 0.0 || t > 1e9)
 		return "—";
 	if (t < 120.0)
 		return std::format("{:.2f} s", t);
@@ -90,6 +90,19 @@ ColorModeInfo const &colorModeInfo(ColorMode m)
 
 void App::drawGui()
 {
+	if (hideGui_)
+	{
+		// presentation mode: the 3D view fills the window, legend and probe markers stay
+		auto *vp  = ImGui::GetMainViewport();
+		ImVec2 sc = ImGui::GetIO().DisplayFramebufferScale;
+		viewRect_ = glm::vec4(0.0f, 0.0f, vp->Size.x * sc.x, vp->Size.y * sc.y);
+		if (map_)
+			if (auto outcome = map_->takeOutcome())
+				loadImport(std::move(*outcome));
+		drawLegend();
+		drawProbeMarkers();
+		return;
+	}
 	drawMenuBar();
 
 	ImGuiID dock = ImGui::DockSpaceOverViewport(0, nullptr, ImGuiDockNodeFlags_PassthruCentralNode);
@@ -119,6 +132,12 @@ void App::drawGui()
 		drawPlotsPanel();
 	if (showPerf_)
 		drawPerfPanel();
+	if (showMap_)
+	{
+		map_->draw(&showMap_, frameCount_);
+		if (auto outcome = map_->takeOutcome())
+			loadImport(std::move(*outcome));
+	}
 	drawLegend();
 	drawProbeMarkers();
 	if (showHelp_)
@@ -156,6 +175,7 @@ void App::setupDockLayout(unsigned int dockId)
 	ImGui::DockBuilderDockWindow(kProbes, right);
 	ImGui::DockBuilderDockWindow(kPerf, right);
 	ImGui::DockBuilderDockWindow(kPlots, bottom);
+	ImGui::DockBuilderDockWindow("Carte", bottom);
 	ImGui::DockBuilderFinish(dock);
 }
 
@@ -207,6 +227,7 @@ void App::drawMenuBar()
 		ImGui::MenuItem(kDisplay, nullptr, &showDisplay_);
 		ImGui::MenuItem(kProbes, nullptr, &showProbes_);
 		ImGui::MenuItem(kPlots, nullptr, &showPlots_);
+		ImGui::MenuItem("Carte (import géographique)", nullptr, &showMap_);
 		ImGui::MenuItem(kPerf, nullptr, &showPerf_);
 		ImGui::Separator();
 		if (ImGui::MenuItem("Recadrer la caméra", "Origine"))
@@ -386,6 +407,16 @@ void App::drawDisplayPanel()
 	}
 
 	ImGui::SeparatorText("Éléments");
+	if (renderer_->hasOrthophoto())
+	{
+		ImGui::Checkbox("Orthophoto", &render_.showOrtho);
+		if (render_.showOrtho)
+		{
+			ImGui::SameLine();
+			ImGui::SetNextItemWidth(-90);
+			ImGui::SliderFloat("mélange", &render_.orthoMix, 0.0f, 1.0f, "%.2f");
+		}
+	}
 	ImGui::Checkbox("Eau", &render_.showWater);
 	ImGui::SameLine(120);
 	ImGui::Checkbox("Maillage", &render_.showMesh);
@@ -679,6 +710,7 @@ void App::drawHelp()
 		row("R", "recommencer");
 		row("Origine", "recadrer la caméra");
 		row("F12", "capture d'écran (captures/)");
+		row("F11", "masquer / afficher l'interface");
 		row("F1", "cette aide");
 		ImGui::SeparatorText("Fenêtres");
 		ImGui::TextWrapped("Les panneaux se déplacent et s'ancrent par leur barre de titre ; la disposition est "

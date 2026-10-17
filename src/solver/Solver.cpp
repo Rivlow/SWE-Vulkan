@@ -198,6 +198,9 @@ void Solver::updateParams()
 	p.h_dry4  = static_cast<float>(std::pow(c.h_dry, 4));
 	p.eps2    = static_cast<float>(std::pow(K_v * std::min(dx, dy) * 10.0 / std::max(c.Lx, c.Ly), 3));
 	p.g_n2    = static_cast<float>(c.g * c.manning_n * c.manning_n);
+	// a (nearly) dry domain has no wave speed: cap dt as if 5 cm of water were present everywhere, so the
+	// first drop of water is resolved and the clock stays meaningful (no effect on the reference cases)
+	p.dt_max  = static_cast<float>(c.cfl * std::min(dx, dy) / std::sqrt(c.g * 0.05));
 	p.flags   = (c.sink.empty() ? 0u : FLAG_SINK) | (c.manning_n > 0.0 ? FLAG_FRICTION : 0u);
 	for (int s = 0; s < 4; ++s)
 	{
