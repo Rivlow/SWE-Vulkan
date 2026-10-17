@@ -8,6 +8,7 @@
   "wall_height": 1.5,
   "manning_n": 0.03,
   "scheme": "ssprk2",
+  "legacy_inflow": true,
   "bc": { "west": ["wall"], "east": ["wall"], "south": ["inflow", 600.0], "north": ["level", "eta_0"] },
   "render": { "depth_ref": 4.0, "z_scale_0": 8.0 }
 }

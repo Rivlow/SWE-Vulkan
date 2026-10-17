@@ -26,6 +26,10 @@ struct RenderSettings
 	float     cmapMin = 0.0f, cmapMax = 1.0f, cmapOpacity = 0.9f;
 	bool      showOrtho = true;        // when the case has an orthophoto
 	float     orthoMix  = 1.0f;
+	bool      thinWater = true;        // minimum opacity for thin films
+	bool      showZones = true;        // tint solver zones
+	// selected cell rectangle (inclusive), none when i1 < i0
+	glm::uvec4 selection{1, 0, 0, 0};
 	// 3D view rectangle in pixels (the central area left free by the docked panels); empty = whole target
 	glm::vec4 viewport{0.0f};
 };

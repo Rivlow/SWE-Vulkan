@@ -123,7 +123,7 @@ float4 terrainFrag(TerrainVarying v) : SV_Target
 {
     float3 n    = normalize(v.n);
     float3 base = terrain_color(v, n);
-    return float4(light(base, n, SC.sun.xyz, 0.55f, 0.75f, v.ao, v.shadow), 1.0f);
+    return float4(overlays(light(base, n, SC.sun.xyz, 0.55f, 0.75f, v.ao, v.shadow), v.disp), 1.0f);
 }
 
 // Wireframe overlay ("Maillage"): position only

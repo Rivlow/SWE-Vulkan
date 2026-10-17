@@ -39,6 +39,16 @@ void OrbitCamera::reset()
 	button_ = 0;
 }
 
+void OrbitCamera::topView(glm::vec3 focalPoint, float extent)
+{
+	float dist = 0.5f * extent / std::tan(0.5f * fovY) * 1.08f;
+	focal      = focalPoint;
+	position   = focalPoint + glm::vec3(0.0f, dist, 0.0f);
+	up         = glm::vec3(0.0f, 0.0f, -1.0f);
+	orthogonaliseUp();
+	button_ = 0;
+}
+
 void OrbitCamera::orthogonaliseUp()
 {
 	glm::vec3 forward = glm::normalize(focal - position);

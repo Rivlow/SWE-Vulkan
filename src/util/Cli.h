@@ -38,6 +38,9 @@ struct Options
 	bool        hideGui     = false;        // --no-gui: 3D view only (F11 toggles)
 	std::string carve;                      // --carve "x1,y1;x2,y2;..." (Lambert 72) with --carve-width/--carve-depth
 	double      carveWidth = 20.0, carveDepth = 2.0;
+	// scripted edits of the loaded case (window): --water i0,j0,i1,j1,depth ; --zone kind,value,i0,j0,i1,j1 ; --top
+	std::vector<std::string> waterBlocks, zoneDefs;
+	bool                     topView = false;
 	float       zScale         = -1.0f;        // --z-scale (default: case value)
 	bool        help           = false;
 };
@@ -82,6 +85,9 @@ inline Options parseOptions(int argc, char **argv)
 		else if (a == "--carve")             o.carve = next(i);
 		else if (a == "--carve-width")       o.carveWidth = std::stod(next(i));
 		else if (a == "--carve-depth")       o.carveDepth = std::stod(next(i));
+		else if (a == "--water")             o.waterBlocks.push_back(next(i));
+		else if (a == "--zone")              o.zoneDefs.push_back(next(i));
+		else if (a == "--top")               o.topView = true;
 		else if (a == "--probe")
 		{
 			auto v     = next(i);

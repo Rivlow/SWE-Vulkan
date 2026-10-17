@@ -41,6 +41,9 @@ usage: swe [options]
     --ortho            also fetch the SPW orthophoto for the drape
     --level <m>        still water at this elevation (m DNG) as initial state
   --no-gui             window without panels (F11 toggles)
+  --top                start with the top view
+  --water i0,j0,i1,j1,h   water block (depth h) on a cell rectangle, repeatable
+  --zone kind,value,i0,j0,i1,j1   per-cell zone (source m3/s | sink | level m DNG), repeatable
 )";
 }
 

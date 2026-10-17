@@ -71,6 +71,11 @@ def main():
         # real data: inflow / level boundaries + Manning (meuse), outlet + 0.48 M cells (vesdre)
         for c in ("meuse", "vesdre"):
             results[f"{c} ssprk2 100"] = validate(exe, c, "ssprk2", 100, args.tol, args.front_cells, args.refresh)
+        # exact inflow on a dry domain: 5 m3/s imposed -> 5 m3/s measured
+        out = ROOT / "out" / "cpp_inflow_test"
+        ok = run([exe, "--headless", "--no-validation", "--case", "inflow_test", "--steps", 3000, "--dump", out]) == 0
+        ok = ok and run([PY, "tools/volume_check.py", out, 5], quiet=False) == 0
+        results["inflow_test dry-start 5 m3/s"] = ok
         print("\n=== summary")
         for k, v in results.items():
             print(f"{'PASS' if v else 'FAIL'}  {k}")

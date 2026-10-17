@@ -121,6 +121,9 @@ WaterOut waterFrag(WaterVarying v)
     float3 tint    = lerp(SHALLOW, DEEP, 1.0f - exp(-h / (0.6f * SC.depth_ref)));
     tint           = lerp(tint, MUD, 0.85f * T);
     float  opacity = 1.0f - exp(-h / (SC.water_clarity * (1.0f - 0.85f * T)));
+    // thin films (a few cm) would be invisible: give them a floor so flooding fronts can be followed
+    if ((SC.flags & SCENE_THIN_WATER) != 0)
+        opacity = max(opacity, 0.45f * sstep(0.002f, 0.03f, h));
     float  shade   = (0.8f + 0.35f * max(dot(n, sun), 0.0f) * sun_vis) * (0.6f + 0.4f * ao);
 
     // sky reflection (Schlick Fresnel) + sun glint (Blinn-Phong), none in the shade
@@ -141,6 +144,14 @@ WaterOut waterFrag(WaterVarying v)
     //     = bed * K + B
     float3 K = (1.0f - fm) * (1.0f - fres) * shade * (1.0f - opacity) * (0.45f + SHALLOW);
     float3 B = (1.0f - fm) * ((1.0f - fres) * shade * opacity * tint + fres * SKY + glint) + fm * foam_col;
+    // selection / zone overlays on the water too (applied to the additive part)
+    int2 c = cell_of(v.disp);
+    if (in_selection(c) || zone_tint(c).a > 0.0f)
+    {
+        float3 over = overlays(B + K * 0.5f, v.disp);
+        B = over;
+        K = K * 0.3f;
+    }
     o.add = float4(B, 1.0f);
     o.mul = float4(K, 0.0f);
     return o;

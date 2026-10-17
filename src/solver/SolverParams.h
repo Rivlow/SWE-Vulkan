@@ -7,9 +7,36 @@ namespace swe {
 
 enum SolverFlags : uint32_t
 {
-	FLAG_SINK     = 1,
+	FLAG_ZONES    = 1,
 	FLAG_INFLOW   = 2,
 	FLAG_FRICTION = 4,
+	FLAG_EXACT_INFLOW = 8,
+};
+
+// Per-cell conditions applied at the end of each step (see params.slang ZONE_*)
+enum class ZoneKind : uint32_t
+{
+	None   = 0,
+	Source = 1,        // discharge (m3/s) spread over the zone
+	Sink   = 2,        // outlet
+	Level  = 3,        // fixed free-surface elevation (relative to z_ref)
+};
+
+struct Zone
+{
+	uint32_t kind   = 0;
+	uint32_t ncells = 0;
+	float    value  = 0;
+	float    _pad   = 0;
+};
+constexpr uint32_t MAX_ZONES = 16;
+
+enum class WaterEdit : uint32_t
+{
+	Depth = 0,        // h = value
+	Level = 1,        // h = max(value - zb, 0)
+	Add   = 2,        // h += value
+	Clear = 3,
 };
 
 enum class BcKind : uint32_t
@@ -24,11 +51,12 @@ struct SolverParams        // std140 uniform buffer
 	uint32_t nx = 0, ny = 0, n_cells = 0, flags = 0;
 	float    dx = 0, dy = 0, g = 0, cfl_dx = 0;
 	float    h_eps = 0, h_dry = 0, h_dry4 = 0, eps2 = 0;
-	float    g_n2 = 0, dt_max = 1e30f, _pad1 = 0, _pad2 = 0;
+	float    g_n2 = 0, dt_max = 1e30f, bc_fill = 0.5f, _pad2 = 0;
 	std::array<uint32_t, 4> bc_kind{};        // west, east, south, north
 	std::array<float, 4>    bc_value{};
+	std::array<float, 4>    bc_zmin{};        // lowest bed elevation of each side
 };
-static_assert(sizeof(SolverParams) == 96);
+static_assert(sizeof(SolverParams) == 112);
 
 struct StagePC             // push constants
 {

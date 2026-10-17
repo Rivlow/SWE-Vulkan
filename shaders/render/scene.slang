@@ -10,6 +10,8 @@ import params;
 public static const uint SCENE_LANDCOVER = 1;   // large domains: forests / parcels instead of plain grass
 public static const uint SCENE_OUTSIDE   = 2;   // the `outside` mask is meaningful
 public static const uint SCENE_ORTHO     = 4;   // an orthophoto covers the domain (sampled by terrain.slang)
+public static const uint SCENE_THIN_WATER = 8;  // keep thin water films visible (minimum opacity)
+public static const uint SCENE_ZONES     = 16;  // tint the cells of the solver zones (sources, sinks, levels)
 
 public static const uint COLOR_REALISTIC = 0;
 public static const uint COLOR_DEPTH     = 1;
@@ -17,7 +19,7 @@ public static const uint COLOR_SPEED     = 2;
 public static const uint COLOR_FROUDE    = 3;
 public static const uint COLOR_ELEVATION = 4;
 
-public struct SceneParams           // std140, 160 bytes
+public struct SceneParams           // std140, 176 bytes
 {
     public float4x4 view_proj;
     public float4   cam_pos;        // xyz
@@ -38,7 +40,49 @@ public struct SceneParams           // std140, 160 bytes
     public float    cmap_max;
     public float    cmap_opacity;
     public float    ortho_mix;      // 0 = procedural ground, 1 = orthophoto
+    public uint4    sel;            // selected cell rectangle i0, j0, i1, j1 (inclusive); i1 < i0 = none
 };
+
+// cell of a display position (terrain / water fragments)
+public int2 cell_of(float3 disp)
+{
+    return int2(int(floor(disp.x / (SC.S * P.dx))), int(floor(-disp.z / (SC.S * P.dy))));
+}
+
+public bool in_selection(int2 c)
+{
+    return SC.sel.z >= SC.sel.x && c.x >= int(SC.sel.x) && c.x <= int(SC.sel.z) && c.y >= int(SC.sel.y) && c.y <= int(SC.sel.w);
+}
+
+// zone tint of a cell (alpha 0 = none)
+public float4 zone_tint(int2 c)
+{
+    if ((SC.flags & SCENE_ZONES) == 0 || c.x < 0 || c.y < 0 || c.x >= int(P.nx) || c.y >= int(P.ny))
+        return float4(0.0f);
+    uint z = cond[idx(uint(c.x), uint(c.y))];
+    if (z == 0)
+        return float4(0.0f);
+    uint kind = zones[min(z - 1, MAX_ZONES - 1)].kind;
+    if (kind == ZONE_SOURCE) return float4(0.25f, 0.55f, 1.0f, 0.45f);
+    if (kind == ZONE_SINK)   return float4(1.0f, 0.3f, 0.2f, 0.45f);
+    if (kind == ZONE_LEVEL)  return float4(0.2f, 0.95f, 0.9f, 0.45f);
+    return float4(0.0f);
+}
+
+// selection + zone overlays applied to a shaded colour
+public float3 overlays(float3 col, float3 disp)
+{
+    int2   c = cell_of(disp);
+    float4 z = zone_tint(c);
+    col = lerp(col, z.rgb, z.a);
+    if (in_selection(c))
+    {
+        // orange tint with a 1-cell border
+        bool border = c.x == int(SC.sel.x) || c.x == int(SC.sel.z) || c.y == int(SC.sel.y) || c.y == int(SC.sel.w);
+        col = lerp(col, float3(1.0f, 0.6f, 0.15f), border ? 0.85f : 0.3f);
+    }
+    return col;
+}
 
 [[vk::binding(0, 2)]] public ConstantBuffer<SceneParams> SC;
 // cells outside the useful domain (e.g. outside the catchment): greyed out (1 = outside)

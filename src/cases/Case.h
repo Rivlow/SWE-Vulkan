@@ -34,6 +34,9 @@ struct CaseData
 	double      manning_n = 0.0;
 	std::string scheme    = "ssprk2";
 	std::array<BoundaryCondition, 4> bc{};        // west, east, south, north
+	// inflow sides: false = mass flux exactly the imposed discharge (default); true = HLLC flux of the ghost
+	// state as in the Python reference (used to validate against it)
+	bool legacyInflow = false;
 
 	// rendering hints
 	double eta_0     = 1.0;
@@ -43,8 +46,19 @@ struct CaseData
 	// fields
 	std::vector<float>    zb;           // bed elevation
 	std::vector<float>    h0, hu0, hv0; // initial state
-	std::vector<uint32_t> sink;         // outlet cells (empty = none)
+	std::vector<uint32_t> sink;         // outlet cells (empty = none) - legacy, converted to a Sink zone on load
 	std::vector<uint8_t>  outside;      // cells outside the useful domain, rendering only (empty = none)
+
+	// per-cell conditions: zones[k] applies to cells with zoneMask == k + 1 (empty = none)
+	struct ZoneDef
+	{
+		ZoneKind    kind = ZoneKind::Source;
+		double      value = 0.0;        // m3/s (source) or elevation relative to z_ref (level)
+		std::string label;
+		uint32_t    i0 = 0, j0 = 0, i1 = 0, j1 = 0;        // rectangle used to create it (GUI)
+	};
+	std::vector<ZoneDef>  zones;
+	std::vector<uint8_t>  zoneMask;
 
 	size_t cells() const { return size_t(nx) * ny; }
 };

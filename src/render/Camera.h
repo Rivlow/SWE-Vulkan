@@ -14,6 +14,8 @@ class OrbitCamera
 
 	void reset();
 	void setHome(glm::vec3 position, glm::vec3 focal, glm::vec3 up = {0, 1, 0});
+	// Straight down onto `focal`, north (display -Z) at the top of the screen, `extent` display units visible
+	void topView(glm::vec3 focalPoint, float extent);
 
 	// cursor in normalised window coordinates, origin bottom-left (like ti.ui get_cursor_pos);
 	// button: 0 none, 1 left, 2 middle; blocked: the drag would start on the GUI

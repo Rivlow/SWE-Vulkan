@@ -255,8 +255,10 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 	sp.time            = time;
 	sp.Lx              = Lx_;
 	sp.Ly              = Ly_;
-	sp.flags           = flags_ | (hasOrtho_ && settings.showOrtho ? SCENE_ORTHO : 0u);
+	sp.flags           = flags_ | (hasOrtho_ && settings.showOrtho ? SCENE_ORTHO : 0u) | (settings.thinWater ? SCENE_THIN_WATER : 0u) |
+	                     (settings.showZones ? SCENE_ZONES : 0u);
 	sp.ortho_mix       = settings.orthoMix;
+	sp.sel             = settings.selection;
 	sp.color_mode      = static_cast<uint32_t>(settings.colorMode);
 	sp.cmap_min        = settings.cmapMin;
 	sp.cmap_max        = settings.cmapMax;

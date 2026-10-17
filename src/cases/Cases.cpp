@@ -19,6 +19,9 @@ namespace swe {
 namespace fs = std::filesystem;
 using nlohmann::json;
 
+void readZones(CaseData &c, json const &j, std::map<std::string, npy::Array> const &npz);
+json zonesJson(CaseData const &c);
+
 namespace {
 
 constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
@@ -38,6 +41,7 @@ void readCommon(CaseData &c, json const &j)
 	c.manning_n = j.value("manning_n", 0.0);
 	c.cfl       = j.value("cfl", 0.4);
 	c.scheme    = j.value("scheme", std::string("ssprk2"));
+	c.legacyInflow = j.value("legacy_inflow", false);
 	if (j.contains("render"))
 	{
 		c.depth_ref = j["render"].value("depth_ref", 1.0);
@@ -232,9 +236,66 @@ void buildImported(CaseData &c, json const &j, fs::path const &assets)
 	}
 	if (c.h0.size() != c.cells() || (!c.outside.empty() && c.outside.size() != c.cells()))
 		throw std::runtime_error("imported: inconsistent array sizes");
+	readZones(c, j, npz);
 }
 
 }        // namespace
+
+// "zones": [{"kind": "source|sink|level", "value": 12.5, "label": "...", "rect": [i0, j0, i1, j1]}, ...]
+// + npz "zones_mask" (uint8, zone index + 1 per cell)
+void readZones(CaseData &c, json const &j, std::map<std::string, npy::Array> const &npz)
+{
+	c.zones.clear();
+	c.zoneMask.clear();
+	if (!j.contains("zones"))
+		return;
+	for (auto const &z : j["zones"])
+	{
+		CaseData::ZoneDef d;
+		auto kind = z.value("kind", "source");
+		d.kind    = kind == "sink" ? ZoneKind::Sink : kind == "level" ? ZoneKind::Level : ZoneKind::Source;
+		d.value   = z.value("value", 0.0);
+		d.label   = z.value("label", kind);
+		if (z.contains("rect") && z["rect"].size() == 4)
+		{
+			d.i0 = z["rect"][0];
+			d.j0 = z["rect"][1];
+			d.i1 = z["rect"][2];
+			d.j1 = z["rect"][3];
+		}
+		c.zones.push_back(d);
+	}
+	if (npz.count("zones_mask"))
+	{
+		auto m = npz.at("zones_mask").asFloat();
+		if (m.size() == c.cells())
+		{
+			c.zoneMask.resize(m.size());
+			for (size_t k = 0; k < m.size(); ++k)
+				c.zoneMask[k] = static_cast<uint8_t>(m[k]);
+		}
+	}
+	if (c.zoneMask.empty() && !c.zones.empty())
+	{
+		// rebuild from the rectangles
+		c.zoneMask.assign(c.cells(), 0);
+		for (size_t z = 0; z < c.zones.size(); ++z)
+			for (uint32_t i = c.zones[z].i0; i <= std::min(c.zones[z].i1, c.nx - 1); ++i)
+				for (uint32_t jj = c.zones[z].j0; jj <= std::min(c.zones[z].j1, c.ny - 1); ++jj)
+					c.zoneMask[size_t(i) * c.ny + jj] = static_cast<uint8_t>(z + 1);
+	}
+}
+
+json zonesJson(CaseData const &c)
+{
+	json arr = json::array();
+	for (auto const &z : c.zones)
+		arr.push_back({{"kind", z.kind == ZoneKind::Sink ? "sink" : z.kind == ZoneKind::Level ? "level" : "source"},
+		               {"value", z.value},
+		               {"label", z.label},
+		               {"rect", {z.i0, z.j0, z.i1, z.j1}}});
+	return arr;
+}
 
 GeoOrigin caseOrigin(std::string const &name, std::string const &assetDir)
 {
@@ -271,6 +332,8 @@ void saveImportedCase(CaseData const &c, ImportMetadata const &meta, std::string
 	arrays["h0"] = npy::makeArray(c.h0, {c.nx, c.ny});
 	if (!c.outside.empty())
 		arrays["outside"] = npy::makeArray(c.outside, {c.nx, c.ny});
+	if (!c.zoneMask.empty())
+		arrays["zones_mask"] = npy::makeArray(c.zoneMask, {c.nx, c.ny});
 	npy::saveNpz(assets / "data" / (c.name + ".npz"), arrays);
 
 	static char const *sides[4] = {"west", "east", "south", "north"};
@@ -299,7 +362,8 @@ void saveImportedCase(CaseData const &c, ImportMetadata const &meta, std::string
 	       {"bc", bc},
 	       {"render", {{"depth_ref", c.depth_ref}, {"z_scale_0", c.z_scale_0}}},
 	       {"sources", meta.sources},
-	       {"attributions", meta.attributions}};
+	       {"attributions", meta.attributions},
+	       {"zones", zonesJson(c)}};
 	if (!meta.orthoFile.empty())
 		j["orthophoto"] = meta.orthoFile;
 	std::ofstream(assets / "cases" / (c.name + ".json")) << j.dump(2) << '\n';
@@ -318,7 +382,10 @@ void updateImportedCase(CaseData const &c, std::string const &assetDir)
 	arrays["h0"] = npy::makeArray(c.h0, {c.nx, c.ny});
 	if (!c.outside.empty())
 		arrays["outside"] = npy::makeArray(c.outside, {c.nx, c.ny});
+	if (!c.zoneMask.empty())
+		arrays["zones_mask"] = npy::makeArray(c.zoneMask, {c.nx, c.ny});
 	npy::saveNpz(assets / j.at("data").get<std::string>(), arrays);
+	j["zones"] = zonesJson(c);
 
 	static char const *sides[4] = {"west", "east", "south", "north"};
 	json               bc;

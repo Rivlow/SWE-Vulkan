@@ -1,0 +1,12 @@
+{
+  "label": "Test : débit entrant sur un domaine sec",
+  "comment": "Bosse analytique, domaine sec (eta_0 = 0), 5 m3/s entrant par l'ouest : le volume doit croître de 5 m3/s.",
+  "type": "dam_break",
+  "nx": 250, "ny": 250,
+  "Lx": 10.0, "Ly": 10.0,
+  "eta_0": 0.0,
+  "manning_n": 0.0,
+  "scheme": "ssprk2",
+  "bc": { "west": ["inflow", 5.0], "east": ["wall"], "south": ["wall"], "north": ["wall"] },
+  "render": { "depth_ref": 1.0, "z_scale_0": 2.0 }
+}

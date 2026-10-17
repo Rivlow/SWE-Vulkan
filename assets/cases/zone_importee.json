@@ -1,0 +1,42 @@
+{
+  "attributions": [
+    "© DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved"
+  ],
+  "bc": {
+    "east": [
+      "wall"
+    ],
+    "north": [
+      "wall"
+    ],
+    "south": [
+      "wall"
+    ],
+    "west": [
+      "wall"
+    ]
+  },
+  "cell": 2.0,
+  "cfl": 0.4,
+  "crs": "EPSG:31370",
+  "data": "data/zone_importee.npz",
+  "eta_0": 4.962947845458984,
+  "label": "zone_importee",
+  "manning_n": 0.029999999329447746,
+  "origin": [
+    234449.0,
+    145665.0
+  ],
+  "orthophoto": "data/zone_importee_ortho.png",
+  "render": {
+    "depth_ref": 4.0,
+    "z_scale_0": 4.0
+  },
+  "scheme": "ssprk2",
+  "sources": [
+    "Copernicus DEM GLO-30 (30 m, monde)"
+  ],
+  "type": "imported",
+  "vertical_datum": "DNG (approx. for foreign sources)",
+  "z_ref": 55.0
+}

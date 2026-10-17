@@ -8,6 +8,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace swe {
@@ -19,10 +20,10 @@ constexpr uint32_t kLine = 256;       // [numthreads(256, 1, 1)]
 
 constexpr char const *kEntries[] = {"reduce_smax",  "finalize_dt", "flux_x",          "flux_y",       "source",
                                     "bc_inflow_norm", "bc_fluxes", "residual",        "combine_fix_dry", "final_update",
-                                    "diag_partial", "diag_final",  "probes"};
+                                    "diag_partial", "diag_final",  "probes",          "set_water"};
 
 // binding -> descriptor type (see shaders/solver/params.slang)
-constexpr uint32_t kBindings = 15;
+constexpr uint32_t kBindings = 16;
 
 vk::DescriptorType bindingType(uint32_t b)
 {
@@ -123,13 +124,22 @@ void Solver::allocate()
 	G_D_     = vkc::Buffer::storage(ctx_, gy * f4, "G_D");
 	G_U_     = vkc::Buffer::storage(ctx_, gy * f4, "G_U");
 	S_b_     = vkc::Buffer::storage(ctx_, n * sizeof(float) * 2, "S_b");
-	sink_    = vkc::Buffer::storage(ctx_, std::max<vk::DeviceSize>(case_.sink.size(), 1) * sizeof(uint32_t), "sink");
+	// legacy outlet mask -> a Sink zone
+	if (!case_.sink.empty() && case_.zones.empty())
+	{
+		case_.zones.push_back({.kind = ZoneKind::Sink, .label = "exutoire"});
+		case_.zoneMask.assign(n, 0);
+		for (size_t k = 0; k < n && k < case_.sink.size(); ++k)
+			case_.zoneMask[k] = case_.sink[k] ? 1 : 0;
+	}
+	sink_    = vkc::Buffer::storage(ctx_, n * sizeof(uint32_t), "cond");
+	zones_   = vkc::Buffer::storage(ctx_, MAX_ZONES * sizeof(Zone), "zones");
 	inflow_  = vkc::Buffer::storage(ctx_, 4 * sizeof(float), "inflow_norm");
 	diag_    = vkc::Buffer::storage(ctx_, vk::DeviceSize(vkc::divUp(case_.ny, kTile)) * vkc::divUp(case_.nx, kTile) * f4, "diag");
 
 	// Deterministic content everywhere (never-written boundary face slots included).
 	ctx_.oneShot([&](vk::raii::CommandBuffer &cb) {
-		for (auto *b : {&scalars_, &zb_, &Q_, &Q_old_, &K_, &F_L_, &F_R_, &G_D_, &G_U_, &S_b_, &sink_, &inflow_, &diag_})
+		for (auto *b : {&scalars_, &zb_, &Q_, &Q_old_, &K_, &F_L_, &F_R_, &G_D_, &G_U_, &S_b_, &sink_, &zones_, &inflow_, &diag_})
 			cb.fillBuffer(b->handle(), 0, vk::WholeSize, 0);
 	});
 	setProbes({});
@@ -139,7 +149,7 @@ void Solver::writeDescriptors()
 {
 	std::array<vkc::Buffer const *, kBindings> buffers{&paramsBuf_, &scalars_, &zb_,    &Q_,     &Q_old_,
 	                                                   &K_,         &F_L_,     &F_R_,   &G_D_,   &G_U_,
-	                                                   &S_b_,       &sink_,    &inflow_, &probeBuf_, &diag_};
+	                                                   &S_b_,       &sink_,    &inflow_, &probeBuf_, &diag_, &zones_};
 	std::array<vk::DescriptorBufferInfo, kBindings> infos;
 	std::array<vk::WriteDescriptorSet, kBindings>   writes;
 	for (uint32_t b = 0; b < kBindings; ++b)
@@ -166,11 +176,79 @@ void Solver::uploadInitialState()
 	}
 	Q_.upload(ctx_, q.data(), q.size() * sizeof(float));
 	zb_.upload(ctx_, case_.zb.data(), n * sizeof(float));
-	if (!case_.sink.empty())
-		sink_.upload(ctx_, case_.sink.data(), case_.sink.size() * sizeof(uint32_t));
+	uploadZones();
 	ctx_.oneShot([&](vk::raii::CommandBuffer &cb) { cb.fillBuffer(scalars_.handle(), 0, vk::WholeSize, 0); });
 	for (auto &r : readback_)
 		std::memset(r.mapped(), 0, r.size());
+}
+
+void Solver::uploadZones()
+{
+	size_t const          n = case_.cells();
+	std::vector<uint32_t> mask(n, 0);
+	std::array<Zone, MAX_ZONES> table{};
+	size_t                nz = std::min<size_t>(case_.zones.size(), MAX_ZONES);
+	if (case_.zoneMask.size() == n)
+		for (size_t k = 0; k < n; ++k)
+		{
+			uint32_t z = case_.zoneMask[k];
+			if (z >= 1 && z <= nz)
+			{
+				mask[k] = z;
+				++table[z - 1].ncells;
+			}
+		}
+	for (size_t z = 0; z < nz; ++z)
+	{
+		table[z].kind  = static_cast<uint32_t>(case_.zones[z].kind);
+		table[z].value = static_cast<float>(case_.zones[z].value);
+	}
+	sink_.upload(ctx_, mask.data(), n * sizeof(uint32_t));
+	zones_.upload(ctx_, table.data(), sizeof(table));
+}
+
+void Solver::setZones(std::vector<CaseData::ZoneDef> const &zones, std::vector<uint8_t> const &mask)
+{
+	ctx_.device.waitIdle();
+	case_.zones    = zones;
+	case_.zoneMask = mask;
+	uploadZones();
+	updateParams();        // FLAG_ZONES
+}
+
+void Solver::editWater(uint32_t i0, uint32_t j0, uint32_t i1, uint32_t j1, WaterEdit mode, float value, bool alsoInitial)
+{
+	ctx_.device.waitIdle();
+	i1 = std::min(i1, case_.nx - 1);
+	j1 = std::min(j1, case_.ny - 1);
+	if (i0 > i1 || j0 > j1)
+		return;
+	StagePC pc{};
+	pc.stage   = static_cast<uint32_t>(mode);
+	pc.n_coefs = 5;
+	pc.coef    = {float(i0), float(j0), float(i1), float(j1), value, 0, 0, 0};
+	ctx_.oneShot([&](vk::raii::CommandBuffer &cb) {
+		cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipelineLayout_, 0, *set_, nullptr);
+		pushStage(cb, pc);
+		dispatchGrid(cb, "set_water");
+	});
+	if (alsoInitial)
+		for (uint32_t i = i0; i <= i1; ++i)
+			for (uint32_t j = j0; j <= j1; ++j)
+			{
+				auto  k = size_t(i) * case_.ny + j;
+				float h = case_.h0[k];
+				switch (mode)
+				{
+				case WaterEdit::Depth: h = value; break;
+				case WaterEdit::Level: h = std::max(value - case_.zb[k], 0.0f); break;
+				case WaterEdit::Add: h = std::max(h + value, 0.0f); break;
+				case WaterEdit::Clear: h = 0.0f; break;
+				}
+				case_.h0[k]  = h;
+				case_.hu0[k] = 0.0f;
+				case_.hv0[k] = 0.0f;
+			}
 }
 
 void Solver::reset()
@@ -201,11 +279,25 @@ void Solver::updateParams()
 	// a (nearly) dry domain has no wave speed: cap dt as if 5 cm of water were present everywhere, so the
 	// first drop of water is resolved and the clock stays meaningful (no effect on the reference cases)
 	p.dt_max  = static_cast<float>(c.cfl * std::min(dx, dy) / std::sqrt(c.g * 0.05));
-	p.flags   = (c.sink.empty() ? 0u : FLAG_SINK) | (c.manning_n > 0.0 ? FLAG_FRICTION : 0u);
+	p.flags   = (c.zones.empty() ? 0u : FLAG_ZONES) | (c.manning_n > 0.0 ? FLAG_FRICTION : 0u) |
+	            (c.legacyInflow ? 0u : FLAG_EXACT_INFLOW);
+	// lowest bed point of each side: a dry inflow side feeds the cells near it (river channel)
+	auto sideMin = [&](int s) {
+		float m = std::numeric_limits<float>::infinity();
+		if (s < 2)
+			for (uint32_t j = 0; j < c.ny; ++j)
+				m = std::min(m, c.zb[size_t(s == 0 ? 0 : c.nx - 1) * c.ny + j]);
+		else
+			for (uint32_t i = 0; i < c.nx; ++i)
+				m = std::min(m, c.zb[size_t(i) * c.ny + (s == 2 ? 0 : c.ny - 1)]);
+		return std::isfinite(m) ? m : 0.0f;
+	};
+	p.bc_fill = 0.5f;
 	for (int s = 0; s < 4; ++s)
 	{
 		p.bc_kind[s]  = static_cast<uint32_t>(c.bc[s].kind);
 		p.bc_value[s] = static_cast<float>(c.bc[s].value);
+		p.bc_zmin[s]  = sideMin(s);
 		if (c.bc[s].kind == BcKind::Inflow)
 			p.flags |= FLAG_INFLOW;
 	}

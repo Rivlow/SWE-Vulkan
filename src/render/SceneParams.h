@@ -11,6 +11,8 @@ enum SceneFlags : uint32_t
 	SCENE_LANDCOVER = 1,
 	SCENE_OUTSIDE   = 2,
 	SCENE_ORTHO     = 4,
+	SCENE_THIN_WATER = 8,
+	SCENE_ZONES     = 16,
 };
 
 struct SceneParams        // std140 uniform buffer
@@ -23,8 +25,9 @@ struct SceneParams        // std140 uniform buffer
 	uint32_t  flags = 0, color_mode = 0;
 	float     viewport_w = 1, viewport_h = 1;
 	float     cmap_min = 0, cmap_max = 1, cmap_opacity = 0.9f, ortho_mix = 0;
+	glm::uvec4 sel{1, 0, 0, 0};        // i0, j0, i1, j1 inclusive; i1 < i0 = none
 };
-static_assert(sizeof(SceneParams) == 160);
+static_assert(sizeof(SceneParams) == 176);
 
 enum class ColorMode : uint32_t
 {

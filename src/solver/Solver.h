@@ -38,6 +38,12 @@ class Solver
 	// Cells (index i * ny + j) whose state is read back each frame, at most MAX_PROBES. Waits for the device.
 	void setProbes(std::vector<uint32_t> const &cells);
 
+	// Interactive editing (waits for the device):
+	// water block in the inclusive cell rectangle, applied to the live state and, if `alsoInitial`, to h0
+	void editWater(uint32_t i0, uint32_t j0, uint32_t i1, uint32_t j1, WaterEdit mode, float value, bool alsoInitial);
+	// replaces the per-cell zones (CaseData::zones / zoneMask) and uploads them
+	void setZones(std::vector<CaseData::ZoneDef> const &zones, std::vector<uint8_t> const &mask);
+
 	// Appends `steps` time steps followed by a scalar readback into `slot` to a submission batch.
 	void appendSteps(std::vector<vk::CommandBufferSubmitInfo> &batch, uint32_t steps, uint32_t slot);
 	// Scalars copied into `slot` (valid once the submission that filled it has completed).
@@ -90,6 +96,8 @@ class Solver
 	// paramsBuf_ is host-visible: updateParams() waits for the device, then writes it directly
 	vkc::Buffer paramsBuf_, scalars_, zb_, Q_, Q_old_, K_, F_L_, F_R_, G_D_, G_U_, S_b_, sink_, inflow_;
 	vkc::Buffer probeBuf_, diag_;        // probe cell list (host-visible), per-workgroup diagnostics
+	vkc::Buffer zones_;                  // MAX_ZONES Zone entries (sink_ holds the per-cell zone index)
+	void        uploadZones();
 	std::array<vkc::Buffer, kReadbackSlots> readback_;
 
 	vk::raii::CommandBuffer                             stepCmd_ = nullptr;

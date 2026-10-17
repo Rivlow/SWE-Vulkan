@@ -158,7 +158,7 @@ void bc_inflow_norm(uint3 gid : SV_GroupID, uint3 ltid : SV_GroupThreadID)
                : side == 1 ? idx(P.nx - 1, k)
                : side == 2 ? idx(k, 0)
                            : idx(k, P.ny - 1);
-        acc += inflow_weight(Q[c].x) * width;
+        acc += inflow_weight(inflow_depth(side, Q[c].x, zb[c])) * width;
     }
     g_partial[t] = acc;
     GroupMemoryBarrierWithGroupSync();
@@ -170,6 +170,15 @@ void bc_inflow_norm(uint3 gid : SV_GroupID, uint3 ltid : SV_GroupThreadID)
     }
     if (t == 0)
         inflow[side] = g_partial[0];
+}
+
+// With FLAG_EXACT_INFLOW the mass flux of an inflow side is the imposed unit discharge (positive inwards);
+// the momentum fluxes keep the HLLC values of the ghost state.
+float3 boundary_flux(uint side, float3 f, float3 q, float z)
+{
+    if ((P.flags & FLAG_EXACT_INFLOW) != 0 && P.bc_kind[side] == BC_INFLOW)
+        f.x = INWARD[side] * inflow_unit_discharge(side, q, z);
+    return f;
 }
 
 // Boundary faces: thread k handles row j = k (west/east) and column i = k (south/north).
@@ -184,11 +193,11 @@ void bc_fluxes(uint3 tid : SV_DispatchThreadID)
         // west: cell (0, j) is right of the face
         uint   c = idx(0, j);
         float3 q = Q[c].xyz;
-        F_R[fidx(0, j)] = float4(Flux_x(ghost(0, q, zb[c]), q), 0.0f);
+        F_R[fidx(0, j)] = float4(boundary_flux(0, Flux_x(ghost(0, q, zb[c]), q), q, zb[c]), 0.0f);
         // east: cell (nx-1, j) is left of the face
         c = idx(P.nx - 1, j);
         q = Q[c].xyz;
-        F_L[fidx(P.nx, j)] = float4(Flux_x(q, ghost(1, q, zb[c])), 0.0f);
+        F_L[fidx(P.nx, j)] = float4(boundary_flux(1, Flux_x(q, ghost(1, q, zb[c])), q, zb[c]), 0.0f);
     }
     if (k < P.nx)
     {
@@ -196,11 +205,11 @@ void bc_fluxes(uint3 tid : SV_DispatchThreadID)
         // south: cell (i, 0) is above the face
         uint   c = idx(i, 0);
         float3 q = Q[c].xyz;
-        G_U[gidx(i, 0)] = float4(Flux_y(ghost(2, q, zb[c]), q), 0.0f);
+        G_U[gidx(i, 0)] = float4(boundary_flux(2, Flux_y(ghost(2, q, zb[c]), q), q, zb[c]), 0.0f);
         // north: cell (i, ny-1) is below the face
         c = idx(i, P.ny - 1);
         q = Q[c].xyz;
-        G_D[gidx(i, P.ny)] = float4(Flux_y(q, ghost(3, q, zb[c])), 0.0f);
+        G_D[gidx(i, P.ny)] = float4(boundary_flux(3, Flux_y(q, ghost(3, q, zb[c])), q, zb[c]), 0.0f);
     }
 }
 
@@ -361,7 +370,7 @@ void probes(uint3 tid : SV_DispatchThreadID)
     scalars[s + 3] = asuint(zb[c] + h);
 }
 
-// Q^{n+1} = Q^n + dt sum_s b[s] K_s, fix_dry, friction, outlet cells emptied
+// Q^{n+1} = Q^n + dt sum_s b[s] K_s, fix_dry, friction, then the per-cell zones (sources, sinks, fixed levels)
 [shader("compute")]
 GRID_THREADS
 void final_update(uint3 tid : SV_DispatchThreadID)
@@ -374,7 +383,43 @@ void final_update(uint3 tid : SV_DispatchThreadID)
     float3 q  = fix_dry(combine(c, dt));
     if ((P.flags & FLAG_FRICTION) != 0)
         q = friction(q, dt);
-    if ((P.flags & FLAG_SINK) != 0 && sink[c] != 0)
-        q = float3(0.0f);
+    if ((P.flags & FLAG_ZONES) != 0 && cond[c] != 0)
+    {
+        Zone zn = zones[min(cond[c] - 1, MAX_ZONES - 1)];
+        if (zn.kind == ZONE_SINK)
+            q = float3(0.0f);
+        else if (zn.kind == ZONE_SOURCE && zn.ncells > 0)
+            q.x += zn.value * dt / (float(zn.ncells) * P.dx * P.dy);      // volume per step shared by the zone
+        else if (zn.kind == ZONE_LEVEL)
+            q = float3(max(zn.value - zb[c], 0.0f), 0.0f, 0.0f);         // reservoir at rest
+    }
     Q[c] = float4(q, 0.0f);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Interactive editing: water block in a cell rectangle (push constants, see WATER_* in params.slang)
+// ---------------------------------------------------------------------------------------------
+[shader("compute")]
+GRID_THREADS
+void set_water(uint3 tid : SV_DispatchThreadID)
+{
+    uint j = tid.x, i = tid.y;
+    if (i >= P.nx || j >= P.ny)
+        return;
+    uint i0 = uint(stage_coef(0)), j0 = uint(stage_coef(1)), i1 = uint(stage_coef(2)), j1 = uint(stage_coef(3));
+    if (i < i0 || i > i1 || j < j0 || j > j1)
+        return;
+    uint   c     = idx(i, j);
+    float  value = stage_coef(4);
+    float4 q     = Q[c];
+    float  h     = q.x;
+    switch (pc.stage)
+    {
+    case WATER_DEPTH: h = value; break;
+    case WATER_LEVEL: h = max(value - zb[c], 0.0f); break;
+    case WATER_ADD:   h = max(h + value, 0.0f); break;
+    default:          h = 0.0f; break;
+    }
+    // water placed at rest
+    Q[c] = float4(h, 0.0f, 0.0f, 0.0f);
 }

@@ -39,6 +39,7 @@ occupe la zone centrale libre.
 | Schéma numérique   | Runge-Kutta, CFL, Manning, conditions aux limites par bord (mur / débit / niveau), à chaud  |
 | Affichage          | coloration (réaliste, h, \|u\|, Froude, cote) + légende, plage auto, eau / maillage / lignes / turbidité, exagération, captures, enregistrement |
 | Sondes             | Ctrl+clic sur le terrain (8 max) : h, \|u\|, η, marqueurs numérotés en 3D                    |
+| Édition            | vue du dessus, sélection d'un rectangle de mailles en glissant dans la vue 3D, bloc d'eau (hauteur / cote / ajout) posé dans l'état courant et l'état initial, **zones** par maille (source de débit, puits, niveau fixé) appliquées à chaque pas, eau mince visible |
 | Courbes            | ImPlot : niveau, hauteur, vitesse des sondes, volume et emprise, pas de temps               |
 | Performances       | timestamps GPU par image (solveur / effets / rendu), pas/s, Mmailles·pas/s                  |
 
@@ -49,7 +50,15 @@ Fichier → Enregistrer : séquence PNG (`captures\rec_*\`, écrite en tâche de
 gardés dans `swe_settings.json`.
 
 Options utiles pour scripter des vues : `--color 0..4`, `--probe i,j` (répétable), `--mesh`, `--z-scale f`,
-`--steps-per-frame n`, `--capture fichier.png --capture-frames n`.
+`--steps-per-frame n`, `--capture fichier.png --capture-frames n`, `--top`, `--water i0,j0,i1,j1,h`,
+`--zone source|sink|level,valeur,i0,j0,i1,j1`.
+
+**Conditions aux limites sur un domaine sec** : le débit entrant d'un bord est réparti sur les mailles de bord au
+prorata de h^(5/3) ; quand le bord est sec, la répartition utilise la profondeur fictive obtenue en remplissant
+le bord jusqu'à 0,5 m au-dessus de son point le plus bas (l'eau entre par le lit de la rivière). Le flux de masse
+imposé est **exactement** le débit (`legacy_inflow: true` dans un cas JSON rétablit le flux HLLC de l'état fantôme
+du Python, gardé pour la validation du cas `meuse`). Vérification : `inflow_test` (5 m³/s sur un domaine sec)
+donne 5,001 m³/s (`tools\volume_check.py`).
 
 ## Rendu
 

@@ -23,6 +23,7 @@ char const *kDisplay    = "Affichage";
 char const *kProbes     = "Sondes";
 char const *kPlots      = "Courbes";
 char const *kPerf       = "Performances";
+char const *kEdit       = "Édition";
 
 // probe colours (also used by the plots and the 3D markers)
 ImVec4 probeColor(size_t p)
@@ -128,6 +129,8 @@ void App::drawGui()
 		drawDisplayPanel();
 	if (showProbes_)
 		drawProbesPanel();
+	if (showEdit_)
+		drawEditPanel();
 	if (showPlots_)
 		drawPlotsPanel();
 	if (showPerf_)
@@ -174,6 +177,7 @@ void App::setupDockLayout(unsigned int dockId)
 	ImGui::DockBuilderDockWindow(kSimulation, leftTop);
 	ImGui::DockBuilderDockWindow(kDisplay, leftBottom);
 	ImGui::DockBuilderDockWindow(kScheme, leftBottom);
+	ImGui::DockBuilderDockWindow(kEdit, right);
 	ImGui::DockBuilderDockWindow(kProbes, right);
 	ImGui::DockBuilderDockWindow(kPerf, right);
 	ImGui::DockBuilderDockWindow(kPlots, bottom);
@@ -228,6 +232,7 @@ void App::drawMenuBar()
 		ImGui::MenuItem(kScheme, nullptr, &showScheme_);
 		ImGui::MenuItem(kDisplay, nullptr, &showDisplay_);
 		ImGui::MenuItem(kProbes, nullptr, &showProbes_);
+		ImGui::MenuItem(kEdit, nullptr, &showEdit_);
 		ImGui::MenuItem(kPlots, nullptr, &showPlots_);
 		ImGui::MenuItem("Carte (import géographique)", nullptr, &showMap_);
 		ImGui::MenuItem(kPerf, nullptr, &showPerf_);
@@ -523,6 +528,140 @@ void App::drawProbesPanel()
 		probes_.clear();
 		updateProbeList();
 	}
+	ImGui::End();
+}
+
+// Edit panel: top view, cell selection in the 3D view, water blocks and per-cell zones
+void App::drawEditPanel()
+{
+	if (!ImGui::Begin(kEdit, &showEdit_))
+	{
+		ImGui::End();
+		return;
+	}
+	auto const &c = solver_->caseData();
+	if (ImGui::Button("Vue du dessus"))
+		topView();
+	tip("Caméra à la verticale, nord en haut (molette : zoom, clic milieu : déplacer)");
+	ImGui::SameLine();
+	if (ImGui::Button("Vue 3D"))
+		camera_.reset();
+
+	ImGui::SeparatorText("Sélection de mailles");
+	if (ImGui::Checkbox("Outil sélection (glisser dans la vue)", &selectTool_) && !selectTool_)
+	{
+		selAnchor_.reset();
+		selCurrent_.reset();
+		render_.selection = {1, 0, 0, 0};
+	}
+	tip("Clic gauche + glisser sur le terrain : rectangle de mailles. Échap : annuler.");
+	auto sel     = render_.selection;
+	bool hasSel  = sel.z >= sel.x && sel.w >= sel.y;
+	if (hasSel)
+	{
+		uint32_t ni = sel.z - sel.x + 1, nj = sel.w - sel.y + 1;
+		ImGui::Text("mailles (%u..%u, %u..%u) : %u x %u = %u", sel.x, sel.z, sel.y, sel.w, ni, nj, ni * nj);
+		ImGui::Text("%.0f x %.0f m", ni * c.dx(), nj * c.dy());
+		float zmin = 1e30f, zmax = -1e30f;
+		for (uint32_t i = sel.x; i <= sel.z; ++i)
+			for (uint32_t j = sel.y; j <= sel.w; ++j)
+			{
+				float z = c.zb[size_t(i) * c.ny + j];
+				zmin    = std::min(zmin, z);
+				zmax    = std::max(zmax, z);
+			}
+		ImGui::Text("fond : %.2f à %.2f m (%.2f à %.2f m DNG)", zmin, zmax, zmin + c.z_ref, zmax + c.z_ref);
+	}
+	else
+		ImGui::TextDisabled("aucune sélection");
+
+	ImGui::SeparatorText("Bloc d'eau");
+	ImGui::SetNextItemWidth(-110);
+	ImGui::Combo("mode", &waterMode_, "hauteur d'eau (m)\0cote de surface (m DNG)\0ajouter (m)\0");
+	ImGui::SetNextItemWidth(-110);
+	ImGui::InputFloat("valeur", &waterValue_, 0.1f, 1.0f, "%.2f");
+	ImGui::Checkbox("aussi dans l'état initial (Recommencer)", &waterInitial_);
+	ImGui::BeginDisabled(!hasSel);
+	if (ImGui::Button("Poser l'eau", ImVec2(-70, 0)))
+	{
+		WaterEdit mode  = waterMode_ == 0 ? WaterEdit::Depth : waterMode_ == 1 ? WaterEdit::Level : WaterEdit::Add;
+		float     value = waterMode_ == 1 ? waterValue_ - static_cast<float>(c.z_ref) : waterValue_;
+		solver_->editWater(sel.x, sel.y, sel.z, sel.w, mode, value, waterInitial_);
+		effects_->reset();
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Vider"))
+	{
+		solver_->editWater(sel.x, sel.y, sel.z, sel.w, WaterEdit::Clear, 0.0f, waterInitial_);
+		effects_->reset();
+	}
+	ImGui::EndDisabled();
+	tip("Eau posée au repos dans la sélection, dans l'état courant (la simulation continue)");
+
+	ImGui::SeparatorText("Zones (conditions par maille)");
+	ImGui::TextDisabled("Appliquées à la fin de chaque pas, sur la sélection.");
+	ImGui::SetNextItemWidth(-110);
+	ImGui::Combo("type", &zoneKind_, "source : débit (m3/s)\0puits (exutoire)\0niveau fixé (m DNG)\0");
+	if (zoneKind_ != 1)
+	{
+		ImGui::SetNextItemWidth(-110);
+		ImGui::InputFloat("##zval", &zoneValue_, 1.0f, 10.0f, zoneKind_ == 0 ? "%.2f m3/s" : "%.2f m DNG");
+	}
+	ImGui::SetNextItemWidth(-110);
+	ImGui::InputTextWithHint("nom", "optionnel", zoneLabel_, sizeof(zoneLabel_));
+	ImGui::BeginDisabled(!hasSel || c.zones.size() >= MAX_ZONES);
+	if (ImGui::Button("Créer la zone", ImVec2(-1, 0)))
+	{
+		ZoneKind kind  = zoneKind_ == 0 ? ZoneKind::Source : zoneKind_ == 1 ? ZoneKind::Sink : ZoneKind::Level;
+		double   value = zoneKind_ == 2 ? zoneValue_ - c.z_ref : zoneValue_;
+		std::string label = zoneLabel_[0] ? zoneLabel_ : (zoneKind_ == 0 ? "source" : zoneKind_ == 1 ? "puits" : "niveau");
+		addZoneFromSelection(kind, value, label);
+		zoneLabel_[0] = 0;
+	}
+	ImGui::EndDisabled();
+	if (!c.zones.empty() && ImGui::BeginTable("zones", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+	{
+		ImGui::TableSetupColumn("zone");
+		ImGui::TableSetupColumn("type", ImGuiTableColumnFlags_WidthFixed, 50);
+		ImGui::TableSetupColumn("valeur", ImGuiTableColumnFlags_WidthFixed, 110);
+		ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 22);
+		ImGui::TableHeadersRow();
+		int remove = -1;
+		for (size_t z = 0; z < c.zones.size(); ++z)
+		{
+			auto const &zd = c.zones[z];
+			ImGui::PushID(int(z));
+			ImGui::TableNextRow();
+			ImGui::TableNextColumn();
+			ImVec4 col = zd.kind == ZoneKind::Source ? ImVec4(0.35f, 0.6f, 1, 1) : zd.kind == ZoneKind::Sink ? ImVec4(1, 0.4f, 0.3f, 1) : ImVec4(0.3f, 0.95f, 0.9f, 1);
+			ImGui::TextColored(col, "%s", zd.label.c_str());
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("mailles (%u..%u, %u..%u)", zd.i0, zd.i1, zd.j0, zd.j1);
+			ImGui::TableNextColumn();
+			ImGui::TextUnformatted(zd.kind == ZoneKind::Source ? "source" : zd.kind == ZoneKind::Sink ? "puits" : "niveau");
+			ImGui::TableNextColumn();
+			if (zd.kind != ZoneKind::Sink)
+			{
+				double v = zd.kind == ZoneKind::Level ? zd.value + c.z_ref : zd.value;
+				ImGui::SetNextItemWidth(-1);
+				if (ImGui::InputDouble("##v", &v, 0.0, 0.0, zd.kind == ZoneKind::Level ? "%.2f m" : "%.1f m3/s", ImGuiInputTextFlags_EnterReturnsTrue))
+					updateZoneValue(z, zd.kind == ZoneKind::Level ? v - c.z_ref : v);
+			}
+			ImGui::TableNextColumn();
+			if (ImGui::SmallButton("x"))
+				remove = int(z);
+			ImGui::PopID();
+		}
+		ImGui::EndTable();
+		if (remove >= 0)
+			removeZone(size_t(remove));
+	}
+	ImGui::Checkbox("Afficher les zones", &render_.showZones);
+	ImGui::SameLine();
+	ImGui::Checkbox("Eau mince visible", &render_.thinWater);
+	tip("Donne une opacité minimale aux lames d'eau de quelques cm, sinon invisibles");
+	if (caseGeo_)
+		ImGui::TextDisabled("« Enregistrer le cas » (Simulation) garde l'eau initiale et les zones.");
 	ImGui::End();
 }
 

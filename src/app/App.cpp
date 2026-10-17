@@ -98,6 +98,35 @@ App::App(Options const &opts) :
 	if (opts_.colorMode >= 0)
 		render_.colorMode = static_cast<ColorMode>(std::clamp(opts_.colorMode, 0, 4));
 	hideGui_ = opts_.hideGui;
+
+	// scripted edits: water blocks and zones on cell rectangles, top view
+	for (auto const &w : opts_.waterBlocks)
+	{
+		unsigned i0, j0, i1, j1;
+		float    depth;
+		if (sscanf_s(w.c_str(), "%u,%u,%u,%u,%f", &i0, &j0, &i1, &j1, &depth) == 5)
+			solver_->editWater(i0, j0, i1, j1, WaterEdit::Depth, depth, true);
+		else
+			log::warn("--water expects i0,j0,i1,j1,depth");
+	}
+	for (auto const &z : opts_.zoneDefs)
+	{
+		char     kind[16];
+		float    value;
+		unsigned i0, j0, i1, j1;
+		if (sscanf_s(z.c_str(), "%15[a-z],%f,%u,%u,%u,%u", kind, static_cast<unsigned>(sizeof(kind)), &value, &i0, &j0, &i1, &j1) == 6)
+		{
+			std::string k(kind);
+			render_.selection = {i0, j0, i1, j1};
+			addZoneFromSelection(k == "sink" ? ZoneKind::Sink : k == "level" ? ZoneKind::Level : ZoneKind::Source,
+			                     k == "level" ? value - solver_->caseData().z_ref : value, k);
+			render_.selection = {1, 0, 0, 0};
+		}
+		else
+			log::warn("--zone expects kind,value,i0,j0,i1,j1 (kind = source | sink | level)");
+	}
+	if (opts_.topView)
+		topView();
 	if (!opts_.probes.empty())
 	{
 		auto const &c = solver_->caseData();
@@ -310,6 +339,65 @@ void App::applyBedEdit(BedEdit const &edit)
 	resetSimulation();
 }
 
+void App::topView()
+{
+	auto const &c = solver_->caseData();
+	float       S = renderer_->S();
+	glm::vec3   focal(0.5f * float(c.Lx) * S, float(c.eta_0) * render_.z_scale * S, -0.5f * float(c.Ly) * S);
+	camera_.topView(focal, std::max(float(c.Lx), float(c.Ly)) * S);
+}
+
+void App::addZoneFromSelection(ZoneKind kind, double value, std::string const &label)
+{
+	auto const &c   = solver_->caseData();
+	auto        sel = render_.selection;
+	if (sel.z < sel.x || sel.w < sel.y)
+		return;
+	auto zones = c.zones;
+	auto mask  = c.zoneMask;
+	if (zones.size() >= MAX_ZONES)
+	{
+		log::warn("at most {} zones", MAX_ZONES);
+		return;
+	}
+	if (mask.size() != c.cells())
+		mask.assign(c.cells(), 0);
+	CaseData::ZoneDef z{.kind = kind, .value = value, .label = label, .i0 = sel.x, .j0 = sel.y, .i1 = sel.z, .j1 = sel.w};
+	zones.push_back(z);
+	auto id = static_cast<uint8_t>(zones.size());
+	for (uint32_t i = sel.x; i <= sel.z; ++i)
+		for (uint32_t j = sel.y; j <= sel.w; ++j)
+			mask[size_t(i) * c.ny + j] = id;
+	solver_->setZones(zones, mask);
+}
+
+void App::removeZone(size_t index)
+{
+	auto const &c     = solver_->caseData();
+	auto        zones = c.zones;
+	auto        mask  = c.zoneMask;
+	if (index >= zones.size())
+		return;
+	zones.erase(zones.begin() + static_cast<std::ptrdiff_t>(index));
+	for (auto &m : mask)
+	{
+		if (m == index + 1)
+			m = 0;
+		else if (m > index + 1)
+			--m;
+	}
+	solver_->setZones(zones, mask);
+}
+
+void App::updateZoneValue(size_t index, double value)
+{
+	auto zones = solver_->caseData().zones;
+	if (index >= zones.size())
+		return;
+	zones[index].value = value;
+	solver_->setZones(zones, solver_->caseData().zoneMask);
+}
+
 void App::saveCurrentCase()
 {
 	if (!caseGeo_)
@@ -457,6 +545,36 @@ void App::handleInput()
 		r = glm::vec4(0.0f, 0.0f, std::max(io.DisplaySize.x, 1.0f), std::max(io.DisplaySize.y, 1.0f));
 	glm::vec2 cursor((io.MousePos.x - r.x) / r.z, 1.0f - (io.MousePos.y - r.y) / r.w);
 	bool      blocked = io.WantCaptureMouse;
+
+	// Cell selection tool: left drag = rectangle of cells (camera untouched)
+	if (selectTool_)
+	{
+		if (!blocked && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+		{
+			selAnchor_  = pickCell({io.MousePos.x, io.MousePos.y});
+			selCurrent_ = selAnchor_;
+			selecting_  = selAnchor_.has_value();
+		}
+		if (selecting_ && ImGui::IsMouseDown(ImGuiMouseButton_Left))
+			if (auto c = pickCell({io.MousePos.x, io.MousePos.y}))
+				selCurrent_ = c;
+		if (selecting_ && ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+			selecting_ = false;
+		if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+		{
+			selAnchor_.reset();
+			selCurrent_.reset();
+		}
+		if (selAnchor_ && selCurrent_)
+			render_.selection = {std::min(selAnchor_->i, selCurrent_->i), std::min(selAnchor_->j, selCurrent_->j),
+			                     std::max(selAnchor_->i, selCurrent_->i), std::max(selAnchor_->j, selCurrent_->j)};
+		else
+			render_.selection = {1, 0, 0, 0};
+		// wheel zoom and middle pan still work, no rotation
+		int button = ImGui::IsMouseDown(ImGuiMouseButton_Middle) ? 2 : 0;
+		camera_.update(cursor, button, blocked ? 0.0f : io.MouseWheel, blocked);
+		return;
+	}
 
 	// Ctrl + click on the terrain: new probe (camera untouched)
 	if (!blocked && io.KeyCtrl && ImGui::IsMouseClicked(ImGuiMouseButton_Left))

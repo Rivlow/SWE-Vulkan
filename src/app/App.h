@@ -87,6 +87,10 @@ class App
 	void applyBedEdit(BedEdit const &edit);
 	void saveCurrentCase();
 	void resetSimulation();
+	void topView();
+	void addZoneFromSelection(ZoneKind kind, double value, std::string const &label);
+	void removeZone(size_t index);
+	void updateZoneValue(size_t index, double value);
 	void handleInput();
 	void drawFrame();
 	void recordFrame(Frame &frame, uint32_t imageIndex);
@@ -105,6 +109,7 @@ class App
 	void drawSchemePanel();
 	void drawDisplayPanel();
 	void drawProbesPanel();
+	void drawEditPanel();
 	void drawPlotsPanel();
 	void drawPerfPanel();
 	void drawLegend();
@@ -156,6 +161,18 @@ class App
 	// Probes
 	std::vector<Probe> probes_;
 
+	// Cell selection in the 3D view (edit tool)
+	bool                 selectTool_ = false;
+	bool                 selecting_  = false;
+	std::optional<Probe> selAnchor_, selCurrent_;
+	// edit panel state
+	int   waterMode_   = 0;          // 0 depth, 1 level, 2 add
+	float waterValue_  = 1.0f;
+	bool  waterInitial_ = true;
+	int   zoneKind_    = 0;          // 0 source, 1 sink, 2 level
+	float zoneValue_   = 10.0f;
+	char  zoneLabel_[48] = "";
+
 	// GPU timing
 	vk::raii::QueryPool queries_         = nullptr;
 	double              timestampPeriod_ = 0.0;        // ns per tick, 0 = unsupported
@@ -173,7 +190,7 @@ class App
 	// GUI state
 	std::vector<CaseInfo> caseList_;
 	bool showSimulation_ = true, showScheme_ = true, showDisplay_ = true, showProbes_ = true;
-	bool showPlots_ = true, showPerf_ = false, showHelp_ = false, showDemo_ = false, showMap_ = true;
+	bool showPlots_ = true, showPerf_ = false, showHelp_ = false, showDemo_ = false, showMap_ = true, showEdit_ = true;
 	bool hideGui_ = false;        // F11: 3D view only
 };
 
