@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <stdexcept>
 
 namespace swe {
@@ -202,7 +203,106 @@ void buildDtmLake(CaseData &c, json const &j, fs::path const &assets)
 	}
 }
 
+// Case saved by the geographic import: everything is in the npz.
+void buildImported(CaseData &c, json const &j, fs::path const &assets)
+{
+	auto npz = npy::loadNpz(assets / j.at("data").get<std::string>());
+	auto &zb = npz.at("zb");
+	if (zb.shape.size() != 2)
+		throw std::runtime_error("imported: zb must be 2-D");
+	c.nx    = static_cast<uint32_t>(zb.shape[0]);
+	c.ny    = static_cast<uint32_t>(zb.shape[1]);
+	double cell = j.at("cell").get<double>();
+	c.Lx    = c.nx * cell;
+	c.Ly    = c.ny * cell;
+	c.z_ref = j.value("z_ref", 0.0);
+	c.eta_0 = j.value("eta_0", 1.0);
+	c.zb    = zb.asFloat();
+	c.h0    = npz.count("h0") ? npz.at("h0").asFloat() : std::vector<float>(c.cells(), 0.0f);
+	c.hu0.assign(c.cells(), 0.0f);
+	c.hv0.assign(c.cells(), 0.0f);
+	if (npz.count("outside"))
+	{
+		auto o = npz.at("outside").asFloat();
+		c.outside.resize(o.size());
+		for (size_t k = 0; k < o.size(); ++k)
+			c.outside[k] = o[k] != 0.0f ? 1 : 0;
+		if (std::ranges::none_of(c.outside, [](uint8_t v) { return v; }))
+			c.outside.clear();
+	}
+	if (c.h0.size() != c.cells() || (!c.outside.empty() && c.outside.size() != c.cells()))
+		throw std::runtime_error("imported: inconsistent array sizes");
+}
+
 }        // namespace
+
+GeoOrigin caseOrigin(std::string const &name, std::string const &assetDir)
+{
+	GeoOrigin g;
+	auto      path = fs::path(assetDir) / "cases" / (name + ".json");
+	if (!fs::exists(path))
+		return g;
+	try
+	{
+		json j = readJson(path);
+		if (j.contains("origin") && j.contains("cell"))
+		{
+			g.x0    = j["origin"].at(0).get<double>();
+			g.y0    = j["origin"].at(1).get<double>();
+			g.cell  = j["cell"].get<double>();
+			g.valid = true;
+		}
+	}
+	catch (std::exception const &)
+	{
+	}
+	return g;
+}
+
+void saveImportedCase(CaseData const &c, ImportMetadata const &meta, std::string const &assetDir)
+{
+	fs::path assets(assetDir);
+	fs::create_directories(assets / "cases");
+	fs::create_directories(assets / "data");
+
+	std::map<std::string, npy::Array> arrays;
+	arrays["zb"] = npy::makeArray(c.zb, {c.nx, c.ny});
+	arrays["h0"] = npy::makeArray(c.h0, {c.nx, c.ny});
+	if (!c.outside.empty())
+		arrays["outside"] = npy::makeArray(c.outside, {c.nx, c.ny});
+	npy::saveNpz(assets / "data" / (c.name + ".npz"), arrays);
+
+	static char const *sides[4] = {"west", "east", "south", "north"};
+	json               bc;
+	for (int s = 0; s < 4; ++s)
+	{
+		switch (c.bc[s].kind)
+		{
+		case BcKind::Wall: bc[sides[s]] = {"wall"}; break;
+		case BcKind::Inflow: bc[sides[s]] = {"inflow", c.bc[s].value}; break;
+		case BcKind::Level: bc[sides[s]] = {"level", c.bc[s].value}; break;
+		}
+	}
+	json j{{"label", c.label},
+	       {"type", "imported"},
+	       {"data", "data/" + c.name + ".npz"},
+	       {"cell", meta.cell},
+	       {"origin", {meta.x0, meta.y0}},
+	       {"crs", "EPSG:31370"},
+	       {"vertical_datum", "DNG (approx. for foreign sources)"},
+	       {"z_ref", c.z_ref},
+	       {"eta_0", c.eta_0},
+	       {"manning_n", c.manning_n},
+	       {"cfl", c.cfl},
+	       {"scheme", c.scheme},
+	       {"bc", bc},
+	       {"render", {{"depth_ref", c.depth_ref}, {"z_scale_0", c.z_scale_0}}},
+	       {"sources", meta.sources},
+	       {"attributions", meta.attributions}};
+	if (!meta.orthoFile.empty())
+		j["orthophoto"] = meta.orthoFile;
+	std::ofstream(assets / "cases" / (c.name + ".json")) << j.dump(2) << '\n';
+}
 
 std::vector<CaseInfo> listCases(std::string const &assetDir)
 {
@@ -249,6 +349,8 @@ CaseData makeCase(std::string const &name, std::string const &assetDir)
 		buildRiver(c, j, assets);
 	else if (type == "dtm_lake")
 		buildDtmLake(c, j, assets);
+	else if (type == "imported")
+		buildImported(c, j, assets);
 	else
 		throw std::runtime_error("case '" + name + "': unknown type '" + type + "'");
 	readBoundaries(c, j);

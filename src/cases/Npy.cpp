@@ -122,8 +122,10 @@ Array load(std::filesystem::path const &path)
 	return parse(bytes.data(), bytes.size(), path.string());
 }
 
-void save(std::filesystem::path const &path, std::string const &descr, std::vector<size_t> const &shape, void const *data,
-          size_t bytes)
+namespace {
+
+// Complete .npy file image (header + data)
+std::vector<uint8_t> encodeNpy(std::string const &descr, std::vector<size_t> const &shape, void const *data, size_t bytes)
 {
 	std::string shapeStr = "(";
 	for (size_t k = 0; k < shape.size(); ++k)
@@ -135,14 +137,147 @@ void save(std::filesystem::path const &path, std::string const &descr, std::vect
 	header.append((64 - total % 64) % 64, ' ');
 	header += '\n';
 
+	std::vector<uint8_t> out;
+	out.reserve(10 + header.size() + bytes);
+	char const magic[] = "\x93NUMPY\x01\x00";
+	out.insert(out.end(), magic, magic + 8);
+	auto len = static_cast<uint16_t>(header.size());
+	out.push_back(static_cast<uint8_t>(len & 0xff));
+	out.push_back(static_cast<uint8_t>(len >> 8));
+	out.insert(out.end(), header.begin(), header.end());
+	auto const *p = static_cast<uint8_t const *>(data);
+	out.insert(out.end(), p, p + bytes);
+	return out;
+}
+
+uint32_t crc32(uint8_t const *data, size_t n)
+{
+	static uint32_t table[256];
+	static bool     init = false;
+	if (!init)
+	{
+		for (uint32_t i = 0; i < 256; ++i)
+		{
+			uint32_t c = i;
+			for (int k = 0; k < 8; ++k)
+				c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+			table[i] = c;
+		}
+		init = true;
+	}
+	uint32_t c = 0xFFFFFFFFu;
+	for (size_t k = 0; k < n; ++k)
+		c = table[(c ^ data[k]) & 0xff] ^ (c >> 8);
+	return c ^ 0xFFFFFFFFu;
+}
+
+template <class T>
+void putLE(std::vector<uint8_t> &out, T v)
+{
+	for (size_t k = 0; k < sizeof(T); ++k)
+		out.push_back(static_cast<uint8_t>((static_cast<uint64_t>(v) >> (8 * k)) & 0xff));
+}
+
+}        // namespace
+
+void save(std::filesystem::path const &path, std::string const &descr, std::vector<size_t> const &shape, void const *data,
+          size_t bytes)
+{
+	auto          image = encodeNpy(descr, shape, data, bytes);
 	std::ofstream f(path, std::ios::binary);
 	if (!f)
 		throw std::runtime_error("cannot write " + path.string());
-	f.write("\x93NUMPY\x01\x00", 8);
-	uint16_t len = static_cast<uint16_t>(header.size());
-	f.write(reinterpret_cast<char const *>(&len), 2);
-	f.write(header.data(), static_cast<std::streamsize>(header.size()));
-	f.write(static_cast<char const *>(data), static_cast<std::streamsize>(bytes));
+	f.write(reinterpret_cast<char const *>(image.data()), static_cast<std::streamsize>(image.size()));
+}
+
+void saveNpz(std::filesystem::path const &path, std::map<std::string, Array> const &arrays)
+{
+	std::vector<uint8_t> zip, central;
+	uint16_t             count = 0;
+	for (auto const &[name, a] : arrays)
+	{
+		auto     image = encodeNpy(a.descr, a.shape, a.data.data(), a.data.size());
+		auto     crc   = crc32(image.data(), image.size());
+		auto     size  = static_cast<uint32_t>(image.size());
+		auto     off   = static_cast<uint32_t>(zip.size());
+		std::string fname = name + ".npy";
+		// local file header (stored)
+		putLE<uint32_t>(zip, 0x04034b50);
+		putLE<uint16_t>(zip, 20);
+		putLE<uint16_t>(zip, 0);
+		putLE<uint16_t>(zip, 0);
+		putLE<uint16_t>(zip, 0);
+		putLE<uint16_t>(zip, 0);
+		putLE<uint32_t>(zip, crc);
+		putLE<uint32_t>(zip, size);
+		putLE<uint32_t>(zip, size);
+		putLE<uint16_t>(zip, static_cast<uint16_t>(fname.size()));
+		putLE<uint16_t>(zip, 0);
+		zip.insert(zip.end(), fname.begin(), fname.end());
+		zip.insert(zip.end(), image.begin(), image.end());
+		// central directory entry
+		putLE<uint32_t>(central, 0x02014b50);
+		putLE<uint16_t>(central, 20);
+		putLE<uint16_t>(central, 20);
+		putLE<uint16_t>(central, 0);
+		putLE<uint16_t>(central, 0);
+		putLE<uint16_t>(central, 0);
+		putLE<uint16_t>(central, 0);
+		putLE<uint32_t>(central, crc);
+		putLE<uint32_t>(central, size);
+		putLE<uint32_t>(central, size);
+		putLE<uint16_t>(central, static_cast<uint16_t>(fname.size()));
+		putLE<uint16_t>(central, 0);
+		putLE<uint16_t>(central, 0);
+		putLE<uint16_t>(central, 0);
+		putLE<uint16_t>(central, 0);
+		putLE<uint32_t>(central, 0);
+		putLE<uint32_t>(central, off);
+		central.insert(central.end(), fname.begin(), fname.end());
+		++count;
+	}
+	auto cdOff = static_cast<uint32_t>(zip.size());
+	zip.insert(zip.end(), central.begin(), central.end());
+	putLE<uint32_t>(zip, 0x06054b50);
+	putLE<uint16_t>(zip, 0);
+	putLE<uint16_t>(zip, 0);
+	putLE<uint16_t>(zip, count);
+	putLE<uint16_t>(zip, count);
+	putLE<uint32_t>(zip, static_cast<uint32_t>(central.size()));
+	putLE<uint32_t>(zip, cdOff);
+	putLE<uint16_t>(zip, 0);
+
+	std::ofstream f(path, std::ios::binary);
+	if (!f)
+		throw std::runtime_error("cannot write " + path.string());
+	f.write(reinterpret_cast<char const *>(zip.data()), static_cast<std::streamsize>(zip.size()));
+}
+
+Array makeArray(std::vector<float> const &v, std::vector<size_t> const &shape)
+{
+	Array a;
+	a.descr = "<f4";
+	a.shape = shape;
+	a.data.assign(reinterpret_cast<uint8_t const *>(v.data()), reinterpret_cast<uint8_t const *>(v.data()) + v.size() * 4);
+	return a;
+}
+
+Array makeArray(std::vector<uint8_t> const &v, std::vector<size_t> const &shape)
+{
+	Array a;
+	a.descr = "|u1";
+	a.shape = shape;
+	a.data  = v;
+	return a;
+}
+
+Array makeArray(std::vector<double> const &v, std::vector<size_t> const &shape)
+{
+	Array a;
+	a.descr = "<f8";
+	a.shape = shape;
+	a.data.assign(reinterpret_cast<uint8_t const *>(v.data()), reinterpret_cast<uint8_t const *>(v.data()) + v.size() * 8);
+	return a;
 }
 
 std::map<std::string, Array> loadNpz(std::filesystem::path const &path)

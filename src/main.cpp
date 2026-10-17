@@ -1,6 +1,7 @@
 #include "app/App.h"
 #include "app/Headless.h"
 #include "app/SelfTest.h"
+#include "geo/Crs.h"
 #include "util/Cli.h"
 #include "util/Log.h"
 #include "vk/Context.h"
@@ -32,6 +33,11 @@ usage: swe [options]
     --selftest         run the compute self-test and exit
     --steps <n>        number of solver steps
     --dump <dir>       write Q.npy, zb.npy and meta.json after the run
+  --import xmin,ymin,xmax,ymax   geographic import (Lambert 72 m) of the bed, saved as a case
+    --cell <m>         target cell size                                          [5]
+    --library <dir>    folder of local GeoTIFF (SPW DTM / bathymetry), repeatable
+    --name <n>         case name                                                 [import]
+    --dump <dir>       also write <name>.tif and zb_abs.npy
 )";
 }
 
@@ -48,6 +54,14 @@ int main(int argc, char **argv)
 			return EXIT_SUCCESS;
 		}
 
+		if (!opts.importBox.empty())
+		{
+			int code = swe::runImport(opts);
+			swe::geo::shutdown();
+			std::cout.flush();
+			return code;
+		}
+
 		if (opts.headless)
 		{
 			swe::vkc::Context ctx({.validation = opts.validation, .syncValidation = opts.syncValidation, .forcedGpu = opts.gpu});
@@ -56,8 +70,11 @@ int main(int argc, char **argv)
 			return swe::runHeadless(opts, ctx);
 		}
 
-		swe::App app(opts);
-		app.run();
+		{
+			swe::App app(opts);
+			app.run();
+		}
+		swe::geo::shutdown();
 		return EXIT_SUCCESS;
 	}
 	catch (std::exception const &e)

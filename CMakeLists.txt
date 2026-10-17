@@ -12,6 +12,8 @@ find_package(imgui CONFIG REQUIRED)
 find_package(implot CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(Stb REQUIRED)
+find_package(GDAL CONFIG REQUIRED)
+find_package(CURL CONFIG REQUIRED)
 
 include(cmake/SlangShaders.cmake)
 
@@ -28,7 +30,8 @@ add_slang_shader(effects  "${CMAKE_SOURCE_DIR}/shaders/effects/effects.slang")
 file(GLOB_RECURSE SWE_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 add_executable(swe ${SWE_SOURCES})
 target_include_directories(swe PRIVATE "${CMAKE_SOURCE_DIR}/src" ${Stb_INCLUDE_DIR})
-target_link_libraries(swe PRIVATE Vulkan::Vulkan glfw glm::glm imgui::imgui implot::implot nlohmann_json::nlohmann_json)
+target_link_libraries(swe PRIVATE Vulkan::Vulkan glfw glm::glm imgui::imgui implot::implot nlohmann_json::nlohmann_json
+                                  GDAL::GDAL CURL::libcurl)
 target_compile_definitions(swe PRIVATE
   VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
   VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1
@@ -39,7 +42,10 @@ target_compile_definitions(swe PRIVATE
   NOMINMAX
   WIN32_LEAN_AND_MEAN
   SWE_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets"
-  SWE_SHADER_DIR="${SWE_SHADER_OUTPUT_DIR}")
+  SWE_SHADER_DIR="${SWE_SHADER_OUTPUT_DIR}"
+  # PROJ / GDAL resource files (proj.db, ...) of the vcpkg install
+  SWE_PROJ_DATA="${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/proj"
+  SWE_GDAL_DATA="${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/gdal")
 target_compile_options(swe PRIVATE /W4 /permissive- /Zc:preprocessor /EHsc /utf-8 /bigobj)
 target_precompile_headers(swe PRIVATE src/pch.h)
 set_target_properties(swe PROPERTIES

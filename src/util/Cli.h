@@ -27,6 +27,11 @@ struct Options
 	int         stepsPerFrame  = -1;           // --steps-per-frame (window)
 	bool        showMesh       = false;        // --mesh
 	std::vector<std::pair<int, int>> probes;   // --probe i,j (repeatable)
+	// geographic import (headless): --import xmin,ymin,xmax,ymax (Lambert 72) --cell m --library <dir>
+	std::string importBox;
+	double      importCell = 5.0;
+	std::vector<std::string> libraryDirs;
+	std::string importName = "import";
 	float       zScale         = -1.0f;        // --z-scale (default: case value)
 	bool        help           = false;
 };
@@ -61,6 +66,10 @@ inline Options parseOptions(int argc, char **argv)
 		else if (a == "--capture-frames")    o.captureFrames = std::stoi(next(i));
 		else if (a == "--steps-per-frame")   o.stepsPerFrame = std::stoi(next(i));
 		else if (a == "--mesh")              o.showMesh = true;
+		else if (a == "--import")            o.importBox = next(i);
+		else if (a == "--cell")              o.importCell = std::stod(next(i));
+		else if (a == "--library")           o.libraryDirs.push_back(next(i));
+		else if (a == "--name")              o.importName = next(i);
 		else if (a == "--probe")
 		{
 			auto v     = next(i);

@@ -10,3 +10,5 @@ __pycache__/
 build.log
 captures/
 swe_settings.json
+cache/
+build-gdal.log

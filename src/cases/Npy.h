@@ -36,4 +36,12 @@ inline void save(std::filesystem::path const &path, std::vector<size_t> const &s
 // .npz archives written by np.savez (stored, not compressed).
 std::map<std::string, Array> loadNpz(std::filesystem::path const &path);
 
+// Writes a stored (uncompressed) .npz readable by np.load. Each entry: name -> array.
+void saveNpz(std::filesystem::path const &path, std::map<std::string, Array> const &arrays);
+
+// Helpers to build Arrays from host vectors
+Array makeArray(std::vector<float> const &v, std::vector<size_t> const &shape);
+Array makeArray(std::vector<uint8_t> const &v, std::vector<size_t> const &shape);
+Array makeArray(std::vector<double> const &v, std::vector<size_t> const &shape);
+
 }        // namespace swe::npy
