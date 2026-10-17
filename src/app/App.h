@@ -1,8 +1,10 @@
 #pragma once
 #include "app/MapPanel.h"
 #include "cases/Cases.h"
+#include "geo/Carve.h"
 #include "geo/LocalLibrary.h"
 #include "geo/TerrainBuilder.h"
+#include "geo/Tiles.h"
 #include "render/Camera.h"
 #include "render/Effects.h"
 #include "render/Renderer.h"
@@ -82,6 +84,8 @@ class App
 	void createTimestamps();
 	void loadCase(std::string const &name);
 	void loadImport(ImportOutcome &&outcome);
+	void applyBedEdit(BedEdit const &edit);
+	void saveCurrentCase();
 	void resetSimulation();
 	void handleInput();
 	void drawFrame();
@@ -137,6 +141,10 @@ class App
 	int           stepsPerFrame_ = 30;        // main.py: steps_per_render
 	double        volume0_       = -1.0;      // initial volume (mass balance)
 	History       history_;
+
+	// Georeferenced case (imports): grid origin and the orthophoto bytes (re-applied after bed edits)
+	std::optional<geo::GridGeometry> caseGeo_;
+	geo::Image                       orthoImage_;
 
 	// View
 	OrbitCamera    camera_;

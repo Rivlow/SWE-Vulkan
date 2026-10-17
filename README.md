@@ -107,10 +107,16 @@ massif, attribution affichée) ; données SPW sous CC BY 4.0 (« Source : SPW »
 AHN CC0, NRW dl-de/zero, IGN Etalab 2.0, Copernicus avec mention DLR/Airbus/ESA. Les attributions sont écrites
 dans le JSON du cas.
 
+**Lit de rivière sans bathymétrie** (panneau Carte → « Lit de rivière ») : tracer l'axe de la rivière sur la
+carte (clics, double-clic pour finir), choisir largeur, profondeur et forme des berges, « Creuser le lit » : le
+fond est abaissé sous la surface d'eau mesurée par le LiDAR avec un profil parabolique ; « zone à abaisser »
+applique un décalage constant dans un polygone. Le cas modifié se garde avec « Enregistrer le cas ».
+
 En ligne de commande :
 
 ```bat
 swe --import 234800,145600,236400,147200 --cell 2 --library "C:\...\BATHYMETRIE_GEOTIFF_31370_PROV_LIEGE" --name liege --ortho --level 60
+swe --import 238500,141500,240500,143500 --cell 2 --name vesdre_chaudfontaine --ortho --carve "240400,141600;239200,142800" --carve-width 40 --carve-depth 4
 swe --case liege
 ```
 

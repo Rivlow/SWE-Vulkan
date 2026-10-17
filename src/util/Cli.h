@@ -36,6 +36,8 @@ struct Options
 	bool        importOrtho = false;        // --ortho: also fetch the SPW orthophoto
 	double      importLevel = std::numeric_limits<double>::quiet_NaN();        // --level <m DNG>: still water
 	bool        hideGui     = false;        // --no-gui: 3D view only (F11 toggles)
+	std::string carve;                      // --carve "x1,y1;x2,y2;..." (Lambert 72) with --carve-width/--carve-depth
+	double      carveWidth = 20.0, carveDepth = 2.0;
 	float       zScale         = -1.0f;        // --z-scale (default: case value)
 	bool        help           = false;
 };
@@ -77,6 +79,9 @@ inline Options parseOptions(int argc, char **argv)
 		else if (a == "--ortho")             o.importOrtho = true;
 		else if (a == "--level")             o.importLevel = std::stod(next(i));
 		else if (a == "--no-gui")            o.hideGui = true;
+		else if (a == "--carve")             o.carve = next(i);
+		else if (a == "--carve-width")       o.carveWidth = std::stod(next(i));
+		else if (a == "--carve-depth")       o.carveDepth = std::stod(next(i));
 		else if (a == "--probe")
 		{
 			auto v     = next(i);

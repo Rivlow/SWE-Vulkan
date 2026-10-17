@@ -251,6 +251,13 @@ std::optional<ImportOutcome> MapPanel::takeOutcome()
 	return o;
 }
 
+std::optional<BedEdit> MapPanel::takeBedEdit()
+{
+	auto e = std::move(pendingEdit_);
+	pendingEdit_.reset();
+	return e;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------------------------
@@ -308,8 +315,8 @@ void MapPanel::drawToolbar()
 			locationError_ = "Position non reconnue";
 	}
 	ImGui::SameLine();
-	if (ImGui::Button(drawMode_ ? "Tracer : cliquer-glisser sur la carte" : "Tracer une zone"))
-		drawMode_ = !drawMode_;
+	if (ImGui::Button(tool_ == Tool::Box ? "Zone : cliquer-glisser sur la carte" : "Tracer une zone"))
+		tool_ = tool_ == Tool::Box ? Tool::None : Tool::Box;
 	if (box_)
 	{
 		ImGui::SameLine();
@@ -393,6 +400,31 @@ void MapPanel::drawMap(uint64_t frame)
 	};
 	if (box_)
 		drawBox(*box_, IM_COL32(255, 160, 40, 45), IM_COL32(255, 140, 20, 255));
+	// --- bed edit sketch (river axis with its width, or polygon)
+	if (!sketch_.empty())
+	{
+		std::vector<ImVec2> pts;
+		for (auto const &p : sketch_)
+			pts.push_back(lambertToScreen(p.x, p.y));
+		double mpp = 156543.03392 * std::cos(center_.lat * 3.14159265 / 180.0) / std::pow(2.0, zoom_);
+		bool   channel = tool_ == Tool::Channel || edit_.type == BedEdit::Type::Channel;
+		if (channel)
+		{
+			if (pts.size() >= 2)
+				dl->AddPolyline(pts.data(), int(pts.size()), IM_COL32(40, 120, 255, 110), ImDrawFlags_None, float(edit_.width / mpp));
+			if (pts.size() >= 2)
+				dl->AddPolyline(pts.data(), int(pts.size()), IM_COL32(20, 80, 255, 255), ImDrawFlags_None, 2.0f);
+		}
+		else if (pts.size() >= 3)
+		{
+			dl->AddConvexPolyFilled(pts.data(), int(pts.size()), IM_COL32(200, 60, 255, 40));
+			dl->AddPolyline(pts.data(), int(pts.size()), IM_COL32(180, 40, 255, 255), ImDrawFlags_Closed, 2.0f);
+		}
+		else if (pts.size() == 2)
+			dl->AddLine(pts[0], pts[1], IM_COL32(180, 40, 255, 255), 2.0f);
+		for (auto const &p : pts)
+			dl->AddCircleFilled(p, 4.0f, IM_COL32(255, 255, 255, 255));
+	}
 
 	// --- input
 	ImGui::InvisibleButton("canvas", mapSize_, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
@@ -408,16 +440,28 @@ void MapPanel::drawMap(uint64_t frame)
 		center_       = geo::fromTile({tc.x + (tb.x - ta.x), tc.y + (tb.y - ta.y)}, 0);
 		tiles_.cancelPending();
 	}
-	bool drawingNow = drawMode_ || ImGui::IsMouseDown(ImGuiMouseButton_Right);
-	if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f) && !drawMode_)
+	bool sketching = tool_ == Tool::Channel || tool_ == Tool::Polygon;
+	// sketch tools: left click adds a vertex, right click removes the last one, double click finishes
+	if (sketching && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsMouseDragging(ImGuiMouseButton_Left, 4.0f))
+	{
+		if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+			tool_ = Tool::None;
+		else
+			sketch_.push_back(geo::toLambert(screenToLonLat(io.MousePos)));
+	}
+	if (sketching && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !sketch_.empty())
+		sketch_.pop_back();
+	bool boxMode    = tool_ == Tool::Box;
+	bool drawingNow = boxMode || (!sketching && ImGui::IsMouseDown(ImGuiMouseButton_Right));
+	if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f) && !boxMode)
 	{
 		// pan
 		double scale = kTilePx * std::pow(2.0, zoom_);
 		auto   tc    = geo::toTile(center_, 0);
 		center_      = geo::fromTile({tc.x - io.MouseDelta.x / scale, tc.y - io.MouseDelta.y / scale}, 0);
 	}
-	// rectangle: left drag in draw mode, or right drag anytime
-	int drawButton = drawMode_ ? ImGuiMouseButton_Left : ImGuiMouseButton_Right;
+	// rectangle: left drag in box mode, or right drag anytime (outside the sketch tools)
+	int drawButton = boxMode ? ImGuiMouseButton_Left : ImGuiMouseButton_Right;
 	if (hovered && ImGui::IsMouseClicked(drawButton) && drawingNow)
 	{
 		auto ll     = screenToLonLat(io.MousePos);
@@ -440,7 +484,7 @@ void MapPanel::drawMap(uint64_t frame)
 			{
 				box_ = b;
 				reports_.clear();
-				drawMode_ = false;
+				tool_ = Tool::None;
 			}
 		}
 	}
@@ -556,6 +600,8 @@ void MapPanel::drawSidebar()
 		ImGui::TextWrapped("%s", status_.c_str());
 
 	ImGui::Spacing();
+	if (ImGui::CollapsingHeader("Lit de rivière (zones sans bathymétrie)"))
+		drawBedTools();
 	if (ImGui::CollapsingHeader("Données locales (MNT / bathymétrie SPW)"))
 		drawLibrary();
 	ImGui::Spacing();
@@ -597,6 +643,81 @@ void MapPanel::drawSourcesTable()
 		}
 		ImGui::EndTable();
 	}
+}
+
+void MapPanel::drawBedTools()
+{
+	ImGui::TextWrapped("Le LiDAR mesure la surface de l'eau : là où aucune bathymétrie n'existe, creusez un lit "
+	                   "estimé le long de l'axe de la rivière, ou abaissez une zone.");
+	if (!caseGeo_)
+	{
+		ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "Chargez d'abord un cas géoréférencé (importé).");
+	}
+	bool channel = edit_.type == BedEdit::Type::Channel;
+	if (ImGui::RadioButton("axe de rivière", channel))
+	{
+		edit_.type = BedEdit::Type::Channel;
+		if (tool_ == Tool::Polygon)
+			tool_ = Tool::Channel;
+	}
+	ImGui::SameLine();
+	if (ImGui::RadioButton("zone à abaisser", !channel))
+	{
+		edit_.type = BedEdit::Type::Polygon;
+		if (tool_ == Tool::Channel)
+			tool_ = Tool::Polygon;
+	}
+	Tool wanted = edit_.type == BedEdit::Type::Channel ? Tool::Channel : Tool::Polygon;
+	if (ImGui::Button(tool_ == wanted ? "Tracé en cours : clic = point, double-clic = fin" : "Tracer sur la carte"))
+	{
+		if (tool_ == wanted)
+			tool_ = Tool::None;
+		else
+		{
+			tool_ = wanted;
+			sketch_.clear();
+		}
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Effacer le tracé"))
+	{
+		sketch_.clear();
+		tool_ = Tool::None;
+	}
+	ImGui::Text("%zu point(s)", sketch_.size());
+	if (edit_.type == BedEdit::Type::Channel)
+	{
+		float w = float(edit_.width), d = float(edit_.depth), s = float(edit_.bankSmoothing);
+		ImGui::SetNextItemWidth(-110);
+		if (ImGui::SliderFloat("largeur (m)", &w, 2.0f, 300.0f, "%.0f", ImGuiSliderFlags_Logarithmic))
+			edit_.width = w;
+		ImGui::SetNextItemWidth(-110);
+		if (ImGui::SliderFloat("profondeur (m)", &d, 0.2f, 15.0f, "%.1f"))
+			edit_.depth = d;
+		ImGui::SetNextItemWidth(-110);
+		if (ImGui::SliderFloat("berges", &s, 0.0f, 1.0f, "%.2f"))
+			edit_.bankSmoothing = s;
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("1 = profil parabolique, 0 = fond plat et berges raides");
+	}
+	else
+	{
+		float dz = float(edit_.dz);
+		ImGui::SetNextItemWidth(-110);
+		if (ImGui::SliderFloat("abaissement (m)", &dz, -10.0f, 10.0f, "%.1f"))
+			edit_.dz = dz;
+	}
+	size_t need = edit_.type == BedEdit::Type::Channel ? 2 : 3;
+	ImGui::BeginDisabled(!caseGeo_ || sketch_.size() < need);
+	if (ImGui::Button(edit_.type == BedEdit::Type::Channel ? "Creuser le lit" : "Appliquer à la zone", ImVec2(-1, 0)))
+	{
+		BedEdit e   = edit_;
+		e.points    = sketch_;
+		pendingEdit_ = e;
+		tool_        = Tool::None;
+	}
+	ImGui::EndDisabled();
+	ImGui::TextDisabled("Le fond n'est jamais relevé par le creusement ; « Enregistrer le cas »\n(panneau Simulation) garde le résultat.");
 }
 
 void MapPanel::drawLibrary()

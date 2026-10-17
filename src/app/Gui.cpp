@@ -137,6 +137,8 @@ void App::drawGui()
 		map_->draw(&showMap_, frameCount_);
 		if (auto outcome = map_->takeOutcome())
 			loadImport(std::move(*outcome));
+		if (auto edit = map_->takeBedEdit())
+			applyBedEdit(*edit);
 	}
 	drawLegend();
 	drawProbeMarkers();
@@ -271,6 +273,13 @@ void App::drawSimulationPanel()
 	}
 	tip("Cas de calcul (fichiers assets/cases/*.json)");
 	ImGui::TextDisabled("%u x %u mailles de %.3g m  (%.2f M)", c.nx, c.ny, c.dx(), c.cells() * 1e-6);
+	if (caseGeo_)
+	{
+		ImGui::SameLine(ImGui::GetContentRegionAvail().x - 110);
+		if (ImGui::SmallButton("Enregistrer le cas"))
+			saveCurrentCase();
+		tip("Écrit le lit (creusements), l'eau initiale et les réglages dans assets/");
+	}
 
 	// transport
 	ImGui::Spacing();

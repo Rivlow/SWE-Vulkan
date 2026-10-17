@@ -305,6 +305,42 @@ void saveImportedCase(CaseData const &c, ImportMetadata const &meta, std::string
 	std::ofstream(assets / "cases" / (c.name + ".json")) << j.dump(2) << '\n';
 }
 
+void updateImportedCase(CaseData const &c, std::string const &assetDir)
+{
+	fs::path assets(assetDir);
+	auto     path = assets / "cases" / (c.name + ".json");
+	json     j    = fs::exists(path) ? readJson(path) : json::object();
+	if (j.value("type", "") != "imported")
+		throw std::runtime_error("only imported cases can be saved in place");
+
+	std::map<std::string, npy::Array> arrays;
+	arrays["zb"] = npy::makeArray(c.zb, {c.nx, c.ny});
+	arrays["h0"] = npy::makeArray(c.h0, {c.nx, c.ny});
+	if (!c.outside.empty())
+		arrays["outside"] = npy::makeArray(c.outside, {c.nx, c.ny});
+	npy::saveNpz(assets / j.at("data").get<std::string>(), arrays);
+
+	static char const *sides[4] = {"west", "east", "south", "north"};
+	json               bc;
+	for (int s = 0; s < 4; ++s)
+	{
+		switch (c.bc[s].kind)
+		{
+		case BcKind::Wall: bc[sides[s]] = {"wall"}; break;
+		case BcKind::Inflow: bc[sides[s]] = {"inflow", c.bc[s].value}; break;
+		case BcKind::Level: bc[sides[s]] = {"level", c.bc[s].value}; break;
+		}
+	}
+	j["bc"]        = bc;
+	j["manning_n"] = c.manning_n;
+	j["cfl"]       = c.cfl;
+	j["scheme"]    = c.scheme;
+	j["eta_0"]     = c.eta_0;
+	j["z_ref"]     = c.z_ref;
+	j["edited"]    = true;
+	std::ofstream(path) << j.dump(2) << '\n';
+}
+
 std::vector<CaseInfo> listCases(std::string const &assetDir)
 {
 	std::vector<CaseInfo> out;

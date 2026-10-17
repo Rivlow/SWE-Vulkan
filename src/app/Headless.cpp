@@ -3,6 +3,7 @@
 #include "cases/Cases.h"
 #include "cases/Npy.h"
 #include "app/Screenshot.h"
+#include "geo/Carve.h"
 #include "geo/TerrainBuilder.h"
 #include "geo/Tiles.h"
 #include "solver/Solver.h"
@@ -118,6 +119,26 @@ int runImport(Options const &opts)
 		log::info("  {:<40} {}{}", r.name, r.used ? "used" : "unused", r.error.empty() ? "" : "  (" + r.error + ")");
 	for (auto const &a : res.attributions)
 		log::info("  attribution: {}", a);
+
+	// optional channel carving along a polyline "x1,y1;x2,y2;..."
+	if (!opts.carve.empty())
+	{
+		geo::ChannelSpec spec{.width = opts.carveWidth, .depth = opts.carveDepth};
+		for (size_t pos = 0; pos < opts.carve.size();)
+		{
+			size_t  end = opts.carve.find(';', pos);
+			auto    tok = opts.carve.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+			geo::XY p;
+			if (sscanf_s(tok.c_str(), "%lf,%lf", &p.x, &p.y) == 2)
+				spec.axis.push_back(p);
+			if (end == std::string::npos)
+				break;
+			pos = end + 1;
+		}
+		geo::GridGeometry g{res.bed.nx, res.bed.ny, res.bed.x0, res.bed.y0, res.bed.cell};
+		size_t            n = geo::carveChannel(res.bed.v, g, spec);
+		log::info("carved channel: {} point(s), {} m wide, {} m deep, {} cell(s) modified", spec.axis.size(), spec.width, spec.depth, n);
+	}
 
 	auto           data = geo::TerrainBuilder::toCase(res, req);
 	ImportMetadata meta{.x0 = res.bed.x0, .y0 = res.bed.y0, .cell = res.bed.cell, .attributions = res.attributions};

@@ -257,20 +257,66 @@ void App::loadCase(std::string const &name)
 	probes_.clear();
 	updateProbeList();
 	resetSimulation();
-	// georeferenced cases: footprint on the map, orthophoto drape
+	// georeferenced cases: footprint on the map, orthophoto drape, bed tools
 	auto origin = caseOrigin(name, resolveAssetDir(opts_.assetDir));
-	if (origin.valid && map_)
-		map_->showBox({origin.x0, origin.y0, origin.x0 + data.nx * origin.cell, origin.y0 + data.ny * origin.cell}, true);
+	caseGeo_.reset();
+	orthoImage_ = {};
+	if (origin.valid)
+	{
+		caseGeo_ = geo::GridGeometry{data.nx, data.ny, origin.x0, origin.y0, origin.cell};
+		if (map_)
+			map_->showBox({origin.x0, origin.y0, origin.x0 + data.nx * origin.cell, origin.y0 + data.ny * origin.cell}, true);
+	}
+	if (map_)
+		map_->setCaseGeometry(caseGeo_);
 	if (!origin.orthoFile.empty())
 	{
 		std::ifstream f(std::filesystem::path(resolveAssetDir(opts_.assetDir)) / origin.orthoFile, std::ios::binary);
 		std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), {});
-		auto                 img = geo::decodeImage(bytes);
-		if (!img.empty())
-			renderer_->setOrthophoto(img.width, img.height, img.rgba.data());
+		orthoImage_ = geo::decodeImage(bytes);
+		if (!orthoImage_.empty())
+			renderer_->setOrthophoto(orthoImage_.width, orthoImage_.height, orthoImage_.rgba.data());
 		else
 			log::warn("orthophoto {} not readable", origin.orthoFile);
 	}
+}
+
+// Bed edit from the map: modifies the loaded case in memory (Save keeps it).
+void App::applyBedEdit(BedEdit const &edit)
+{
+	if (!caseGeo_)
+		return;
+	CaseData c = solver_->caseData();
+	size_t   n = 0;
+	if (edit.type == BedEdit::Type::Channel)
+		n = geo::carveChannel(c.zb, *caseGeo_, geo::ChannelSpec{.axis = edit.points, .width = edit.width, .depth = edit.depth, .bankSmoothing = edit.bankSmoothing});
+	else
+		n = geo::lowerPolygon(c.zb, *caseGeo_, edit.points, static_cast<float>(edit.dz));
+	log::info("bed edit: {} cell(s) modified", n);
+	if (n == 0)
+		return;
+	// still water keeps its surface: the initial depth follows the new bed
+	for (size_t k = 0; k < c.cells(); ++k)
+		if (c.h0[k] > 0.0f)
+		{
+			float eta = solver_->caseData().zb[k] + solver_->caseData().h0[k];
+			c.h0[k]   = std::max(eta - c.zb[k], 0.0f);
+		}
+	solver_->load(c);
+	effects_->setCase(solver_->caseData());
+	renderer_->setCase(solver_->caseData());
+	if (!orthoImage_.empty())
+		renderer_->setOrthophoto(orthoImage_.width, orthoImage_.height, orthoImage_.rgba.data());
+	resetSimulation();
+}
+
+void App::saveCurrentCase()
+{
+	if (!caseGeo_)
+		return;
+	updateImportedCase(solver_->caseData(), resolveAssetDir(opts_.assetDir));
+	caseList_ = listCases(resolveAssetDir(opts_.assetDir));
+	log::info("case '{}' saved", solver_->caseData().name);
 }
 
 // A finished geographic import: saved as a case (JSON + npz + orthophoto), then loaded like any other.

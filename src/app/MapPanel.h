@@ -1,6 +1,7 @@
 #pragma once
 // "Carte" panel: slippy map (OSM / SPW orthophoto tiles), area selection, data source probing and the
 // asynchronous geographic import that produces a case.
+#include "geo/Carve.h"
 #include "geo/Crs.h"
 #include "geo/LocalLibrary.h"
 #include "geo/Progress.h"
@@ -32,6 +33,20 @@ struct ImportOutcome
 	std::string        error;
 };
 
+// Bed edit requested from the map (applied by the application to the loaded case)
+struct BedEdit
+{
+	enum class Type
+	{
+		Channel,
+		Polygon,
+	};
+	Type                 type = Type::Channel;
+	std::vector<geo::XY> points;        // Lambert 72
+	double               width = 20.0, depth = 2.0, bankSmoothing = 1.0;        // channel
+	double               dz = 1.0;                                             // polygon: lowering (m)
+};
+
 class MapPanel
 {
   public:
@@ -43,6 +58,10 @@ class MapPanel
 
 	// An import finished since the last call (consumed once)
 	std::optional<ImportOutcome> takeOutcome();
+	// A bed edit was requested (consumed once)
+	std::optional<BedEdit> takeBedEdit();
+	// Geometry of the loaded case (bed edits are only possible on georeferenced cases)
+	void setCaseGeometry(std::optional<geo::GridGeometry> const &g) { caseGeo_ = g; }
 
 	// View state persistence
 	geo::LonLat center() const { return center_; }
@@ -69,6 +88,7 @@ class MapPanel
 	void   drawSidebar();
 	void   drawSourcesTable();
 	void   drawLibrary();
+	void   drawBedTools();
 	void   collectGarbage(uint64_t frame);
 	ImTextureID tileTexture(geo::TileKey const &key, uint64_t frame);
 	geo::LonLat screenToLonLat(ImVec2 p) const;
@@ -94,7 +114,18 @@ class MapPanel
 
 	// selection (Lambert 72)
 	std::optional<geo::BBox> box_;
-	bool                     drawMode_ = false;        // button "Tracer une zone"
+	enum class Tool
+	{
+		None,
+		Box,            // rectangle to import
+		Channel,        // river axis polyline
+		Polygon,        // area to lower
+	};
+	Tool                     tool_ = Tool::None;
+	std::vector<geo::XY>     sketch_;               // channel / polygon vertices
+	BedEdit                  edit_;                 // current parameters
+	std::optional<BedEdit>   pendingEdit_;
+	std::optional<geo::GridGeometry> caseGeo_;
 	char                     locationText_[256] = "";
 	std::string              locationError_;
 

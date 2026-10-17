@@ -39,4 +39,8 @@ struct ImportMetadata
 };
 void saveImportedCase(CaseData const &data, ImportMetadata const &meta, std::string const &assetDir);
 
+// Rewrites the arrays and the physical parameters of an existing imported case (bed edits, boundary
+// conditions...), keeping its provenance metadata.
+void updateImportedCase(CaseData const &data, std::string const &assetDir);
+
 }        // namespace swe
