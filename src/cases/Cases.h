@@ -24,6 +24,7 @@ struct GeoOrigin
 	bool        valid = false;
 	double      x0 = 0, y0 = 0;        // lower-left corner (m)
 	double      cell = 0;
+	int         epsg = 31370;
 	std::string orthoFile;             // relative to the asset dir, empty if none
 };
 GeoOrigin caseOrigin(std::string const &name, std::string const &assetDir);
@@ -32,7 +33,8 @@ GeoOrigin caseOrigin(std::string const &name, std::string const &assetDir);
 // assets/data/<name>.npz (zb, h0, outside, bathy mask), with provenance metadata.
 struct ImportMetadata
 {
-	double                   x0 = 0, y0 = 0, cell = 0;        // Lambert 72 grid origin
+	double                   x0 = 0, y0 = 0, cell = 0;        // grid origin in `epsg`
+	int                      epsg = 31370;
 	std::vector<std::string> sources;                        // human-readable list
 	std::vector<std::string> attributions;
 	std::string              orthoFile;                      // png next to the npz, optional

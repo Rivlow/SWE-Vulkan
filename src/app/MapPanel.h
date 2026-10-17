@@ -72,8 +72,8 @@ class MapPanel
 	int         layer() const { return layer_; }
 	void        setLayer(int l) { layer_ = l; }
 
-	// Shows a Lambert 72 box on the map (e.g. the loaded case) and frames it
-	void showBox(geo::BBox const &boxL72, bool frameIt);
+	// Shows a box (in `epsg`) on the map, e.g. the loaded case, and frames it
+	void showBox(geo::BBox const &box, int epsg, bool frameIt);
 
 	bool busy() const { return job_.valid(); }
 
@@ -95,8 +95,9 @@ class MapPanel
 	ImTextureID tileTexture(geo::TileKey const &key, uint64_t frame);
 	geo::LonLat screenToLonLat(ImVec2 p) const;
 	ImVec2      lonLatToScreen(geo::LonLat ll) const;
-	ImVec2      lambertToScreen(double x, double y) const;
-	void        frameBox(geo::BBox const &boxL72);
+	ImVec2      projToScreen(double x, double y, int epsg) const;
+	void        frameBox(geo::BBox const &box, int epsg);
+	int         sketchEpsg() const;        // projection of the sketch points (the loaded case, else the box)
 	void        startProbe();
 	void        startImport();
 	void        pollJob();
@@ -114,8 +115,9 @@ class MapPanel
 	bool        drawingBox_ = false;
 	geo::XY     boxStart_{};
 
-	// selection (Lambert 72)
+	// selection, in the working projection chosen for its centre (Lambert 72 near Belgium, UTM elsewhere)
 	std::optional<geo::BBox> box_;
+	int                      boxEpsg_ = geo::EPSG_LAMBERT72;
 	enum class Tool
 	{
 		None,

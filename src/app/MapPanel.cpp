@@ -38,7 +38,7 @@ ImTextureID toTextureId(VkDescriptorSet ds)
 }        // namespace
 
 MapPanel::MapPanel(vkc::Context const &ctx, geo::TerrainBuilder &builder) :
-    ctx_(ctx), builder_(builder), tiles_({geo::osmLayer(), geo::spwOrthoLayer()}, 4)
+    ctx_(ctx), builder_(builder), tiles_({geo::osmLayer(), geo::sentinelLayer(), geo::spwOrthoLayer()}, 4)
 {
 	auto const &folders = builder_.library().folders();
 	if (!folders.empty())
@@ -88,14 +88,20 @@ ImVec2 MapPanel::lonLatToScreen(geo::LonLat ll) const
 	return ImVec2(float(mapPos_.x + mapSize_.x * 0.5 + (t.x - c.x) * scale), float(mapPos_.y + mapSize_.y * 0.5 + (t.y - c.y) * scale));
 }
 
-ImVec2 MapPanel::lambertToScreen(double x, double y) const
+ImVec2 MapPanel::projToScreen(double x, double y, int epsg) const
 {
-	return lonLatToScreen(geo::toLonLat({x, y}));
+	geo::transform(epsg, geo::EPSG_WGS84, x, y);
+	return lonLatToScreen({x, y});
 }
 
-void MapPanel::frameBox(geo::BBox const &boxL72)
+int MapPanel::sketchEpsg() const
 {
-	auto ll  = geo::lambertToLonLatBox(boxL72);
+	return caseGeo_ ? caseGeo_->epsg : boxEpsg_;
+}
+
+void MapPanel::frameBox(geo::BBox const &box, int epsg)
+{
+	auto ll  = geo::transformBox(box, epsg, geo::EPSG_WGS84);
 	center_  = {0.5 * (ll.xmin + ll.xmax), 0.5 * (ll.ymin + ll.ymax)};
 	auto a   = geo::toTile({ll.xmin, ll.ymax}, 0), b = geo::toTile({ll.xmax, ll.ymin}, 0);
 	double w = std::max(b.x - a.x, 1e-12), h = std::max(b.y - a.y, 1e-12);
@@ -103,11 +109,12 @@ void MapPanel::frameBox(geo::BBox const &boxL72)
 	zoom_     = std::clamp(std::log2(std::min(sx, sy)), double(kMinZoom), double(kMaxZoom));
 }
 
-void MapPanel::showBox(geo::BBox const &boxL72, bool frameIt)
+void MapPanel::showBox(geo::BBox const &box, int epsg, bool frameIt)
 {
-	box_ = boxL72;
+	box_     = box;
+	boxEpsg_ = epsg;
 	if (frameIt)
-		frameBox(boxL72);
+		frameBox(box, epsg);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -170,11 +177,13 @@ void MapPanel::startProbe()
 	jobIsProbe_ = true;
 	status_     = "Sondage des sources…";
 	auto box    = *box_;
-	job_        = std::async(std::launch::async, [this, box] {
+	int  epsg   = boxEpsg_;
+	job_        = std::async(std::launch::async, [this, box, epsg] {
         ImportOutcome o;
-        o.request.box = box;
-        reports_      = {};
-        auto rep      = builder_.probe(box, progress_, true);
+        o.request.box  = box;
+        o.request.epsg = epsg;
+        reports_       = {};
+        auto rep       = builder_.probe(box, epsg, progress_, true);
         {
             // hand over through the outcome (consumed on the GUI thread)
             o.result.sources = rep;
@@ -192,6 +201,7 @@ void MapPanel::startImport()
 	status_     = "Import…";
 	geo::ImportRequest req;
 	req.box        = *box_;
+	req.epsg       = boxEpsg_;
 	req.cell       = kCells[cellIndex_];
 	req.mergeBathy = mergeBathy_;
 	req.name       = caseName_;
@@ -212,11 +222,13 @@ void MapPanel::startImport()
         o.result  = builder_.build(req, progress_, &o.error);
         if (!o.result.bed.v.empty() && ortho && !progress_.cancelled())
         {
-            progress_.set(0.95f, "Orthophoto SPW…");
-            std::string err;
-            o.orthophoto = geo::fetchOrthophoto(req.box, static_cast<uint32_t>(orthoPx), &err);
+            progress_.set(0.95f, "Orthophoto…");
+            std::string err, attribution;
+            o.orthophoto = geo::fetchOrthophoto(req.box, req.epsg, static_cast<uint32_t>(orthoPx), &err, &attribution);
             if (o.orthophoto.empty())
                 log::warn("orthophoto: {}", err);
+            else if (!attribution.empty())
+                o.result.attributions.push_back(attribution);
         }
         return o;
     });
@@ -339,7 +351,7 @@ void MapPanel::drawToolbar()
 	{
 		ImGui::SameLine();
 		if (ImGui::Button("Cadrer"))
-			frameBox(*box_);
+			frameBox(*box_, boxEpsg_);
 		ImGui::SameLine();
 		if (ImGui::Button("Effacer"))
 		{
@@ -409,21 +421,21 @@ void MapPanel::drawMap(uint64_t frame)
 		}
 	}
 
-	// --- selection rectangle (Lambert 72 box: draw its 4 corners projected)
-	auto drawBox = [&](geo::BBox const &bx, ImU32 fill, ImU32 line) {
-		ImVec2 p[4] = {lambertToScreen(bx.xmin, bx.ymin), lambertToScreen(bx.xmax, bx.ymin), lambertToScreen(bx.xmax, bx.ymax),
-		               lambertToScreen(bx.xmin, bx.ymax)};
+	// --- selection rectangle (projected box: draw its 4 corners)
+	auto drawBox = [&](geo::BBox const &bx, int epsg, ImU32 fill, ImU32 line) {
+		ImVec2 p[4] = {projToScreen(bx.xmin, bx.ymin, epsg), projToScreen(bx.xmax, bx.ymin, epsg), projToScreen(bx.xmax, bx.ymax, epsg),
+		               projToScreen(bx.xmin, bx.ymax, epsg)};
 		dl->AddConvexPolyFilled(p, 4, fill);
 		dl->AddPolyline(p, 4, line, ImDrawFlags_Closed, 2.0f);
 	};
 	if (box_)
-		drawBox(*box_, IM_COL32(255, 160, 40, 45), IM_COL32(255, 140, 20, 255));
+		drawBox(*box_, boxEpsg_, IM_COL32(255, 160, 40, 45), IM_COL32(255, 140, 20, 255));
 	// --- bed edit sketch (river axis with its width, or polygon)
 	if (!sketch_.empty())
 	{
 		std::vector<ImVec2> pts;
 		for (auto const &p : sketch_)
-			pts.push_back(lambertToScreen(p.x, p.y));
+			pts.push_back(projToScreen(p.x, p.y, sketchEpsg()));
 		double mpp = 156543.03392 * std::cos(center_.lat * 3.14159265 / 180.0) / std::pow(2.0, zoom_);
 		bool   channel = tool_ == Tool::Channel || edit_.type == BedEdit::Type::Channel;
 		if (channel)
@@ -467,7 +479,12 @@ void MapPanel::drawMap(uint64_t frame)
 		if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
 			tool_ = Tool::None;
 		else
-			sketch_.push_back(geo::toLambert(screenToLonLat(io.MousePos)));
+		{
+			auto   ll = screenToLonLat(io.MousePos);
+			double x = ll.lon, y = ll.lat;
+			geo::transform(geo::EPSG_WGS84, sketchEpsg(), x, y);
+			sketch_.push_back({x, y});
+		}
 	}
 	if (sketching && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !sketch_.empty())
 		sketch_.pop_back();
@@ -484,19 +501,23 @@ void MapPanel::drawMap(uint64_t frame)
 	int drawButton = boxMode ? ImGuiMouseButton_Left : ImGuiMouseButton_Right;
 	if (hovered && ImGui::IsMouseClicked(drawButton) && drawingNow)
 	{
+		// the working projection is chosen for the point where the drag starts
 		auto ll     = screenToLonLat(io.MousePos);
-		boxStart_   = geo::toLambert(ll);
+		boxEpsg_    = geo::suggestEpsg(ll);
+		boxStart_   = {ll.lon, ll.lat};
+		geo::transform(geo::EPSG_WGS84, boxEpsg_, boxStart_.x, boxStart_.y);
 		drawingBox_ = true;
 	}
 	if (drawingBox_)
 	{
-		auto ll  = screenToLonLat(io.MousePos);
-		auto cur = geo::toLambert(ll);
+		auto    ll  = screenToLonLat(io.MousePos);
+		geo::XY cur{ll.lon, ll.lat};
+		geo::transform(geo::EPSG_WGS84, boxEpsg_, cur.x, cur.y);
 		geo::BBox b{std::min(boxStart_.x, cur.x), std::min(boxStart_.y, cur.y), std::max(boxStart_.x, cur.x), std::max(boxStart_.y, cur.y)};
 		// snap to whole metres
 		b = {std::floor(b.xmin), std::floor(b.ymin), std::ceil(b.xmax), std::ceil(b.ymax)};
 		if (!b.empty())
-			drawBox(b, IM_COL32(255, 160, 40, 30), IM_COL32(255, 140, 20, 200));
+			drawBox(b, boxEpsg_, IM_COL32(255, 160, 40, 30), IM_COL32(255, 140, 20, 200));
 		if (ImGui::IsMouseReleased(drawButton))
 		{
 			drawingBox_ = false;
@@ -512,9 +533,11 @@ void MapPanel::drawMap(uint64_t frame)
 	// --- overlays: cursor position, scale bar, attribution
 	if (hovered)
 	{
-		auto ll = screenToLonLat(io.MousePos);
-		auto xy = geo::toLambert(ll);
-		auto txt = std::format("{:.5f}, {:.5f}   L72 {:.0f}, {:.0f}", ll.lat, ll.lon, xy.x, xy.y);
+		auto    ll   = screenToLonLat(io.MousePos);
+		int     epsg = box_ ? boxEpsg_ : geo::suggestEpsg(ll);
+		geo::XY xy{ll.lon, ll.lat};
+		geo::transform(geo::EPSG_WGS84, epsg, xy.x, xy.y);
+		auto txt = std::format("{:.5f}, {:.5f}   {} {:.0f}, {:.0f}", ll.lat, ll.lon, geo::crsName(epsg), xy.x, xy.y);
 		dl->AddRectFilled(ImVec2(mapPos_.x + 6, mapPos_.y + 6), ImVec2(mapPos_.x + 16 + ImGui::CalcTextSize(txt.c_str()).x, mapPos_.y + 26), IM_COL32(0, 0, 0, 140), 3.0f);
 		dl->AddText(ImVec2(mapPos_.x + 11, mapPos_.y + 9), IM_COL32_WHITE, txt.c_str());
 	}
@@ -559,8 +582,8 @@ void MapPanel::drawSidebar()
 	else
 	{
 		auto const &b = *box_;
-		ImGui::Text("%.0f x %.0f m", b.width(), b.height());
-		ImGui::TextDisabled("L72 %.0f, %.0f -> %.0f, %.0f", b.xmin, b.ymin, b.xmax, b.ymax);
+		ImGui::Text("%.0f x %.0f m   (%s)", b.width(), b.height(), geo::crsName(boxEpsg_).c_str());
+		ImGui::TextDisabled("%.0f, %.0f -> %.0f, %.0f", b.xmin, b.ymin, b.xmax, b.ymax);
 		ImGui::SetNextItemWidth(-90);
 		ImGui::Combo("maille", &cellIndex_, kCellLabels, IM_ARRAYSIZE(kCellLabels));
 		double cell = kCells[cellIndex_];
@@ -595,9 +618,11 @@ void MapPanel::drawSidebar()
 		ImGui::SetNextItemWidth(-90);
 		ImGui::SliderFloat("Manning n", &manning_, 0.0f, 0.1f, "%.3f");
 		ImGui::Checkbox("Fusionner la bathymétrie", &mergeBathy_);
-		ImGui::Checkbox("Orthophoto SPW drapée", &fetchOrtho_);
+		ImGui::Checkbox("Orthophoto drapée", &fetchOrtho_);
 		if (fetchOrtho_)
 		{
+			auto ll = geo::transformBox(b, boxEpsg_, geo::EPSG_WGS84);
+			ImGui::TextDisabled("%s", geo::orthophotoSourceName({0.5 * (ll.xmin + ll.xmax), 0.5 * (ll.ymin + ll.ymax)}).c_str());
 			ImGui::SameLine();
 			ImGui::SetNextItemWidth(90);
 			ImGui::Combo("##orthopx", &orthoPixels_, "1024\0" "2048\0" "4096\0");

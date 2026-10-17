@@ -19,8 +19,8 @@ struct OgcService
 	Protocol    protocol = Protocol::Wcs201;
 	std::string baseUrl;
 	std::string layer;             // coverage id / layer name
-	int         requestEpsg = 31370;   // CRS of the BBOX we send (31370 when the server accepts it)
-	bool        outputL72 = true;      // server reprojects to Lambert 72 (OUTPUTCRS) - else we warp
+	int         requestEpsg = 31370;   // CRS of the BBOX we send (the server's native grid)
+	bool        outputL72 = true;      // server can reproject to Lambert 72 (OUTPUTCRS) when that is the target
 	int         maxPixels = 2000;      // per side
 	double      nativeRes = 1.0;
 };
@@ -30,10 +30,10 @@ class OgcSource : public RasterSource
   public:
 	OgcSource(SourceInfo info, OgcService service);
 	SourceInfo const &info() const override { return info_; }
-	Grid              fetch(BBox const &box, double cell, Progress &progress, std::string *error) override;
+	Grid              fetch(BBox const &box, double cell, int epsg, Progress &progress, std::string *error) override;
 
   private:
-	std::string requestUrl(BBox const &boxReq, uint32_t w, uint32_t h) const;
+	std::string requestUrl(BBox const &boxReq, uint32_t w, uint32_t h, bool outputL72) const;
 
 	SourceInfo info_;
 	OgcService service_;
@@ -44,7 +44,7 @@ class CopernicusSource : public RasterSource
   public:
 	CopernicusSource();
 	SourceInfo const &info() const override { return info_; }
-	Grid              fetch(BBox const &box, double cell, Progress &progress, std::string *error) override;
+	Grid              fetch(BBox const &box, double cell, int epsg, Progress &progress, std::string *error) override;
 
   private:
 	SourceInfo info_;

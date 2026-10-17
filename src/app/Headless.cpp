@@ -75,13 +75,27 @@ int runHeadless(Options const &opts, vkc::Context const &ctx)
 
 int runImport(Options const &opts)
 {
+	geo::init();
 	geo::BBox box;
-	if (sscanf_s(opts.importBox.c_str(), "%lf,%lf,%lf,%lf", &box.xmin, &box.ymin, &box.xmax, &box.ymax) != 4 || box.empty())
+	int       epsg = geo::EPSG_LAMBERT72;
+	if (!opts.importBoxLL.empty())
+	{
+		geo::BBox ll;
+		if (sscanf_s(opts.importBoxLL.c_str(), "%lf,%lf,%lf,%lf", &ll.xmin, &ll.ymin, &ll.xmax, &ll.ymax) != 4 || ll.empty())
+		{
+			log::error("--import-ll expects lonmin,latmin,lonmax,latmax");
+			return 1;
+		}
+		epsg = geo::suggestEpsg({0.5 * (ll.xmin + ll.xmax), 0.5 * (ll.ymin + ll.ymax)});
+		box  = geo::transformBox(ll, geo::EPSG_WGS84, epsg);
+		box  = {std::floor(box.xmin), std::floor(box.ymin), std::ceil(box.xmax), std::ceil(box.ymax)};
+		log::info("working projection: {} (EPSG:{})", geo::crsName(epsg), epsg);
+	}
+	else if (sscanf_s(opts.importBox.c_str(), "%lf,%lf,%lf,%lf", &box.xmin, &box.ymin, &box.xmax, &box.ymax) != 4 || box.empty())
 	{
 		log::error("--import expects xmin,ymin,xmax,ymax in Lambert 72 metres");
 		return 1;
 	}
-	geo::init();
 	geo::LocalLibrary library;
 	for (auto const &d : opts.libraryDirs)
 		library.addFolder(d);
@@ -91,11 +105,11 @@ int runImport(Options const &opts)
 	geo::Progress       progress;
 
 	log::info("probe {}x{} m at {} m", box.width(), box.height(), opts.importCell);
-	for (auto const &r : builder.probe(box, progress))
+	for (auto const &r : builder.probe(box, epsg, progress))
 		log::info("  {:<40} footprint {:5.1f} %  data {}{}", r.name, 100.0 * r.footprint,
 		          r.data < 0 ? std::string("-") : std::format("{:5.1f} %", 100.0 * r.data), r.error.empty() ? "" : "  (" + r.error + ")");
 
-	geo::ImportRequest req{.box = box, .cell = opts.importCell, .name = opts.importName, .label = opts.importName};
+	geo::ImportRequest req{.box = box, .epsg = epsg, .cell = opts.importCell, .name = opts.importName, .label = opts.importName};
 	if (std::isfinite(opts.importLevel))
 	{
 		req.initial = geo::InitialWater::Level;
@@ -135,27 +149,28 @@ int runImport(Options const &opts)
 				break;
 			pos = end + 1;
 		}
-		geo::GridGeometry g{res.bed.nx, res.bed.ny, res.bed.x0, res.bed.y0, res.bed.cell};
+		geo::GridGeometry g{res.bed.nx, res.bed.ny, res.bed.x0, res.bed.y0, res.bed.cell, res.bed.epsg};
 		size_t            n = geo::carveChannel(res.bed.v, g, spec);
 		log::info("carved channel: {} point(s), {} m wide, {} m deep, {} cell(s) modified", spec.axis.size(), spec.width, spec.depth, n);
 	}
 
 	auto           data = geo::TerrainBuilder::toCase(res, req);
-	ImportMetadata meta{.x0 = res.bed.x0, .y0 = res.bed.y0, .cell = res.bed.cell, .attributions = res.attributions};
+	ImportMetadata meta{.x0 = res.bed.x0, .y0 = res.bed.y0, .cell = res.bed.cell, .epsg = res.bed.epsg, .attributions = res.attributions};
 	for (auto const &r : res.sources)
 		if (r.used)
 			meta.sources.push_back(r.name);
 	if (opts.importOrtho)
 	{
-		std::string err;
-		auto        img = geo::fetchOrthophoto(box, 2048, &err);
+		std::string err, attribution;
+		auto        img = geo::fetchOrthophoto(box, epsg, 2048, &err, &attribution);
 		if (img.empty())
 			log::warn("orthophoto: {}", err);
 		else
 		{
 			meta.orthoFile = "data/" + data.name + "_ortho.png";
 			writePng(std::filesystem::path(resolveAssetDir(opts.assetDir)) / meta.orthoFile, img.rgba.data(), img.width, img.height, false);
-			log::info("orthophoto {}x{} saved", img.width, img.height);
+			meta.attributions.push_back(attribution);
+			log::info("orthophoto {}x{} saved ({})", img.width, img.height, attribution);
 		}
 	}
 	saveImportedCase(data, meta, resolveAssetDir(opts.assetDir));

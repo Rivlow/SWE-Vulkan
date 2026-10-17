@@ -199,6 +199,38 @@ BBox hull(BBox const &b, F const &f)
 
 }        // namespace
 
+BBox transformBox(BBox const &box, int fromEpsg, int toEpsg)
+{
+	if (fromEpsg == toEpsg)
+		return box;
+	return hull(box, [&](double x, double y) {
+		double px = x, py = y;
+		transform(fromEpsg, toEpsg, px, py);
+		return XY{px, py};
+	});
+}
+
+int suggestEpsg(LonLat c)
+{
+	// Belgium and its immediate surroundings: the national grid (and the SPW / Flemish data are native in it)
+	if (c.lon >= 2.3 && c.lon <= 6.6 && c.lat >= 49.3 && c.lat <= 51.7)
+		return EPSG_LAMBERT72;
+	int zone = static_cast<int>(std::floor((c.lon + 180.0) / 6.0)) + 1;
+	zone     = std::clamp(zone, 1, 60);
+	return (c.lat >= 0.0 ? 32600 : 32700) + zone;
+}
+
+std::string crsName(int epsg)
+{
+	if (epsg == EPSG_LAMBERT72)
+		return "Lambert 72";
+	if (epsg > 32600 && epsg <= 32660)
+		return "UTM " + std::to_string(epsg - 32600) + "N";
+	if (epsg > 32700 && epsg <= 32760)
+		return "UTM " + std::to_string(epsg - 32700) + "S";
+	return "EPSG:" + std::to_string(epsg);
+}
+
 BBox lambertToLonLatBox(BBox const &l72)
 {
 	return hull(l72, [](double x, double y) {

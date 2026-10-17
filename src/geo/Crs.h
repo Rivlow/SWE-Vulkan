@@ -59,6 +59,16 @@ BBox lonLatToLambertBox(BBox const &ll);
 // Generic transform (any EPSG -> any EPSG) for the WCS sources. Returns false on failure.
 bool transform(int fromEpsg, int toEpsg, double &x, double &y);
 
+// Bounding box of `box` (in fromEpsg) expressed in toEpsg: hull of corners and edge midpoints.
+BBox transformBox(BBox const &box, int fromEpsg, int toEpsg);
+
+// Working projection for an area: Belgian Lambert 72 around Belgium, else the WGS 84 / UTM zone of the point
+// (EPSG:326xx north, 327xx south). All solver grids are metric and axis-aligned in that projection.
+int suggestEpsg(LonLat centre);
+
+// Human-readable name of a working projection ("Lambert 72", "UTM 33N")
+std::string crsName(int epsg);
+
 // Parses "50.63, 5.57", "50.63 5.57", a Google Maps URL (@lat,lon / ?q=lat,lon / ll=lat,lon) or an
 // OpenStreetMap URL (#map=z/lat/lon). Returns false when nothing usable is found.
 bool parseLocation(std::string const &text, LonLat &out);

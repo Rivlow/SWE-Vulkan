@@ -1,5 +1,5 @@
 #pragma once
-// An elevation (or bathymetry) data source that can fill a Lambert 72 grid.
+// An elevation (or bathymetry) data source that can fill a metric grid in any working projection.
 #include "geo/Progress.h"
 #include "geo/Raster.h"
 
@@ -26,7 +26,7 @@ struct SourceInfo
 	double      resolution = 1.0; // native cell (m)
 	float       verticalOffset = 0.0f;   // added to the values to express them in DNG (Belgian datum), approximate
 	bool        online = false;
-	BBox        extentL72;        // approximate footprint in Lambert 72 (coverage estimate)
+	BBox        extentLonLat;     // approximate footprint (WGS 84 lon/lat) for the coverage estimate
 };
 
 class RasterSource
@@ -35,12 +35,12 @@ class RasterSource
 	virtual ~RasterSource() = default;
 	virtual SourceInfo const &info() const = 0;
 
-	// Cheap estimate: fraction of `box` inside the source footprint (0..1).
-	double footprintCoverage(BBox const &box) const;
+	// Cheap estimate: fraction of `box` (in `epsg`) inside the source footprint (0..1).
+	double footprintCoverage(BBox const &box, int epsg) const;
 
-	// Fills a grid of `cell` metres over `box` (NaN where the source has no data). May be slow (network).
+	// Fills a grid of `cell` metres over `box` (in `epsg`), NaN where the source has no data. May be slow.
 	// Returns an empty grid on failure and sets `error`.
-	virtual Grid fetch(BBox const &box, double cell, Progress &progress, std::string *error) = 0;
+	virtual Grid fetch(BBox const &box, double cell, int epsg, Progress &progress, std::string *error) = 0;
 };
 
 }        // namespace swe::geo

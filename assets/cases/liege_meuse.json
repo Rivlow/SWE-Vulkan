@@ -1,7 +1,8 @@
 {
   "attributions": [
     "Source : Service public de Wallonie (SPW)",
-    "© DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved"
+    "© DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved",
+    "Orthophotos © Service public de Wallonie (SPW)"
   ],
   "bc": {
     "east": [
@@ -40,5 +41,6 @@
   ],
   "type": "imported",
   "vertical_datum": "DNG (approx. for foreign sources)",
-  "z_ref": 52.0
+  "z_ref": 52.0,
+  "zones": []
 }

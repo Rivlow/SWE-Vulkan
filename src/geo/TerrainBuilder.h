@@ -29,7 +29,8 @@ enum class InitialWater
 
 struct ImportRequest
 {
-	BBox         box;                    // Lambert 72
+	BBox         box;                    // in `epsg`
+	int          epsg       = EPSG_LAMBERT72;   // working projection (see suggestEpsg)
 	double       cell       = 5.0;       // target resolution (m)
 	bool         mergeBathy = true;
 	bool         fillHoles  = true;
@@ -64,7 +65,7 @@ class TerrainBuilder
 	void                                               refreshLocal();        // after a library rescan
 
 	// Quick look at what covers `box`: footprints, plus a coarse fetch (~96 px across) for the data fraction.
-	std::vector<SourceReport> probe(BBox const &box, Progress &progress, bool fetchCoarse = true);
+	std::vector<SourceReport> probe(BBox const &box, int epsg, Progress &progress, bool fetchCoarse = true);
 
 	// Full import. Empty bed on failure (error in `error`).
 	ImportResult build(ImportRequest const &req, Progress &progress, std::string *error);

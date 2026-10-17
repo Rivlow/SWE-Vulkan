@@ -7,6 +7,9 @@
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
 #include <stb_image.h>
+#include <stb_image_write.h>
+
+#include "geo/Raster.h"
 
 #include <algorithm>
 #include <cmath>
@@ -39,17 +42,67 @@ BBox tileBounds3857(int z, int x, int y)
 }
 
 constexpr char const *kSpwOrtho = "https://geoservices.wallonie.be/arcgis/services/IMAGERIE/ORTHO_LAST/MapServer/WMSServer";
+constexpr char const *kEox      = "https://tiles.maps.eox.at/wms";
+
+// Orthophoto WMS services, finest first; the last one covers the world.
+struct OrthoService
+{
+	char const *id;
+	char const *name;
+	char const *base;
+	char const *layer;
+	int         epsg;            // request CRS (projected, x/y axis order)
+	bool        wms13;           // 1.3.0 (CRS=) or 1.1.1 (SRS=)
+	char const *format;
+	int         maxPixels;
+	BBox        extentLonLat;
+	char const *attribution;
+};
+
+OrthoService const kOrthoServices[] = {
+    {"spw", "Orthophoto SPW (Wallonie, 25 cm)", kSpwOrtho, "0", 31370, true, "image/jpeg", 4096, {2.75, 49.49, 6.45, 50.86},
+     "Orthophotos © Service public de Wallonie (SPW)"},
+    {"omw", "Orthophoto Digitaal Vlaanderen (25 cm)", "https://geo.api.vlaanderen.be/OMWRGBMRVL/wms", "Ortho", 31370, true, "image/jpeg", 2048,
+     {2.5, 50.67, 5.95, 51.52}, "Orthofoto's Digitaal Vlaanderen"},
+    {"pdok", "Luchtfoto PDOK (Pays-Bas, 25 cm)", "https://service.pdok.nl/hwh/luchtfotorgb/wms/v1_0", "Actueel_ortho25", 28992, true,
+     "image/jpeg", 4000, {3.3, 50.75, 7.25, 53.6}, "Luchtfoto PDOK / Beeldmateriaal Nederland (CC BY 4.0)"},
+    {"nrw", "DOP Geobasis NRW (10 cm)", "https://www.wms.nrw.de/geobasis/wms_nw_dop", "nw_dop_rgb", 25832, true, "image/jpeg", 4000,
+     {5.86, 50.32, 9.47, 52.53}, "Digitale Orthophotos © Geobasis NRW (dl-de/zero-2.0)"},
+    {"ign", "Orthophoto IGN (France, 20 cm)", "https://data.geopf.fr/wms-r/wms", "ORTHOIMAGERY.ORTHOPHOTOS", 2154, true, "image/jpeg", 4096,
+     {-5.2, 41.3, 9.6, 51.1}, "Orthophotos © IGN - Géoplateforme (Licence Ouverte Etalab 2.0)"},
+    {"s2", "Sentinel-2 cloudless (EOX, 10 m, monde)", kEox, "s2cloudless-2020_3857", 3857, false, "image/jpeg", 4096,
+     {-180.0, -85.0, 180.0, 85.0},
+     "Sentinel-2 cloudless - https://s2maps.eu by EOX IT Services GmbH (Contains modified Copernicus Sentinel data 2020)"},
+};
 
 std::string wmsUrl(std::string const &base, std::string const &layer, int epsg, BBox const &b, uint32_t w, uint32_t h,
-                   char const *format)
+                   char const *format, bool wms13 = true)
 {
-	// WMS 1.3.0 with EPSG:3857 / 31370: axis order x, y
-	return std::format("{}?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={}&STYLES=&CRS=EPSG:{}&BBOX={:.3f},{:.3f},{:.3f},{:.3f}"
+	// projected CRS: x/y axis order in both versions
+	std::string sep = base.find('?') == std::string::npos ? "?" : "&";
+	if (wms13)
+		return std::format("{}{}SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={}&STYLES=&CRS=EPSG:{}&BBOX={:.3f},{:.3f},{:.3f},{:.3f}"
+		                   "&WIDTH={}&HEIGHT={}&FORMAT={}",
+		                   base, sep, layer, epsg, b.xmin, b.ymin, b.xmax, b.ymax, w, h, format);
+	return std::format("{}{}SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS={}&STYLES=&SRS=EPSG:{}&BBOX={:.3f},{:.3f},{:.3f},{:.3f}"
 	                   "&WIDTH={}&HEIGHT={}&FORMAT={}",
-	                   base, layer, epsg, b.xmin, b.ymin, b.xmax, b.ymax, w, h, format);
+	                   base, sep, layer, epsg, b.xmin, b.ymin, b.xmax, b.ymax, w, h, format);
+}
+
+OrthoService const &orthoServiceAt(LonLat where)
+{
+	for (auto const &s : kOrthoServices)
+		if (s.extentLonLat.contains(where.lon, where.lat))
+			return s;
+	return kOrthoServices[std::size(kOrthoServices) - 1];
 }
 
 }        // namespace
+
+std::string orthophotoSourceName(LonLat where)
+{
+	return orthoServiceAt(where).name;
+}
 
 TileLayer osmLayer()
 {
@@ -71,6 +124,18 @@ TileLayer spwOrthoLayer()
 	l.minZoom     = 8;
 	l.maxZoom     = 20;
 	l.url         = [](int z, int x, int y) { return wmsUrl(kSpwOrtho, "0", EPSG_MERCATOR, tileBounds3857(z, x, y), 256, 256, "image/jpeg"); };
+	return l;
+}
+
+TileLayer sentinelLayer()
+{
+	TileLayer l;
+	l.id          = "s2cloudless";
+	l.name        = "Satellite Sentinel-2 (EOX, monde)";
+	l.attribution = "Sentinel-2 cloudless by EOX (modified Copernicus Sentinel data 2020)";
+	l.minZoom     = 2;
+	l.maxZoom     = 17;
+	l.url = [](int z, int x, int y) { return wmsUrl(kEox, "s2cloudless-2020_3857", EPSG_MERCATOR, tileBounds3857(z, x, y), 256, 256, "image/jpeg", false); };
 	return l;
 }
 
@@ -166,27 +231,27 @@ void TileProvider::worker()
 
 // ---------------------------------------------------------------------------------------------
 
-Image fetchOrthophoto(BBox const &box, uint32_t pixels, std::string *error)
+namespace {
+
+// Mosaic of WMS requests covering `srvBox` (in the service CRS) at `res` m/px: RGBA, row 0 = north.
+Image fetchMosaic(OrthoService const &s, BBox const &srvBox, double res, std::string *error)
 {
-	double   longest = std::max(box.width(), box.height());
-	double   res     = longest / pixels;                 // m / px
-	uint32_t W       = static_cast<uint32_t>(std::round(box.width() / res));
-	uint32_t H       = static_cast<uint32_t>(std::round(box.height() / res));
+	uint32_t W = static_cast<uint32_t>(std::round(srvBox.width() / res));
+	uint32_t H = static_cast<uint32_t>(std::round(srvBox.height() / res));
 	Image    out;
 	out.width  = W;
 	out.height = H;
 	out.rgba.assign(size_t(W) * H * 4, 0);
-
-	constexpr uint32_t kTile = 2048;
-	uint32_t           nx = (W + kTile - 1) / kTile, ny = (H + kTile - 1) / kTile;
-	bool               any = false;
+	uint32_t const tile = static_cast<uint32_t>(std::min(2048, s.maxPixels));
+	uint32_t       nx = (W + tile - 1) / tile, ny = (H + tile - 1) / tile;
+	bool           any = false;
 	for (uint32_t ty = 0; ty < ny; ++ty)
 		for (uint32_t tx = 0; tx < nx; ++tx)
 		{
-			uint32_t px0 = tx * kTile, py0 = ty * kTile;        // py from the top (north)
-			uint32_t w = std::min(kTile, W - px0), h = std::min(kTile, H - py0);
-			BBox     b{box.xmin + px0 * res, box.ymax - (py0 + h) * res, box.xmin + (px0 + w) * res, box.ymax - py0 * res};
-			auto     resp = http::get(wmsUrl(kSpwOrtho, "0", EPSG_LAMBERT72, b, w, h, "image/jpeg"), true, 120);
+			uint32_t px0 = tx * tile, py0 = ty * tile;        // py from the top (north)
+			uint32_t w = std::min(tile, W - px0), h = std::min(tile, H - py0);
+			BBox     b{srvBox.xmin + px0 * res, srvBox.ymax - (py0 + h) * res, srvBox.xmin + (px0 + w) * res, srvBox.ymax - py0 * res};
+			auto     resp = http::get(wmsUrl(s.base, s.layer, s.epsg, b, w, h, s.format, s.wms13), true, 120);
 			if (!resp.ok())
 			{
 				if (error)
@@ -197,16 +262,93 @@ Image fetchOrthophoto(BBox const &box, uint32_t pixels, std::string *error)
 			if (part.empty() || part.width != w || part.height != h)
 			{
 				if (error)
-					*error = "réponse WMS non décodable";
+					*error = std::string(s.name) + " : réponse WMS non décodable";
 				continue;
 			}
 			for (uint32_t row = 0; row < h; ++row)
 				std::copy_n(&part.rgba[size_t(row) * w * 4], size_t(w) * 4, &out.rgba[(size_t(py0 + row) * W + px0) * 4]);
 			any = true;
 		}
-	if (!any)
-		return {};
-	return out;
+	return any ? out : Image{};
+}
+
+bool mostlyBlank(Image const &img)
+{
+	// a WMS answering outside its coverage returns white / transparent tiles
+	size_t n = img.rgba.size() / 4, white = 0;
+	for (size_t k = 0; k < n; k += 97)
+		if ((img.rgba[4 * k] > 245 && img.rgba[4 * k + 1] > 245 && img.rgba[4 * k + 2] > 245) || img.rgba[4 * k + 3] < 10)
+			++white;
+	return white * 97 > n * 9 / 10;
+}
+
+}        // namespace
+
+Image fetchOrthophoto(BBox const &box, int epsg, uint32_t pixels, std::string *error, std::string *attribution)
+{
+	double   longest = std::max(box.width(), box.height());
+	double   res     = longest / pixels;        // m / px in the target grid
+	uint32_t W       = static_cast<uint32_t>(std::round(box.width() / res));
+	uint32_t H       = static_cast<uint32_t>(std::round(box.height() / res));
+	BBox     ll      = transformBox(box, epsg, EPSG_WGS84);
+	LonLat   centre{0.5 * (ll.xmin + ll.xmax), 0.5 * (ll.ymin + ll.ymax)};
+
+	// regional services first, Sentinel-2 as the universal fallback
+	std::vector<OrthoService const *> candidates;
+	for (auto const &s : kOrthoServices)
+		if (s.extentLonLat.contains(centre.lon, centre.lat))
+			candidates.push_back(&s);
+	for (auto const *s : candidates)
+	{
+		std::string err;
+		if (s->epsg == epsg)
+		{
+			// same grid: request the target box directly
+			Image img = fetchMosaic(*s, box, res, &err);
+			if (!img.empty() && !mostlyBlank(img))
+			{
+				if (attribution)
+					*attribution = s->attribution;
+				return img;
+			}
+		}
+		else
+		{
+			// request in the service CRS (hull + margin), then reproject onto the target grid
+			BBox   srv  = transformBox(box, epsg, s->epsg);
+			double m    = 4.0 * res;
+			srv         = {srv.xmin - m, srv.ymin - m, srv.xmax + m, srv.ymax + m};
+			double sres = std::max(srv.width(), srv.height()) / (pixels + 8);
+			Image  mosaic = fetchMosaic(*s, srv, sres, &err);
+			if (mosaic.empty() || mostlyBlank(mosaic))
+			{
+				if (error && !err.empty())
+					*error = err;
+				continue;
+			}
+			std::vector<uint8_t> bytes;
+			auto                 append = [](void *ctx, void *data, int size) {
+                auto *v = static_cast<std::vector<uint8_t> *>(ctx);
+                v->insert(v->end(), static_cast<uint8_t *>(data), static_cast<uint8_t *>(data) + size);
+			};
+			if (!stbi_write_png_to_func(append, &bytes, int(mosaic.width), int(mosaic.height), 4, mosaic.rgba.data(), int(mosaic.width) * 4))
+				continue;
+			auto rgba = warpImage(bytes, srv, s->epsg, box, epsg, W, H, &err);
+			if (!rgba.empty())
+			{
+				if (attribution)
+					*attribution = s->attribution;
+				Image out;
+				out.width  = W;
+				out.height = H;
+				out.rgba   = std::move(rgba);
+				return out;
+			}
+		}
+		if (error && !err.empty())
+			*error = err;
+	}
+	return {};
 }
 
 }        // namespace swe::geo

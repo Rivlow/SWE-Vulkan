@@ -15,7 +15,8 @@ namespace swe::geo {
 namespace {
 
 // Writes bytes into GDAL's in-memory file system and reads them as a raster window.
-Grid gridFromBytes(std::vector<uint8_t> const &bytes, std::string const &name, BBox const &box, double cell, std::string *error)
+Grid gridFromBytes(std::vector<uint8_t> const &bytes, std::string const &name, BBox const &box, double cell, int epsg, int srcEpsg,
+                   std::string *error)
 {
 	std::string vsi = "/vsimem/swe_" + name + ".tif";
 	// VSIFileFromMemBuffer takes ownership only when bTakeOwnership = TRUE; keep a copy GDAL may free
@@ -29,7 +30,7 @@ Grid gridFromBytes(std::vector<uint8_t> const &bytes, std::string const &name, B
 		return {};
 	}
 	VSIFCloseL(f);
-	Grid g = readWindow(vsi, box, cell, error);
+	Grid g = readWindow(vsi, box, cell, epsg, error, srcEpsg);
 	VSIUnlink(vsi.c_str());
 	return g;
 }
@@ -68,7 +69,7 @@ OgcSource::OgcSource(SourceInfo info, OgcService service) :
 	info_.online = true;
 }
 
-std::string OgcSource::requestUrl(BBox const &b, uint32_t w, uint32_t h) const
+std::string OgcSource::requestUrl(BBox const &b, uint32_t w, uint32_t h, bool outputL72) const
 {
 	auto const &s   = service_;
 	std::string sep = s.baseUrl.find('?') == std::string::npos ? "?" : "&";
@@ -85,7 +86,7 @@ std::string OgcSource::requestUrl(BBox const &b, uint32_t w, uint32_t h) const
 		                              s.baseUrl, sep, s.layer, fmt(b.xmin), fmt(b.xmax), fmt(b.ymin), fmt(b.ymax));
 		std::string crs = std::format("http://www.opengis.net/def/crs/EPSG/0/{}", s.requestEpsg);
 		url += "&SUBSETTINGCRS=" + http::urlEncode(crs);
-		if (s.outputL72)
+		if (outputL72)
 			url += "&OUTPUTCRS=" + http::urlEncode("http://www.opengis.net/def/crs/EPSG/0/31370");
 		return url;
 	}
@@ -97,39 +98,17 @@ std::string OgcSource::requestUrl(BBox const &b, uint32_t w, uint32_t h) const
 	return {};
 }
 
-Grid OgcSource::fetch(BBox const &box, double cell, Progress &progress, std::string *error)
+Grid OgcSource::fetch(BBox const &box, double cell, int epsg, Progress &progress, std::string *error)
 {
-	Grid out(box, cell);
+	Grid out(box, cell, epsg);
 	// request resolution: never finer than the native product, never coarser than the target
 	double reqRes = std::max(service_.nativeRes, std::min(cell, service_.nativeRes * 4.0));
-	// request box in the server's CRS (hull of the target box)
-	BBox reqBox = box;
-	if (service_.requestEpsg != EPSG_LAMBERT72)
-	{
-		reqBox = BBox{1e300, 1e300, -1e300, -1e300};
-		double xs[3] = {box.xmin, 0.5 * (box.xmin + box.xmax), box.xmax};
-		double ys[3] = {box.ymin, 0.5 * (box.ymin + box.ymax), box.ymax};
-		for (double x : xs)
-			for (double y : ys)
-			{
-				double px = x, py = y;
-				if (!transform(EPSG_LAMBERT72, service_.requestEpsg, px, py))
-				{
-					if (error)
-						*error = "reprojection vers le CRS du service impossible";
-					return {};
-				}
-				reqBox.xmin = std::min(reqBox.xmin, px);
-				reqBox.xmax = std::max(reqBox.xmax, px);
-				reqBox.ymin = std::min(reqBox.ymin, py);
-				reqBox.ymax = std::max(reqBox.ymax, py);
-			}
-		// margin for the warp
-		double m = 2.0 * reqRes;
-		reqBox   = {reqBox.xmin - m, reqBox.ymin - m, reqBox.xmax + m, reqBox.ymax + m};
-	}
-	else
-		reqBox = {box.xmin - reqRes, box.ymin - reqRes, box.xmax + reqRes, box.ymax + reqRes};
+	// request box in the server's CRS (hull of the target box) with a margin for the warp
+	BBox   reqBox = transformBox(box, epsg, service_.requestEpsg);
+	double m      = 2.0 * reqRes;
+	reqBox        = {reqBox.xmin - m, reqBox.ymin - m, reqBox.xmax + m, reqBox.ymax + m};
+	// the server reprojects for us only when the target is Lambert 72 and it supports it
+	bool outputL72 = service_.outputL72 && epsg == EPSG_LAMBERT72;
 
 	// tiling under the pixel limit; a WCS 2.0.1 GetCoverage without scaling returns the native resolution
 	bool     native = service_.protocol == OgcService::Protocol::Wcs201;
@@ -149,7 +128,7 @@ Grid OgcSource::fetch(BBox const &box, double cell, Progress &progress, std::str
 			       std::min(reqBox.ymin + (b + 1) * tileM, reqBox.ymax)};
 			auto w   = static_cast<uint32_t>(std::max(1.0, std::round(t.width() / reqRes)));
 			auto h   = static_cast<uint32_t>(std::max(1.0, std::round(t.height() / reqRes)));
-			auto url = requestUrl(t, w, h);
+			auto url = requestUrl(t, w, h, outputL72);
 			progress.set(float(done) / float(total), std::format("{} : tuile {}/{}", info_.name, done + 1, total));
 			auto r = http::get(url);
 			++done;
@@ -170,7 +149,7 @@ Grid OgcSource::fetch(BBox const &box, double cell, Progress &progress, std::str
 				continue;
 			}
 			std::string err;
-			Grid        part = gridFromBytes(tiff, info_.id, box, cell, &err);
+			Grid        part = gridFromBytes(tiff, info_.id, box, cell, epsg, outputL72 ? EPSG_LAMBERT72 : service_.requestEpsg, &err);
 			if (part.v.empty())
 			{
 				log::warn("{}: {}", info_.name, err);
@@ -202,13 +181,13 @@ CopernicusSource::CopernicusSource()
 	info_.resolution     = 30.0;
 	info_.verticalOffset = 2.3f;        // EGM2008 -> DNG, approximate
 	info_.online         = true;
-	info_.extentL72      = {-1e7, -1e7, 1e7, 1e7};
+	info_.extentLonLat   = {-180.0, -90.0, 180.0, 90.0};
 }
 
-Grid CopernicusSource::fetch(BBox const &box, double cell, Progress &progress, std::string *error)
+Grid CopernicusSource::fetch(BBox const &box, double cell, int epsg, Progress &progress, std::string *error)
 {
-	Grid out(box, cell);
-	BBox ll = lambertToLonLatBox(box);
+	Grid out(box, cell, epsg);
+	BBox ll = transformBox(box, epsg, EPSG_WGS84);
 	int  lon0 = static_cast<int>(std::floor(ll.xmin)), lon1 = static_cast<int>(std::floor(ll.xmax));
 	int  lat0 = static_cast<int>(std::floor(ll.ymin)), lat1 = static_cast<int>(std::floor(ll.ymax));
 	int  total = (lon1 - lon0 + 1) * (lat1 - lat0 + 1), done = 0;
@@ -223,7 +202,7 @@ Grid CopernicusSource::fetch(BBox const &box, double cell, Progress &progress, s
 			std::string path = std::format("/vsicurl/https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com/{}/{}.tif", name, name);
 			progress.set(float(done) / float(total), std::format("Copernicus : dalle {}", name.substr(23)));
 			std::string err;
-			Grid        part = readWindow(path, box, cell, &err);
+			Grid        part = readWindow(path, box, cell, epsg, &err);
 			++done;
 			if (part.v.empty())
 			{
@@ -254,7 +233,7 @@ std::vector<std::unique_ptr<RasterSource>> makeOnlineSources()
 	{
 		SourceInfo i{.id = "dhmv2", .name = "Flandre : DHMV II MNT 1 m (LiDAR)", .provider = "Digitaal Vlaanderen",
 		             .licence = "Modellicentie gratis hergebruik", .attribution = "Bron: Digitaal Vlaanderen",
-		             .resolution = 1.0, .verticalOffset = 0.0f, .extentL72 = {20000, 150000, 262000, 246000}};
+		             .resolution = 1.0, .verticalOffset = 0.0f, .extentLonLat = {2.5, 50.67, 5.95, 51.52}};
 		OgcService s{.protocol = OgcService::Protocol::Wcs100, .baseUrl = "https://geo.api.vlaanderen.be/DHMV/wcs",
 		             .layer = "DHMVII_DTM_1m", .requestEpsg = 31370, .outputL72 = true, .maxPixels = 2500, .nativeRes = 1.0};
 		v.push_back(std::make_unique<OgcSource>(i, s));
@@ -262,24 +241,24 @@ std::vector<std::unique_ptr<RasterSource>> makeOnlineSources()
 	{
 		SourceInfo i{.id = "ahn4", .name = "Pays-Bas : AHN4 MNT 0,5 m (LiDAR)", .provider = "PDOK / Rijkswaterstaat",
 		             .licence = "CC0", .attribution = "AHN4, PDOK (CC0)", .resolution = 0.5, .verticalOffset = 2.32f,
-		             .extentL72 = {60000, 160000, 320000, 490000}};
+		             .extentLonLat = {3.3, 50.75, 7.25, 53.6}};
 		OgcService s{.protocol = OgcService::Protocol::Wcs201,
 		             .baseUrl  = "https://service.pdok.nl/rws/actueel-hoogtebestand-nederland/wcs/v1_0",
-		             .layer = "dtm_05m", .requestEpsg = 31370, .outputL72 = true, .maxPixels = 4000, .nativeRes = 0.5};
+		             .layer = "dtm_05m", .requestEpsg = 28992, .outputL72 = true, .maxPixels = 4000, .nativeRes = 0.5};
 		v.push_back(std::make_unique<OgcSource>(i, s));
 	}
 	{
 		SourceInfo i{.id = "nrw_dgm1", .name = "Allemagne (NRW) : DGM1 1 m (LiDAR)", .provider = "Geobasis NRW",
 		             .licence = "dl-de/zero-2.0", .attribution = "Geobasis NRW (dl-de/zero-2.0)", .resolution = 1.0,
-		             .verticalOffset = 2.31f, .extentL72 = {266000, 85000, 430000, 310000}};
+		             .verticalOffset = 2.31f, .extentLonLat = {5.86, 50.32, 9.47, 52.53}};
 		OgcService s{.protocol = OgcService::Protocol::Wcs201, .baseUrl = "https://www.wcs.nrw.de/geobasis/wcs_nw_dgm",
-		             .layer = "nw_dgm", .requestEpsg = 31370, .outputL72 = true, .maxPixels = 2000, .nativeRes = 1.0};
+		             .layer = "nw_dgm", .requestEpsg = 25832, .outputL72 = true, .maxPixels = 2000, .nativeRes = 1.0};
 		v.push_back(std::make_unique<OgcSource>(i, s));
 	}
 	{
 		SourceInfo i{.id = "ign_rge", .name = "France : RGE ALTI 1 m", .provider = "IGN (Géoplateforme)",
 		             .licence = "Licence Ouverte Etalab 2.0", .attribution = "IGN - RGE ALTI, Licence Ouverte Etalab 2.0",
-		             .resolution = 1.0, .verticalOffset = 1.82f, .extentL72 = {-350000, -750000, 330000, 40000}};
+		             .resolution = 1.0, .verticalOffset = 1.82f, .extentLonLat = {-5.2, 41.3, 9.6, 51.1}};
 		OgcService s{.protocol = OgcService::Protocol::WmsGeoTiff, .baseUrl = "https://data.geopf.fr/wms-r/wms",
 		             .layer = "ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES", .requestEpsg = 2154, .outputL72 = false,
 		             .maxPixels = 4000, .nativeRes = 1.0};

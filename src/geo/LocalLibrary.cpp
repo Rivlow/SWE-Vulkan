@@ -80,7 +80,7 @@ void LocalLibrary::indexFile(fs::path const &file)
 			log::warn("library: {} ignored ({})", p, err);
 			continue;
 		}
-		if (e.info.bands < 1 || e.info.epsg == 0 && e.info.boundsL72.empty())
+		if (e.info.bands < 1 || e.info.boundsLonLat.empty())
 			continue;
 		e.kind  = guessKind(p);
 		e.label = fs::path(p).filename().string();
@@ -139,6 +139,7 @@ void LocalLibrary::load()
 			le.info.boundsL72  = {b[0], b[1], b[2], b[3]};
 			auto bb            = e.value("bounds", b);
 			le.info.bounds     = {bb[0], bb[1], bb[2], bb[3]};
+			le.info.boundsLonLat = transformBox(le.info.boundsL72, EPSG_LAMBERT72, EPSG_WGS84);
 			le.info.resX       = e.value("res_x", 1.0);
 			le.info.resY       = e.value("res_y", 1.0);
 			le.info.width      = e.value("width", 0u);
@@ -215,7 +216,7 @@ void LocalSource::refresh()
 	{
 		if (le.kind != kind_ || !le.enabled)
 			continue;
-		auto const &b = le.info.boundsL72;
+		auto const &b = le.info.boundsLonLat;
 		e.xmin        = std::min(e.xmin, b.xmin);
 		e.ymin        = std::min(e.ymin, b.ymin);
 		e.xmax        = std::max(e.xmax, b.xmax);
@@ -223,17 +224,17 @@ void LocalSource::refresh()
 		res           = any ? std::min(res, le.info.resX) : le.info.resX;
 		any           = true;
 	}
-	info_.extentL72  = any ? e : BBox{};
-	info_.resolution = any ? res : 1.0;
+	info_.extentLonLat = any ? e : BBox{};
+	info_.resolution   = any ? res : 1.0;
 }
 
-Grid LocalSource::fetch(BBox const &box, double cell, Progress &progress, std::string *error)
+Grid LocalSource::fetch(BBox const &box, double cell, int epsg, Progress &progress, std::string *error)
 {
-	Grid out(box, cell);
+	Grid out(box, cell, epsg);
 	// finest rasters first: they win where several overlap
 	std::vector<LibraryEntry const *> hits;
 	for (auto const &le : library_.entries())
-		if (le.kind == kind_ && le.enabled && !le.info.boundsL72.intersect(box).empty())
+		if (le.kind == kind_ && le.enabled && !le.info.boundsIn(epsg).intersect(box).empty())
 			hits.push_back(&le);
 	std::ranges::sort(hits, [](auto *a, auto *b) { return a->info.resX < b->info.resX; });
 	if (hits.empty())
@@ -248,7 +249,7 @@ Grid LocalSource::fetch(BBox const &box, double cell, Progress &progress, std::s
 			return {};
 		progress.set(float(k) / float(hits.size()), info_.name + " : " + hits[k]->label);
 		std::string err;
-		Grid        part = readWindow(hits[k]->info.path, box, cell, &err);
+		Grid        part = readWindow(hits[k]->info.path, box, cell, epsg, &err);
 		if (part.v.empty())
 		{
 			log::warn("{}: {}", hits[k]->label, err);

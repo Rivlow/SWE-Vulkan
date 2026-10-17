@@ -39,6 +39,7 @@ struct TileLayer
 
 TileLayer osmLayer();
 TileLayer spwOrthoLayer();        // Wallonia orthophoto (WMS, cut into 3857 tiles)
+TileLayer sentinelLayer();        // Sentinel-2 cloudless (EOX), world
 
 struct TileKey
 {
@@ -92,8 +93,13 @@ class TileProvider
 	size_t                                                   maxReady_ = 1500;
 };
 
-// Orthophoto of a Lambert 72 box (SPW ORTHO_LAST WMS, EPSG:31370), assembled from <= 2048 px requests.
-// `pixels` is the longest side. Empty image on failure.
-Image fetchOrthophoto(BBox const &boxL72, uint32_t pixels, std::string *error = nullptr);
+// Orthophoto of `box` (in `epsg`) from the best regional WMS (SPW, Flanders, PDOK, NRW, IGN) or, anywhere in
+// the world, Sentinel-2 cloudless (EOX, 10 m). Assembled from <= 2048 px requests in the server's CRS, then
+// reprojected onto the box. `pixels` is the longest side. Empty image on failure; `attribution` receives the
+// text to credit.
+Image fetchOrthophoto(BBox const &box, int epsg, uint32_t pixels, std::string *error = nullptr, std::string *attribution = nullptr);
+
+// Name of the orthophoto source that would be used at a location
+std::string orthophotoSourceName(LonLat where);
 
 }        // namespace swe::geo

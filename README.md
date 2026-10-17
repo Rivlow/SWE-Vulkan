@@ -104,6 +104,13 @@ SPW est drapée sur le terrain, et le cas est sauvé (`assets/cases/<nom>.json` 
 | France RGE ALTI | WMS-R IGN (GeoTIFF float) | 1 m | NGF-IGN69 → DNG (+1,82 m) |
 | Monde : Copernicus GLO-30 | COG public S3 (`/vsicurl/`) | 30 m (MNS : bâtiments inclus) | EGM2008 → DNG (≈ +2,3 m) |
 
+**Projection de travail** : Lambert 72 autour de la Belgique, sinon la zone UTM du centre de la zone
+(EPSG:326xx / 327xx), choisie automatiquement ; les cas importés gardent leur projection dans le JSON (`crs`).
+Hors Belgique, le relief vient des flux nationaux disponibles (Flandre, Pays-Bas, NRW, France) puis de
+Copernicus 30 m partout ; l'orthophoto vient du service régional (SPW, Flandre, PDOK, NRW, IGN) ou, partout dans
+le monde, de **Sentinel-2 cloudless** (EOX, 10 m). La carte propose aussi un fond satellite Sentinel-2 mondial.
+Exemple : `swe --import-ll 12.455,41.885,12.505,41.915 --cell 10 --name rome --ortho` (Rome, UTM 33N).
+
 La Wallonie n'a **pas de flux d'altitude** : ses services WMS ne servent que des images 8 bits. Le MNT LiDAR
 wallon (1 m 2013-2014, 0,5 m 2021-2022) se télécharge par province sur le portail SPW (zips GeoTIFF, 13 à 43 Go
 pour Liège) et se dépose dans un dossier indexé par « Données locales » ; en attendant, Copernicus 30 m sert de

@@ -29,7 +29,8 @@ struct Options
 	bool        showMesh       = false;        // --mesh
 	std::vector<std::pair<int, int>> probes;   // --probe i,j (repeatable)
 	// geographic import (headless): --import xmin,ymin,xmax,ymax (Lambert 72) --cell m --library <dir>
-	std::string importBox;
+	std::string importBox;           // Lambert 72 metres
+	std::string importBoxLL;         // --import-ll lonmin,latmin,lonmax,latmax (WGS 84): projection chosen automatically
 	double      importCell = 5.0;
 	std::vector<std::string> libraryDirs;
 	std::string importName = "import";
@@ -76,6 +77,7 @@ inline Options parseOptions(int argc, char **argv)
 		else if (a == "--steps-per-frame")   o.stepsPerFrame = std::stoi(next(i));
 		else if (a == "--mesh")              o.showMesh = true;
 		else if (a == "--import")            o.importBox = next(i);
+		else if (a == "--import-ll")         o.importBoxLL = next(i);
 		else if (a == "--cell")              o.importCell = std::stod(next(i));
 		else if (a == "--library")           o.libraryDirs.push_back(next(i));
 		else if (a == "--name")              o.importName = next(i);

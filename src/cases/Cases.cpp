@@ -221,6 +221,8 @@ void buildImported(CaseData &c, json const &j, fs::path const &assets)
 	c.Ly    = c.ny * cell;
 	c.z_ref = j.value("z_ref", 0.0);
 	c.eta_0 = j.value("eta_0", 1.0);
+	if (auto crs = j.value("crs", std::string("EPSG:31370")); crs.rfind("EPSG:", 0) == 0)
+		c.epsg = std::stoi(crs.substr(5));
 	c.zb    = zb.asFloat();
 	c.h0    = npz.count("h0") ? npz.at("h0").asFloat() : std::vector<float>(c.cells(), 0.0f);
 	c.hu0.assign(c.cells(), 0.0f);
@@ -314,6 +316,9 @@ GeoOrigin caseOrigin(std::string const &name, std::string const &assetDir)
 			g.valid = true;
 		}
 		g.orthoFile = j.value("orthophoto", std::string{});
+		auto crs    = j.value("crs", std::string("EPSG:31370"));
+		if (crs.rfind("EPSG:", 0) == 0)
+			g.epsg = std::stoi(crs.substr(5));
 	}
 	catch (std::exception const &)
 	{
@@ -352,7 +357,7 @@ void saveImportedCase(CaseData const &c, ImportMetadata const &meta, std::string
 	       {"data", "data/" + c.name + ".npz"},
 	       {"cell", meta.cell},
 	       {"origin", {meta.x0, meta.y0}},
-	       {"crs", "EPSG:31370"},
+	       {"crs", "EPSG:" + std::to_string(meta.epsg)},
 	       {"vertical_datum", "DNG (approx. for foreign sources)"},
 	       {"z_ref", c.z_ref},
 	       {"eta_0", c.eta_0},

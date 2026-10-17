@@ -292,9 +292,9 @@ void App::loadCase(std::string const &name)
 	orthoImage_ = {};
 	if (origin.valid)
 	{
-		caseGeo_ = geo::GridGeometry{data.nx, data.ny, origin.x0, origin.y0, origin.cell};
+		caseGeo_ = geo::GridGeometry{data.nx, data.ny, origin.x0, origin.y0, origin.cell, origin.epsg};
 		if (map_)
-			map_->showBox({origin.x0, origin.y0, origin.x0 + data.nx * origin.cell, origin.y0 + data.ny * origin.cell}, true);
+			map_->showBox({origin.x0, origin.y0, origin.x0 + data.nx * origin.cell, origin.y0 + data.ny * origin.cell}, origin.epsg, true);
 	}
 	if (map_)
 		map_->setCaseGeometry(caseGeo_);
@@ -411,7 +411,8 @@ void App::saveCurrentCase()
 void App::loadImport(ImportOutcome &&o)
 {
 	auto data = geo::TerrainBuilder::toCase(o.result, o.request);
-	ImportMetadata meta{.x0 = o.result.bed.x0, .y0 = o.result.bed.y0, .cell = o.result.bed.cell, .attributions = o.result.attributions};
+	ImportMetadata meta{.x0 = o.result.bed.x0, .y0 = o.result.bed.y0, .cell = o.result.bed.cell, .epsg = o.result.bed.epsg,
+	                    .attributions = o.result.attributions};
 	for (auto const &r : o.result.sources)
 		if (r.used)
 			meta.sources.push_back(r.name);

@@ -50,7 +50,7 @@ class LocalSource : public RasterSource
   public:
 	LocalSource(LocalLibrary const &library, SourceKind kind);
 	SourceInfo const &info() const override { return info_; }
-	Grid              fetch(BBox const &box, double cell, Progress &progress, std::string *error) override;
+	Grid              fetch(BBox const &box, double cell, int epsg, Progress &progress, std::string *error) override;
 	// recompute footprint / resolution from the library entries (after a rescan)
 	void refresh();
 

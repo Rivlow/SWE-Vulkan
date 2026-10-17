@@ -14,6 +14,7 @@ struct GridGeometry
 {
 	uint32_t nx = 0, ny = 0;
 	double   x0 = 0, y0 = 0, cell = 1.0;
+	int      epsg = EPSG_LAMBERT72;        // projection of x0, y0 and of the points given to the tools
 };
 
 struct ChannelSpec

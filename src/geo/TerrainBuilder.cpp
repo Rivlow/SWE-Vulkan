@@ -27,7 +27,7 @@ void TerrainBuilder::refreshLocal()
 		local->refresh();
 }
 
-std::vector<SourceReport> TerrainBuilder::probe(BBox const &box, Progress &progress, bool fetchCoarse)
+std::vector<SourceReport> TerrainBuilder::probe(BBox const &box, int epsg, Progress &progress, bool fetchCoarse)
 {
 	std::vector<SourceReport> reports;
 	std::vector<RasterSource *> all;
@@ -39,12 +39,12 @@ std::vector<SourceReport> TerrainBuilder::probe(BBox const &box, Progress &progr
 	for (size_t k = 0; k < all.size(); ++k)
 	{
 		auto        *s = all[k];
-		SourceReport r{.id = s->info().id, .name = s->info().name, .footprint = s->footprintCoverage(box)};
+		SourceReport r{.id = s->info().id, .name = s->info().name, .footprint = s->footprintCoverage(box, epsg)};
 		if (fetchCoarse && r.footprint > 0.0)
 		{
 			progress.set(float(k) / float(all.size()), "Sondage : " + s->info().name);
 			std::string err;
-			Grid        g = s->fetch(box, std::max(coarse, s->info().resolution), progress, &err);
+			Grid        g = s->fetch(box, std::max(coarse, s->info().resolution), epsg, progress, &err);
 			r.data        = g.v.empty() ? 0.0 : g.coverage();
 			r.error       = err;
 		}
@@ -58,7 +58,7 @@ std::vector<SourceReport> TerrainBuilder::probe(BBox const &box, Progress &progr
 ImportResult TerrainBuilder::build(ImportRequest const &req, Progress &progress, std::string *error)
 {
 	ImportResult res;
-	Grid         bed(req.box, req.cell);
+	Grid         bed(req.box, req.cell, req.epsg);
 	size_t const n = bed.cells();
 	if (n == 0 || n > 16'000'000)
 	{
@@ -73,13 +73,13 @@ ImportResult TerrainBuilder::build(ImportRequest const &req, Progress &progress,
 	{
 		if (progress.cancelled())
 			return {};
-		SourceReport r{.id = s->info().id, .name = s->info().name, .footprint = s->footprintCoverage(req.box)};
+		SourceReport r{.id = s->info().id, .name = s->info().name, .footprint = s->footprintCoverage(req.box, req.epsg)};
 		double       missing = 1.0 - bed.coverage();
 		if (r.footprint > 0.0 && missing > 1e-6)
 		{
 			progress.set(float(step) / float(steps), s->info().name);
 			std::string err;
-			Grid        g = s->fetch(req.box, req.cell, progress, &err);
+			Grid        g = s->fetch(req.box, req.cell, req.epsg, progress, &err);
 			r.error       = err;
 			if (!g.v.empty())
 			{
@@ -105,12 +105,12 @@ ImportResult TerrainBuilder::build(ImportRequest const &req, Progress &progress,
 
 	// bathymetry overrides the terrain where surveyed
 	res.bathyMask.assign(n, 0);
-	if (req.mergeBathy && bathy_->footprintCoverage(req.box) > 0.0)
+	if (req.mergeBathy && bathy_->footprintCoverage(req.box, req.epsg) > 0.0)
 	{
 		progress.set(float(step) / float(steps), bathy_->info().name);
 		std::string  err;
-		Grid         g = bathy_->fetch(req.box, req.cell, progress, &err);
-		SourceReport r{.id = bathy_->info().id, .name = bathy_->info().name, .footprint = bathy_->footprintCoverage(req.box), .error = err};
+		Grid         g = bathy_->fetch(req.box, req.cell, req.epsg, progress, &err);
+		SourceReport r{.id = bathy_->info().id, .name = bathy_->info().name, .footprint = bathy_->footprintCoverage(req.box, req.epsg), .error = err};
 		if (!g.v.empty())
 		{
 			size_t count = 0;
@@ -162,6 +162,7 @@ CaseData TerrainBuilder::toCase(ImportResult const &result, ImportRequest const 
 	c.ny        = bed.ny;
 	c.Lx        = bed.nx * bed.cell;
 	c.Ly        = bed.ny * bed.cell;
+	c.epsg      = bed.epsg;
 	c.manning_n = req.manning;
 	c.depth_ref = req.depthRef;
 	c.z_scale_0 = req.zScale;

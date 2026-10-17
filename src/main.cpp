@@ -34,6 +34,7 @@ usage: swe [options]
     --steps <n>        number of solver steps
     --dump <dir>       write Q.npy, zb.npy and meta.json after the run
   --import xmin,ymin,xmax,ymax   geographic import (Lambert 72 m) of the bed, saved as a case
+  --import-ll lonmin,latmin,lonmax,latmax   same with a WGS 84 box (projection chosen automatically)
     --cell <m>         target cell size                                          [5]
     --library <dir>    folder of local GeoTIFF (SPW DTM / bathymetry), repeatable
     --name <n>         case name                                                 [import]
@@ -60,7 +61,7 @@ int main(int argc, char **argv)
 			return EXIT_SUCCESS;
 		}
 
-		if (!opts.importBox.empty())
+		if (!opts.importBox.empty() || !opts.importBoxLL.empty())
 		{
 			int code = swe::runImport(opts);
 			swe::geo::shutdown();

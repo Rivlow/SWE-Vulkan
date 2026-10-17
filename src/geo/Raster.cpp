@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <format>
 #include <memory>
 
 namespace swe::geo {
@@ -75,8 +76,8 @@ int epsgOf(GDALDataset &ds)
 // Grid
 // ---------------------------------------------------------------------------------------------
 
-Grid::Grid(BBox const &box, double cellSize, float nodataValue) :
-    x0(box.xmin), y0(box.ymin), cell(cellSize), nodata(nodataValue)
+Grid::Grid(BBox const &box, double cellSize, int epsgCode, float nodataValue) :
+    x0(box.xmin), y0(box.ymin), cell(cellSize), epsg(epsgCode), nodata(nodataValue)
 {
 	nx = static_cast<uint32_t>(std::max(1.0, std::round(box.width() / cellSize)));
 	ny = static_cast<uint32_t>(std::max(1.0, std::round(box.height() / cellSize)));
@@ -170,8 +171,13 @@ std::vector<uint8_t> Grid::fillHoles()
 	return hole;
 }
 
+BBox Grid::boundsLonLat() const
+{
+	return transformBox(bounds(), epsg, EPSG_WGS84);
+}
+
 Grid Grid::fromGdalRows(std::vector<float> const &rows, uint32_t width, uint32_t height, BBox const &box, double cellSize,
-                        float nodataValue)
+                        int epsgCode, float nodataValue)
 {
 	Grid g;
 	g.nx     = width;
@@ -179,6 +185,7 @@ Grid Grid::fromGdalRows(std::vector<float> const &rows, uint32_t width, uint32_t
 	g.x0     = box.xmin;
 	g.y0     = box.ymin;
 	g.cell   = cellSize;
+	g.epsg   = epsgCode;
 	g.nodata = nodataValue;
 	g.v.resize(size_t(width) * height);
 	for (uint32_t row = 0; row < height; ++row)
@@ -232,6 +239,7 @@ bool readInfo(std::string const &path, RasterInfo &info, std::string *error)
 	double x1 = gt[0] + gt[1] * info.width, y1 = gt[3] + gt[5] * info.height;
 	info.bounds = {std::min(gt[0], x1), std::min(gt[3], y1), std::max(gt[0], x1), std::max(gt[3], y1)};
 	info.epsg   = epsgOf(*ds);
+	info.hasSrs = ds->GetSpatialRef() != nullptr;
 	if (info.bands > 0)
 	{
 		auto *band      = ds->GetRasterBand(1);
@@ -250,30 +258,93 @@ bool readInfo(std::string const &path, RasterInfo &info, std::string *error)
 		double lat     = 0.5 * (info.bounds.ymin + info.bounds.ymax) * 3.14159265358979 / 180.0;
 		info.resMetres = info.resX * 111320.0 * std::cos(lat);
 	}
-	if (info.epsg == EPSG_LAMBERT72)
-		info.boundsL72 = info.bounds;
-	else if (info.epsg != 0)
-	{
-		info.boundsL72 = BBox{1e300, 1e300, -1e300, -1e300};
-		double xs[3] = {info.bounds.xmin, 0.5 * (info.bounds.xmin + info.bounds.xmax), info.bounds.xmax};
-		double ys[3] = {info.bounds.ymin, 0.5 * (info.bounds.ymin + info.bounds.ymax), info.bounds.ymax};
-		for (double x : xs)
-			for (double y : ys)
-			{
-				double px = x, py = y;
-				if (transform(info.epsg, EPSG_LAMBERT72, px, py))
-				{
-					info.boundsL72.xmin = std::min(info.boundsL72.xmin, px);
-					info.boundsL72.xmax = std::max(info.boundsL72.xmax, px);
-					info.boundsL72.ymin = std::min(info.boundsL72.ymin, py);
-					info.boundsL72.ymax = std::max(info.boundsL72.ymax, py);
-				}
-			}
-	}
+	int srcEpsg = info.epsg != 0 ? info.epsg : EPSG_LAMBERT72;        // SPW products without a code are Lambert 72
+	info.boundsL72    = transformBox(info.bounds, srcEpsg, EPSG_LAMBERT72);
+	info.boundsLonLat = transformBox(info.bounds, srcEpsg, EPSG_WGS84);
 	return true;
 }
 
-Grid readWindow(std::string const &path, BBox const &box, double cell, std::string *error)
+BBox RasterInfo::boundsIn(int targetEpsg) const
+{
+	if (targetEpsg == EPSG_LAMBERT72)
+		return boundsL72;
+	return transformBox(boundsLonLat, EPSG_WGS84, targetEpsg);
+}
+
+std::vector<uint8_t> warpImage(std::vector<uint8_t> const &bytes, BBox const &srcBox, int srcEpsg, BBox const &box, int epsg,
+                               uint32_t width, uint32_t height, std::string *error)
+{
+	init();
+	// decode the image from GDAL's memory file system, then georeference an in-memory copy
+	// (sidecar world files are not discovered: GDAL_DISABLE_READDIR_ON_OPEN is set for the HTTP sources)
+	bool        jpeg = bytes.size() > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8;
+	std::string img  = jpeg ? "/vsimem/swe_ortho.jpg" : "/vsimem/swe_ortho.png";
+	auto       *copy = static_cast<GByte *>(CPLMalloc(bytes.size()));
+	std::copy(bytes.begin(), bytes.end(), copy);
+	VSIFCloseL(VSIFileFromMemBuffer(img.c_str(), copy, static_cast<vsi_l_offset>(bytes.size()), TRUE));
+	DatasetPtr src;
+	{
+		auto decoded = openRaster(img);
+		if (!decoded)
+		{
+			VSIUnlink(img.c_str());
+			if (error)
+				*error = "image non décodable";
+			return {};
+		}
+		auto *memDriver = GetGDALDriverManager()->GetDriverByName("MEM");
+		src.reset(memDriver->CreateCopy("", decoded.get(), FALSE, nullptr, nullptr, nullptr));
+	}
+	VSIUnlink(img.c_str());
+	if (!src)
+	{
+		if (error)
+			*error = "copie mémoire impossible";
+		return {};
+	}
+	double psx   = srcBox.width() / src->GetRasterXSize(), psy = srcBox.height() / src->GetRasterYSize();
+	double gt[6] = {srcBox.xmin, psx, 0.0, srcBox.ymax, 0.0, -psy};
+	src->SetGeoTransform(gt);
+	OGRSpatialReference srs;
+	srs.importFromEPSG(srcEpsg);
+	src->SetSpatialRef(&srs);
+
+	std::vector<std::string> args{"-of",   "MEM",  "-t_srs", std::format("EPSG:{}", epsg),
+	                              "-te",   std::to_string(box.xmin), std::to_string(box.ymin), std::to_string(box.xmax), std::to_string(box.ymax),
+	                              "-ts",   std::to_string(width), std::to_string(height), "-r", "bilinear", "-ot", "Byte"};
+	std::vector<char *> argv;
+	for (auto &a : args)
+		argv.push_back(a.data());
+	argv.push_back(nullptr);
+	auto *options = GDALWarpAppOptionsNew(argv.data(), nullptr);
+	int   err     = 0;
+	auto  hSrc    = GDALDataset::ToHandle(src.get());
+	DatasetPtr dst(GDALDataset::FromHandle(GDALWarp("", nullptr, 1, &hSrc, options, &err)));
+	GDALWarpAppOptionsFree(options);
+	src.reset();
+	if (!dst || err)
+	{
+		if (error)
+			*error = lastError();
+		return {};
+	}
+	int                  bands = std::min(dst->GetRasterCount(), 3);
+	std::vector<uint8_t> rgba(size_t(width) * height * 4, 255);
+	std::vector<uint8_t> band(size_t(width) * height);
+	for (int b = 0; b < bands; ++b)
+	{
+		if (dst->GetRasterBand(b + 1)->RasterIO(GF_Read, 0, 0, int(width), int(height), band.data(), int(width), int(height), GDT_Byte, 0, 0) != CE_None)
+			continue;
+		for (size_t k = 0; k < band.size(); ++k)
+			rgba[4 * k + b] = band[k];
+	}
+	if (bands == 1)
+		for (size_t k = 0; k < band.size(); ++k)
+			rgba[4 * k + 1] = rgba[4 * k + 2] = rgba[4 * k];
+	return rgba;
+}
+
+Grid readWindow(std::string const &path, BBox const &box, double cell, int epsg, std::string *error, int srcEpsgHint)
 {
 	init();
 	auto src = openRaster(path);
@@ -287,7 +358,7 @@ Grid readWindow(std::string const &path, BBox const &box, double cell, std::stri
 	readInfo(path, info);
 
 	// output grid aligned on `cell`, snapped so cell edges fall on multiples of cell
-	Grid     target(box, cell);
+	Grid     target(box, cell, epsg);
 	uint32_t w = target.nx, h = target.ny;
 	BBox     out = target.bounds();
 
@@ -295,14 +366,19 @@ Grid readWindow(std::string const &path, BBox const &box, double cell, std::stri
 	bool        coarsen = cell > 1.5 * std::max(info.resMetres, 1e-9);
 	char const *resampling = coarsen ? "average" : "bilinear";
 
-	// GDALWarp to a MEM dataset in Lambert 72 on exactly the target grid
-	std::vector<std::string> args{"-of",  "MEM", "-t_srs", "EPSG:31370", "-te", std::to_string(out.xmin), std::to_string(out.ymin),
+	// GDALWarp to a MEM dataset in the target projection on exactly the target grid
+	std::string              tsrs = std::format("EPSG:{}", epsg);
+	std::vector<std::string> args{"-of",  "MEM", "-t_srs", tsrs, "-te", std::to_string(out.xmin), std::to_string(out.ymin),
 	                              std::to_string(out.xmax), std::to_string(out.ymax), "-ts", std::to_string(w), std::to_string(h),
 	                              "-r", resampling, "-ot", "Float32", "-dstnodata", "-9999", "-wo", "INIT_DEST=NO_DATA"};
 	if (info.epsg == 0)
 	{
-		// no usable CRS: assume Lambert 72 (SPW products sometimes lack the authority code)
-		args.insert(args.end(), {"-s_srs", "EPSG:31370"});
+		// no EPSG code: trust the caller's hint (WCS/WMS answers), else the file's own definition, else assume
+		// Lambert 72 (SPW products without any spatial reference)
+		if (srcEpsgHint != 0)
+			args.insert(args.end(), {"-s_srs", std::format("EPSG:{}", srcEpsgHint)});
+		else if (!info.hasSrs)
+			args.insert(args.end(), {"-s_srs", "EPSG:31370"});
 	}
 	if (!info.hasNoData && info.dataType == "Float32")
 		args.insert(args.end(), {"-srcnodata", "nan"});
@@ -337,7 +413,7 @@ Grid readWindow(std::string const &path, BBox const &box, double cell, std::stri
 			*error = lastError();
 		return {};
 	}
-	Grid g = Grid::fromGdalRows(rows, w, h, out, cell, -9999.0f);
+	Grid g = Grid::fromGdalRows(rows, w, h, out, cell, epsg, -9999.0f);
 	// normalise NoData to NaN so later merges do not care about the source convention
 	for (auto &f : g.v)
 		if (g.isNoData(f))
@@ -370,7 +446,7 @@ bool writeGeoTiff(std::string const &path, Grid const &grid, std::string *error)
 	double gt[6] = {grid.x0, grid.cell, 0.0, grid.y0 + grid.ny * grid.cell, 0.0, -grid.cell};
 	ds->SetGeoTransform(gt);
 	OGRSpatialReference srs;
-	srs.importFromEPSG(EPSG_LAMBERT72);
+	srs.importFromEPSG(grid.epsg);
 	ds->SetSpatialRef(&srs);
 	auto rows = grid.toGdalRows();
 	for (auto &f : rows)
