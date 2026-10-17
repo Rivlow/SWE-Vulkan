@@ -8,3 +8,5 @@ imgui.ini
 .cache/
 __pycache__/
 build.log
+captures/
+swe_settings.json

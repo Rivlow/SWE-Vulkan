@@ -10,7 +10,13 @@ import params;
 public static const uint SCENE_LANDCOVER = 1;   // large domains: forests / parcels instead of plain grass
 public static const uint SCENE_OUTSIDE   = 2;   // the `outside` mask is meaningful
 
-public struct SceneParams           // std140, 144 bytes
+public static const uint COLOR_REALISTIC = 0;
+public static const uint COLOR_DEPTH     = 1;
+public static const uint COLOR_SPEED     = 2;
+public static const uint COLOR_FROUDE    = 3;
+public static const uint COLOR_ELEVATION = 4;
+
+public struct SceneParams           // std140, 160 bytes
 {
     public float4x4 view_proj;
     public float4   cam_pos;        // xyz
@@ -27,6 +33,10 @@ public struct SceneParams           // std140, 144 bytes
     public uint     color_mode;
     public float    viewport_w;     // pixels (screen-space line width)
     public float    viewport_h;
+    public float    cmap_min;       // colour map range (color_mode != COLOR_REALISTIC)
+    public float    cmap_max;
+    public float    cmap_opacity;
+    public float    _pad0;
 };
 
 [[vk::binding(0, 2)]] public ConstantBuffer<SceneParams> SC;

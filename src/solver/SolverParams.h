@@ -45,7 +45,19 @@ enum ScalarSlot : uint32_t
 	S_DT        = 2,
 	S_TIME      = 3,
 	S_NSTEPS    = 4,
+	S_VOLUME    = 16,
+	S_WET_CELLS = 17,
+	S_HMAX      = 18,
+	S_UMAX      = 19,
+	S_PROBES    = 32,        // MAX_PROBES x (h, u, v, eta)
 	S_COUNT     = 64,
+};
+
+constexpr uint32_t MAX_PROBES = 8;
+
+struct ProbeValue
+{
+	float h = 0, u = 0, v = 0, eta = 0;
 };
 
 // Values read back from the GPU once per frame.
@@ -55,6 +67,9 @@ struct SolverScalars
 	float    dt      = 0;
 	float    t       = 0;
 	uint32_t n_steps = 0;
+	// diagnostics
+	float volume = 0, wetCells = 0, hMax = 0, uMax = 0;
+	std::array<ProbeValue, MAX_PROBES> probes{};
 };
 
 }        // namespace swe

@@ -17,11 +17,12 @@ namespace {
 constexpr uint32_t kTile = 16;        // [numthreads(16, 16, 1)]
 constexpr uint32_t kLine = 256;       // [numthreads(256, 1, 1)]
 
-constexpr char const *kEntries[] = {"reduce_smax", "finalize_dt", "flux_x",   "flux_y",          "source",
-                                    "bc_inflow_norm", "bc_fluxes", "residual", "combine_fix_dry", "final_update"};
+constexpr char const *kEntries[] = {"reduce_smax",  "finalize_dt", "flux_x",          "flux_y",       "source",
+                                    "bc_inflow_norm", "bc_fluxes", "residual",        "combine_fix_dry", "final_update",
+                                    "diag_partial", "diag_final",  "probes"};
 
 // binding -> descriptor type (see shaders/solver/params.slang)
-constexpr uint32_t kBindings = 13;
+constexpr uint32_t kBindings = 15;
 
 vk::DescriptorType bindingType(uint32_t b)
 {
@@ -44,6 +45,8 @@ Solver::Solver(vkc::Context const &ctx) :
 		readbackCmd_[s] = std::move(cbs[1 + s]);
 
 	paramsBuf_ = vkc::Buffer::host(ctx_, sizeof(SolverParams), vk::BufferUsageFlagBits::eUniformBuffer, "solver-params");
+	probeBuf_  = vkc::Buffer::host(ctx_, (1 + MAX_PROBES) * sizeof(uint32_t), vk::BufferUsageFlagBits::eStorageBuffer, "probe-cells");
+	std::memset(probeBuf_.mapped(), 0, probeBuf_.size());
 	for (uint32_t s = 0; s < kReadbackSlots; ++s)
 		readback_[s] = vkc::Buffer::host(ctx_, S_COUNT * sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst,
 		                                 std::format("solver-readback-{}", s));
@@ -122,18 +125,21 @@ void Solver::allocate()
 	S_b_     = vkc::Buffer::storage(ctx_, n * sizeof(float) * 2, "S_b");
 	sink_    = vkc::Buffer::storage(ctx_, std::max<vk::DeviceSize>(case_.sink.size(), 1) * sizeof(uint32_t), "sink");
 	inflow_  = vkc::Buffer::storage(ctx_, 4 * sizeof(float), "inflow_norm");
+	diag_    = vkc::Buffer::storage(ctx_, vk::DeviceSize(vkc::divUp(case_.ny, kTile)) * vkc::divUp(case_.nx, kTile) * f4, "diag");
 
 	// Deterministic content everywhere (never-written boundary face slots included).
 	ctx_.oneShot([&](vk::raii::CommandBuffer &cb) {
-		for (auto *b : {&scalars_, &zb_, &Q_, &Q_old_, &K_, &F_L_, &F_R_, &G_D_, &G_U_, &S_b_, &sink_, &inflow_})
+		for (auto *b : {&scalars_, &zb_, &Q_, &Q_old_, &K_, &F_L_, &F_R_, &G_D_, &G_U_, &S_b_, &sink_, &inflow_, &diag_})
 			cb.fillBuffer(b->handle(), 0, vk::WholeSize, 0);
 	});
+	setProbes({});
 }
 
 void Solver::writeDescriptors()
 {
-	std::array<vkc::Buffer const *, kBindings> buffers{&paramsBuf_, &scalars_, &zb_, &Q_, &Q_old_, &K_, &F_L_,
-	                                                   &F_R_, &G_D_, &G_U_, &S_b_, &sink_, &inflow_};
+	std::array<vkc::Buffer const *, kBindings> buffers{&paramsBuf_, &scalars_, &zb_,    &Q_,     &Q_old_,
+	                                                   &K_,         &F_L_,     &F_R_,   &G_D_,   &G_U_,
+	                                                   &S_b_,       &sink_,    &inflow_, &probeBuf_, &diag_};
 	std::array<vk::DescriptorBufferInfo, kBindings> infos;
 	std::array<vk::WriteDescriptorSet, kBindings>   writes;
 	for (uint32_t b = 0; b < kBindings; ++b)
@@ -243,12 +249,12 @@ void Solver::setBoundary(int side, BoundaryCondition const &bc)
 	updateParams();
 }
 
-void Solver::bind(vk::raii::CommandBuffer &cb, char const *entry) const
+void Solver::bind(vk::raii::CommandBuffer const &cb, char const *entry) const
 {
 	cb.bindPipeline(vk::PipelineBindPoint::eCompute, *pipelines_.at(entry));
 }
 
-void Solver::dispatchGrid(vk::raii::CommandBuffer &cb, char const *entry) const
+void Solver::dispatchGrid(vk::raii::CommandBuffer const &cb, char const *entry) const
 {
 	bind(cb, entry);
 	cb.dispatch(vkc::divUp(case_.ny, kTile), vkc::divUp(case_.nx, kTile), 1);
@@ -335,6 +341,19 @@ void Solver::recordReadback(uint32_t slot)
 	auto &cb = readbackCmd_[slot];
 	cb.reset();
 	cb.begin({});
+	cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipelineLayout_, 0, *set_, nullptr);
+
+	// diagnostics (volume, wet area, maxima) and probes of the state after this frame's steps
+	vkc::memoryBarrier(cb, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite,
+	                   vk::PipelineStageFlagBits2::eComputeShader,
+	                   vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
+	dispatchGrid(cb, "diag_partial");
+	vkc::computeBarrier(cb);
+	bind(cb, "diag_final");
+	cb.dispatch(1, 1, 1);
+	bind(cb, "probes");
+	cb.dispatch(1, 1, 1);
+
 	vkc::memoryBarrier(cb, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	                   vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
 	cb.copyBuffer(scalars_.handle(), readback_[slot].handle(),
@@ -354,10 +373,29 @@ void Solver::appendSteps(std::vector<vk::CommandBufferSubmitInfo> &batch, uint32
 
 static SolverScalars decodeScalars(uint32_t const *s)
 {
-	return SolverScalars{.s_max   = std::bit_cast<float>(s[S_SMAX]),
-	                     .dt      = std::bit_cast<float>(s[S_DT]),
-	                     .t       = std::bit_cast<float>(s[S_TIME]),
-	                     .n_steps = s[S_NSTEPS]};
+	auto          f = [s](uint32_t k) { return std::bit_cast<float>(s[k]); };
+	SolverScalars r{.s_max    = f(S_SMAX),
+	                .dt       = f(S_DT),
+	                .t        = f(S_TIME),
+	                .n_steps  = s[S_NSTEPS],
+	                .volume   = f(S_VOLUME),
+	                .wetCells = f(S_WET_CELLS),
+	                .hMax     = f(S_HMAX),
+	                .uMax     = f(S_UMAX)};
+	for (uint32_t p = 0; p < MAX_PROBES; ++p)
+		r.probes[p] = {f(S_PROBES + 4 * p), f(S_PROBES + 4 * p + 1), f(S_PROBES + 4 * p + 2), f(S_PROBES + 4 * p + 3)};
+	return r;
+}
+
+void Solver::setProbes(std::vector<uint32_t> const &cells)
+{
+	// read by in-flight readbacks: only written with the device idle
+	ctx_.device.waitIdle();
+	auto    *p = static_cast<uint32_t *>(probeBuf_.mapped());
+	uint32_t n = static_cast<uint32_t>(std::min<size_t>(cells.size(), MAX_PROBES));
+	p[0]       = n;
+	for (uint32_t k = 0; k < n; ++k)
+		p[1 + k] = std::min<uint32_t>(cells[k], static_cast<uint32_t>(case_.cells()) - 1);
 }
 
 SolverScalars Solver::readback(uint32_t slot) const

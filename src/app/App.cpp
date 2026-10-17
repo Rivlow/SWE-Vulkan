@@ -2,7 +2,6 @@
 
 #include "app/Headless.h"
 #include "app/Screenshot.h"
-#include "cases/Cases.h"
 #include "util/Log.h"
 #include "vk/Pipelines.h"
 
@@ -11,9 +10,11 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
 #include <implot.h>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <stdexcept>
 
 namespace swe {
@@ -26,14 +27,22 @@ void checkVk(VkResult r)
 		log::error("imgui vulkan backend: VkResult {}", static_cast<int>(r));
 }
 
-std::filesystem::path timestampedCapturePath()
+std::string timestamp()
 {
-	auto now = std::chrono::system_clock::now();
-	auto t   = std::chrono::floor<std::chrono::seconds>(now);
-	return std::filesystem::path("captures") / std::format("swe_{:%Y%m%d_%H%M%S}.png", t);
+	auto t = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+	return std::format("{:%Y%m%d_%H%M%S}", t);
+}
+
+std::filesystem::path settingsPath()
+{
+	return "swe_settings.json";        // next to imgui.ini, in the working directory
 }
 
 }        // namespace
+
+// ---------------------------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------------------------
 
 App::App(Options const &opts) :
     opts_(opts)
@@ -48,13 +57,15 @@ App::App(Options const &opts) :
 
 	auto cmds = vk::raii::CommandBuffers(ctx_->device, {.commandPool        = *ctx_->commandPool,
 	                                                    .level              = vk::CommandBufferLevel::ePrimary,
-	                                                    .commandBufferCount = kFramesInFlight});
+	                                                    .commandBufferCount = 2 * kFramesInFlight});
 	for (uint32_t i = 0; i < kFramesInFlight; ++i)
 	{
-		frames_[i].cmd            = std::move(cmds[i]);
+		frames_[i].cmd            = std::move(cmds[2 * i]);
+		frames_[i].begin          = std::move(cmds[2 * i + 1]);
 		frames_[i].inFlight       = vk::raii::Fence(ctx_->device, {.flags = vk::FenceCreateFlagBits::eSignaled});
 		frames_[i].imageAvailable = vk::raii::Semaphore(ctx_->device, vk::SemaphoreCreateInfo{});
 	}
+	createTimestamps();
 
 	initImGui();
 
@@ -63,21 +74,38 @@ App::App(Options const &opts) :
 	renderer_ = std::make_unique<Renderer>(*ctx_, *solver_, *effects_, colorFormat_);
 	renderer_->resize(swapchain_->extent);
 	caseList_ = listCases(resolveAssetDir(opts_.assetDir));
+
+	loadSettings();        // may change the case, steps per frame and display options
 	loadCase(opts_.caseName);
 	if (opts_.stepsPerFrame > 0)
 		stepsPerFrame_ = opts_.stepsPerFrame;
-	render_.showMesh = opts_.showMesh;
+	if (opts_.showMesh)
+		render_.showMesh = true;
 	if (opts_.zScale > 0)
 		render_.z_scale = opts_.zScale;
+	if (opts_.colorMode >= 0)
+		render_.colorMode = static_cast<ColorMode>(std::clamp(opts_.colorMode, 0, 4));
+	if (!opts_.probes.empty())
+	{
+		auto const &c = solver_->caseData();
+		for (auto [i, j] : opts_.probes)
+			if (probes_.size() < MAX_PROBES)
+				probes_.push_back({uint32_t(std::clamp(i, 0, int(c.nx) - 1)), uint32_t(std::clamp(j, 0, int(c.ny) - 1))});
+		updateProbeList();
+	}
 }
 
 App::~App()
 {
 	if (ctx_)
 		ctx_->device.waitIdle();
+	for (auto &w : writers_)
+		w.wait();
+	if (solver_)
+		saveSettings();
 	shutdownImGui();
 	// Vulkan objects must die before the window/GLFW.
-	captureBuffer_ = {};
+	queries_ = nullptr;
 	renderer_.reset();
 	effects_.reset();
 	solver_.reset();
@@ -96,7 +124,7 @@ void App::initWindow()
 		throw std::runtime_error("glfwInit failed");
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 	glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-	window_ = glfwCreateWindow(1280, 800, "Saint-Venant 2D - HLLC (Vulkan)", nullptr, nullptr);
+	window_ = glfwCreateWindow(1600, 950, "Saint-Venant 2D - HLLC (Vulkan)", nullptr, nullptr);
 	if (!window_)
 		throw std::runtime_error("glfwCreateWindow failed");
 	glfwSetWindowUserPointer(window_, this);
@@ -116,6 +144,11 @@ void App::initImGui()
 	auto &io = ImGui::GetIO();
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_DockingEnable;
 	ImGui::StyleColorsDark();
+	auto &style            = ImGui::GetStyle();
+	style.WindowRounding   = 4.0f;
+	style.FrameRounding    = 3.0f;
+	style.GrabRounding     = 3.0f;
+	style.WindowBorderSize = 0.0f;
 
 	ImGui_ImplGlfw_InitForVulkan(window_, true);
 
@@ -155,6 +188,44 @@ void App::shutdownImGui()
 	imguiReady_ = false;
 }
 
+// GPU timestamps: per frame slot, [reset + T0] in a static "begin" command buffer submitted before the
+// solver steps, T1..T3 in the frame command buffer.
+void App::createTimestamps()
+{
+	auto family = ctx_->physicalDevice.getQueueFamilyProperties()[ctx_->queueFamily];
+	if (family.timestampValidBits == 0 || ctx_->properties.limits.timestampPeriod <= 0.0f)
+		return;
+	timestampPeriod_ = ctx_->properties.limits.timestampPeriod;
+	queries_ = vk::raii::QueryPool(ctx_->device, {.queryType = vk::QueryType::eTimestamp, .queryCount = kFramesInFlight * kTimestamps});
+	for (uint32_t s = 0; s < kFramesInFlight; ++s)
+	{
+		auto &cb = frames_[s].begin;
+		cb.begin({});
+		cb.resetQueryPool(*queries_, s * kTimestamps, kTimestamps);
+		cb.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *queries_, s * kTimestamps);
+		cb.end();
+	}
+}
+
+void App::readTimestamps(uint32_t slot)
+{
+	if (!*queries_ || frameCount_ < kFramesInFlight)
+		return;
+	auto [r, ts] = queries_.getResults<uint64_t>(slot * kTimestamps, kTimestamps, kTimestamps * sizeof(uint64_t),
+	                                             sizeof(uint64_t), vk::QueryResultFlagBits::e64);
+	if (r != vk::Result::eSuccess || ts.size() < kTimestamps)
+		return;
+	auto ms = [&](int a, int b) { return double(ts[b] - ts[a]) * timestampPeriod_ * 1e-6; };
+	auto smooth = [](double &acc, double v) { acc = acc == 0.0 ? v : 0.9 * acc + 0.1 * v; };
+	smooth(gpu_.solver, ms(0, 1));
+	smooth(gpu_.effects, ms(1, 2));
+	smooth(gpu_.render, ms(2, 3));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Simulation
+// ---------------------------------------------------------------------------------------------
+
 void App::loadCase(std::string const &name)
 {
 	auto data = makeCase(name, resolveAssetDir(opts_.assetDir));
@@ -163,12 +234,71 @@ void App::loadCase(std::string const &name)
 	solver_->load(data);
 	effects_->setCase(solver_->caseData());
 	renderer_->setCase(solver_->caseData());
+	opts_.caseName  = name;
 	zScale0_        = static_cast<float>(data.z_scale_0);
 	render_.z_scale = zScale0_;
 	renderer_->homeCamera(camera_, zScale0_);
+	probes_.clear();
+	updateProbeList();
+	resetSimulation();
+}
+
+void App::resetSimulation()
+{
+	solver_->reset();
+	effects_->reset();
 	scalars_   = {};
 	prevSteps_ = 0;
+	volume0_   = -1.0;
+	history_.clear();
 }
+
+void App::History::clear()
+{
+	t.clear();
+	volume.clear();
+	wetArea.clear();
+	dt.clear();
+	for (auto *series : {&eta, &depth, &speed})
+		for (auto &v : *series)
+			v.clear();
+}
+
+void App::History::push(SolverScalars const &s, double cellArea, size_t probes)
+{
+	t.push_back(s.t);
+	volume.push_back(s.volume);
+	wetArea.push_back(s.wetCells * cellArea);
+	dt.push_back(s.dt);
+	for (size_t p = 0; p < MAX_PROBES; ++p)
+	{
+		bool on = p < probes;
+		eta[p].push_back(on ? s.probes[p].eta : NAN);
+		depth[p].push_back(on ? s.probes[p].h : NAN);
+		speed[p].push_back(on ? std::hypot(s.probes[p].u, s.probes[p].v) : NAN);
+	}
+	if (t.size() > 40000)
+		decimate();
+}
+
+void App::History::decimate()
+{
+	auto half = [](std::vector<double> &v) {
+		size_t k = 0;
+		for (size_t i = 0; i < v.size(); i += 2)
+			v[k++] = v[i];
+		v.resize(k);
+	};
+	for (auto *v : {&t, &volume, &wetArea, &dt})
+		half(*v);
+	for (auto *series : {&eta, &depth, &speed})
+		for (auto &v : *series)
+			half(v);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Frame loop
+// ---------------------------------------------------------------------------------------------
 
 void App::run()
 {
@@ -187,8 +317,8 @@ void App::run()
 		ImGui_ImplVulkan_NewFrame();
 		ImGui_ImplGlfw_NewFrame();
 		ImGui::NewFrame();
-		handleInput();
 		drawGui();
+		handleInput();
 		ImGui::Render();
 
 		if (!opts_.capturePath.empty() && frameCount_ == static_cast<uint64_t>(opts_.captureFrames))
@@ -197,14 +327,13 @@ void App::run()
 		drawFrame();
 		++frameCount_;
 
-		// --capture: quit once the image has been written
-		if (!opts_.capturePath.empty() && frameCount_ > static_cast<uint64_t>(opts_.captureFrames) && !capturePending_ &&
-		    !captureRequest_)
+		if (!opts_.capturePath.empty() && captureDone_)
 			glfwSetWindowShouldClose(window_, GLFW_TRUE);
 	}
 	ctx_->device.waitIdle();
-	if (capturePending_)
-		saveCapture();
+	for (auto &f : frames_)
+		if (f.capturePath)
+			saveCapture(f);
 }
 
 void App::handleInput()
@@ -215,141 +344,36 @@ void App::handleInput()
 		if (ImGui::IsKeyPressed(ImGuiKey_Space, false))
 			paused_ = !paused_;
 		if (ImGui::IsKeyPressed(ImGuiKey_F12, false))
-			captureRequest_ = timestampedCapturePath();
+			captureRequest_ = std::filesystem::path("captures") / ("swe_" + timestamp() + ".png");
+		if (ImGui::IsKeyPressed(ImGuiKey_R, false) && io.KeyCtrl)
+			resetSimulation();
+		if (ImGui::IsKeyPressed(ImGuiKey_Home, false))
+			camera_.reset();
+		if (ImGui::IsKeyPressed(ImGuiKey_F1, false))
+			showHelp_ = !showHelp_;
 	}
 
-	// Camera: normalised cursor with origin bottom-left (as in ui/camera.py); no drag starting on the GUI
-	glm::vec2 size(std::max(io.DisplaySize.x, 1.0f), std::max(io.DisplaySize.y, 1.0f));
-	glm::vec2 cursor(io.MousePos.x / size.x, 1.0f - io.MousePos.y / size.y);
-	int       button = ImGui::IsMouseDown(ImGuiMouseButton_Left) ? 1 : ImGui::IsMouseDown(ImGuiMouseButton_Middle) ? 2 : 0;
+	// Camera, in the 3D view rectangle: normalised cursor with origin bottom-left (as in ui/camera.py)
+	glm::vec4 r = viewRect_;
+	if (r.z < 1.0f || r.w < 1.0f)
+		r = glm::vec4(0.0f, 0.0f, std::max(io.DisplaySize.x, 1.0f), std::max(io.DisplaySize.y, 1.0f));
+	glm::vec2 cursor((io.MousePos.x - r.x) / r.z, 1.0f - (io.MousePos.y - r.y) / r.w);
 	bool      blocked = io.WantCaptureMouse;
-	camera_.update(cursor, button, blocked ? 0.0f : io.MouseWheel, blocked);
-}
 
-void App::drawGui()
-{
-	ImGui::DockSpaceOverViewport(0, nullptr, ImGuiDockNodeFlags_PassthruCentralNode);
-	drawControls();
-	if (showDemo_)
-		ImGui::ShowDemoWindow(&showDemo_);
-}
-
-void App::drawControls()
-{
-	auto &io = ImGui::GetIO();
-	ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_FirstUseEver);
-	ImGui::SetNextWindowSize(ImVec2(360, 470), ImGuiCond_FirstUseEver);
-	if (!ImGui::Begin("Contrôles"))
+	// Ctrl + click on the terrain: new probe (camera untouched)
+	if (!blocked && io.KeyCtrl && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 	{
-		ImGui::End();
+		if (auto cell = pickCell({io.MousePos.x, io.MousePos.y}))
+		{
+			if (probes_.size() >= MAX_PROBES)
+				probes_.erase(probes_.begin());
+			probes_.push_back(*cell);
+			updateProbeList();
+		}
 		return;
 	}
-
-	auto const &c = solver_->caseData();
-	ImGui::Text("t = %.3f s   (%u pas)", scalars_.t, scalars_.n_steps);
-	ImGui::Text("dt = %.2e s   s_max = %.3f m/s", scalars_.dt, scalars_.s_max);
-	ImGui::Text("%.0f pas/s   %.1f fps", stepsPerSec_, io.Framerate);
-	if (!std::isfinite(scalars_.t) || !std::isfinite(scalars_.dt))
-		ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "La simulation a divergé : Reset simulation");
-
-	ImGui::Separator();
-	ImGui::Checkbox("Pause  (Espace)", &paused_);
-	ImGui::SliderInt("Pas / rendu", &stepsPerFrame_, 1, 500, "%d", ImGuiSliderFlags_AlwaysClamp);
-	if (ImGui::Button("Reset simulation"))
-		resetSimulation();
-	ImGui::SameLine();
-	if (ImGui::Button("Reset caméra"))
-		camera_.reset();
-
-	ImGui::SeparatorText("Affichage");
-	ImGui::Checkbox("Eau", &render_.showWater);
-	ImGui::SameLine();
-	ImGui::Checkbox("Maillage", &render_.showMesh);
-	ImGui::SameLine();
-	ImGui::Checkbox("Lignes de courant", &render_.showLines);
-	bool turbid = effects_->turbidity();
-	if (ImGui::Checkbox("Eau turbide (crue chargée)", &turbid))
-		effects_->setTurbidity(turbid);
-	ImGui::SliderFloat("Exagération z", &render_.z_scale, 1.0f, 2.5f * zScale0_, "%.2f");
-	ImGui::TextDisabled("Clic gauche : rotation, molette : zoom,\nclic milieu : translation, F12 : capture");
-
-	ImGui::SeparatorText("Schéma numérique");
-	if (ImGui::BeginCombo("Runge-Kutta", schemes().at(solver_->schemeName()).label.c_str()))
-	{
-		for (auto const &[name, tableau] : schemes())
-		{
-			bool selected = name == solver_->schemeName();
-			if (ImGui::Selectable(tableau.label.c_str(), selected) && !selected)
-				solver_->setScheme(name);
-			if (selected)
-				ImGui::SetItemDefaultFocus();
-		}
-		ImGui::EndCombo();
-	}
-	float cfl = static_cast<float>(c.cfl);
-	if (ImGui::SliderFloat("CFL", &cfl, 0.05f, 0.9f, "%.2f"))
-		solver_->setCfl(cfl);
-	float manning = static_cast<float>(c.manning_n);
-	if (ImGui::SliderFloat("Manning n", &manning, 0.0f, 0.1f, "%.3f"))
-		solver_->setManning(manning);
-
-	if (ImGui::CollapsingHeader("Conditions aux limites"))
-	{
-		static char const *sideNames[4] = {"Ouest", "Est", "Sud", "Nord"};
-		static char const *kindNames[3] = {"mur", "débit entrant", "niveau imposé"};
-		for (int s = 0; s < 4; ++s)
-		{
-			ImGui::PushID(s);
-			auto bc   = c.bc[s];
-			int  kind = static_cast<int>(bc.kind);
-			ImGui::SetNextItemWidth(130);
-			bool changed = ImGui::Combo(sideNames[s], &kind, kindNames, 3);
-			if (changed && kind != static_cast<int>(bc.kind))
-			{
-				bc.kind = static_cast<BcKind>(kind);
-				// sensible defaults: still-water level, or a modest discharge
-				bc.value = bc.kind == BcKind::Level ? c.eta_0 : bc.kind == BcKind::Inflow ? 10.0 : 0.0;
-			}
-			if (bc.kind != BcKind::Wall)
-			{
-				ImGui::SameLine();
-				ImGui::SetNextItemWidth(110);
-				double v = bc.value;
-				char const *fmt = bc.kind == BcKind::Inflow ? "%.1f m3/s" : "%.2f m";
-				if (ImGui::InputDouble("##value", &v, 0.0, 0.0, fmt, ImGuiInputTextFlags_EnterReturnsTrue))
-				{
-					bc.value = v;
-					changed  = true;
-				}
-			}
-			if (changed)
-				solver_->setBoundary(s, bc);
-			ImGui::PopID();
-		}
-		ImGui::TextDisabled("Niveaux relatifs à z_ref = %.0f m", c.z_ref);
-	}
-
-	ImGui::SeparatorText("Cas");
-	ImGui::SetNextItemWidth(-1);
-	if (ImGui::BeginCombo("##case", c.label.c_str()))
-	{
-		for (auto const &info : caseList_)
-			if (ImGui::Selectable(info.label.c_str(), info.name == c.name) && info.name != c.name)
-				loadCase(info.name);
-		ImGui::EndCombo();
-	}
-	ImGui::Text("%u x %u mailles (%.3g m), %.2f M", c.nx, c.ny, c.dx(), c.cells() * 1e-6);
-	ImGui::TextDisabled("%s", ctx_->properties.deviceName.data());
-	ImGui::Checkbox("Démo ImGui", &showDemo_);
-	ImGui::End();
-}
-
-void App::resetSimulation()
-{
-	solver_->reset();
-	effects_->reset();
-	scalars_   = {};
-	prevSteps_ = 0;
+	int button = ImGui::IsMouseDown(ImGuiMouseButton_Left) && !io.KeyCtrl ? 1 : ImGui::IsMouseDown(ImGuiMouseButton_Middle) ? 2 : 0;
+	camera_.update(cursor, button, blocked ? 0.0f : io.MouseWheel, blocked);
 }
 
 void App::drawFrame()
@@ -360,16 +384,25 @@ void App::drawFrame()
 
 	// The fence covered the solver batch of this slot too: its scalar readback is complete.
 	auto s = solver_->readback(frameIndex_);
-	if (s.n_steps >= prevSteps_ && s.n_steps > 0)
+	if (s.n_steps > 0 && s.n_steps >= prevSteps_)
 	{
 		double dtFrame = ImGui::GetIO().DeltaTime;
 		if (dtFrame > 0)
 			stepsPerSec_ = 0.9 * stepsPerSec_ + 0.1 * (s.n_steps - prevSteps_) / dtFrame;
-		prevSteps_ = s.n_steps;
-		scalars_   = s;
+		bool advanced = s.n_steps > prevSteps_;
+		prevSteps_    = s.n_steps;
+		scalars_      = s;
+		if (volume0_ < 0.0)
+			volume0_ = s.volume;
+		if (advanced)
+		{
+			auto const &c = solver_->caseData();
+			history_.push(s, c.dx() * c.dy(), probes_.size());
+		}
 	}
-	if (capturePending_)
-		saveCapture();
+	readTimestamps(frameIndex_);
+	if (frame.capturePath)
+		saveCapture(frame);
 
 	auto [acquire, imageIndex] = swapchain_->swapchain.acquireNextImage(UINT64_MAX, *frame.imageAvailable, nullptr);
 	if (acquire == vk::Result::eErrorOutOfDateKHR)
@@ -382,8 +415,10 @@ void App::drawFrame()
 
 	recordFrame(frame, imageIndex);
 
-	// One submission, two batches, one fence: [N solver steps + scalar readback] then [frame rendering].
+	// One submission, two batches, one fence: [timestamp, N solver steps, diagnostics + readback] then [frame].
 	std::vector<vk::CommandBufferSubmitInfo> solverCmds;
+	if (*queries_)
+		solverCmds.push_back({.commandBuffer = *frame.begin});
 	solver_->appendSteps(solverCmds, paused_ ? 0u : static_cast<uint32_t>(stepsPerFrame_), frameIndex_);
 
 	vk::SemaphoreSubmitInfo     waitInfo{.semaphore = *frame.imageAvailable, .stageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput};
@@ -420,21 +455,27 @@ void App::recordFrame(Frame &frame, uint32_t imageIndex)
 	auto &cb    = frame.cmd;
 	auto  image = swapchain_->images[imageIndex];
 	auto  view  = *swapchain_->views[imageIndex];
+	auto  q0    = frameIndex_ * kTimestamps;
 	cb.reset();
 	cb.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+	if (*queries_)
+		cb.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *queries_, q0 + 1);
 
 	// effects of this frame (they read the state the solver batch has just produced)
-	double   tFrame = paused_ ? 0.0 : double(stepsPerFrame_) * scalars_.dt;        // estimate (substep count only)
-	float    realDt = paused_ ? 0.0f : std::min(ImGui::GetIO().DeltaTime, 0.1f);
-	bool     lines  = render_.showLines && render_.showWater;
+	double tFrame = paused_ ? 0.0 : double(stepsPerFrame_) * scalars_.dt;        // estimate (substep count only)
+	float  realDt = paused_ ? 0.0f : std::min(ImGui::GetIO().DeltaTime, 0.1f);
+	bool   lines  = render_.showLines && render_.showWater;
 	effects_->record(cb, EffectsFrame{.zScale      = render_.z_scale,
 	                                  .realDt      = realDt,
 	                                  .substeps    = effects_->substeps(tFrame, scalars_.s_max),
 	                                  .streamlines = lines});
+	if (*queries_)
+		cb.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *queries_, q0 + 2);
 
-	// 3D scene (multisampled, resolved into the swapchain image)
+	// 3D scene (multisampled, resolved into the swapchain image), in the central dock area
 	RenderSettings settings = render_;
 	settings.showLines      = lines;
+	settings.viewport       = viewRect_;
 	renderer_->record(cb, frameIndex_, image, view, camera_, settings, scalars_.t);
 
 	// GUI on top, single-sampled
@@ -452,34 +493,40 @@ void App::recordFrame(Frame &frame, uint32_t imageIndex)
 	ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), *cb);
 	cb.endRendering();
 
-	if (captureRequest_)
+	// screenshot or recording frame
+	std::optional<std::filesystem::path> shot = captureRequest_;
+	captureRequest_.reset();
+	if (!shot && recording_ && !paused_ && frameCount_ % std::max(recordEvery_, 1) == 0)
+		shot = recordDir_ / std::format("frame_{:05d}.png", recordIndex_++);
+	if (shot)
 	{
-		recordCapture(cb, image);
-		capturePending_ = captureRequest_;
-		captureRequest_.reset();
+		recordCapture(frame, cb, image);
+		frame.capturePath = shot;
 	}
 	else
 		vkc::transitionImage(cb, image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::ePresentSrcKHR,
 		                     vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
 		                     vk::PipelineStageFlagBits2::eBottomOfPipe, {});
+	if (*queries_)
+		cb.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *queries_, q0 + 3);
 	cb.end();
 }
 
-void App::recordCapture(vk::raii::CommandBuffer const &cb, vk::Image image)
+void App::recordCapture(Frame &frame, vk::raii::CommandBuffer const &cb, vk::Image image)
 {
 	auto           extent = swapchain_->extent;
 	vk::DeviceSize size   = vk::DeviceSize(extent.width) * extent.height * 4;
-	if (!captureBuffer_ || captureBuffer_.size() < size)
-		captureBuffer_ = vkc::Buffer::host(*ctx_, size, vk::BufferUsageFlagBits::eTransferDst, "capture");
-	captureExtent_ = extent;
+	if (!frame.capture || frame.capture.size() < size)
+		frame.capture = vkc::Buffer::host(*ctx_, size, vk::BufferUsageFlagBits::eTransferDst, "capture");
+	frame.captureExtent = extent;
 
 	vkc::transitionImage(cb, image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eTransferSrcOptimal,
 	                     vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
 	                     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
-	cb.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, captureBuffer_.handle(),
-	                     vk::BufferImageCopy{.bufferOffset      = 0,
-	                                         .imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-	                                         .imageExtent       = {extent.width, extent.height, 1}});
+	cb.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, frame.capture.handle(),
+	                     vk::BufferImageCopy{.bufferOffset     = 0,
+	                                         .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+	                                         .imageExtent      = {extent.width, extent.height, 1}});
 	vkc::memoryBarrier(cb, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 	                   vk::PipelineStageFlagBits2::eHost, vk::AccessFlagBits2::eHostRead);
 	vkc::transitionImage(cb, image, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::ePresentSrcKHR,
@@ -487,15 +534,31 @@ void App::recordCapture(vk::raii::CommandBuffer const &cb, vk::Image image)
 	                     vk::PipelineStageFlagBits2::eBottomOfPipe, {});
 }
 
-void App::saveCapture()
+// Called once the fence of the frame that recorded the copy has signalled: copies the pixels and hands
+// the PNG encoding to a worker thread (recording must not stall the frame loop).
+void App::saveCapture(Frame &frame)
 {
-	// called once the fence of the frame that recorded the copy has signalled (or after waitIdle)
-	ctx_->device.waitIdle();
-	bool bgra = colorFormat_ == vk::Format::eB8G8R8A8Unorm || colorFormat_ == vk::Format::eB8G8R8A8Srgb;
-	if (writePng(*capturePending_, static_cast<uint8_t const *>(captureBuffer_.mapped()), captureExtent_.width,
-	             captureExtent_.height, bgra))
-		log::info("capture saved: {}", std::filesystem::absolute(*capturePending_).string());
-	capturePending_.reset();
+	auto     path   = *frame.capturePath;
+	auto     extent = frame.captureExtent;
+	bool     bgra   = colorFormat_ == vk::Format::eB8G8R8A8Unorm || colorFormat_ == vk::Format::eB8G8R8A8Srgb;
+	auto     bytes  = static_cast<uint8_t const *>(frame.capture.mapped());
+	std::vector<uint8_t> pixels(bytes, bytes + size_t(extent.width) * extent.height * 4);
+	frame.capturePath.reset();
+
+	bool single = !recording_ || path.parent_path() != recordDir_;
+	writers_.push_back(std::async(std::launch::async, [path, extent, bgra, single, pixels = std::move(pixels)] {
+		bool ok = writePng(path, pixels.data(), extent.width, extent.height, bgra);
+		if (ok && single)
+			log::info("capture saved: {}", std::filesystem::absolute(path).string());
+		return ok;
+	}));
+	std::erase_if(writers_, [](auto &f) { return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+	if (!opts_.capturePath.empty() && path == std::filesystem::path(opts_.capturePath))
+	{
+		for (auto &w : writers_)
+			w.wait();
+		captureDone_ = true;
+	}
 }
 
 void App::onSwapchainRecreated()
@@ -504,6 +567,55 @@ void App::onSwapchainRecreated()
 	if (swapchain_->surfaceFormat.format != colorFormat_)
 		throw std::runtime_error("swapchain format changed on recreation (unsupported)");
 	renderer_->resize(swapchain_->extent);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Settings persistence (swe_settings.json, next to imgui.ini)
+// ---------------------------------------------------------------------------------------------
+
+void App::loadSettings()
+{
+	std::ifstream f(settingsPath());
+	if (!f)
+		return;
+	try
+	{
+		auto j = nlohmann::json::parse(f);
+		if (!opts_.caseExplicit && j.contains("case"))
+		{
+			auto name = j["case"].get<std::string>();
+			if (std::ranges::any_of(caseList_, [&](CaseInfo const &c) { return c.name == name; }))
+				opts_.caseName = name;
+		}
+		stepsPerFrame_     = std::clamp(j.value("steps_per_frame", stepsPerFrame_), 1, 500);
+		render_.showLines  = j.value("streamlines", render_.showLines);
+		render_.showMesh   = j.value("mesh", render_.showMesh);
+		render_.colorMode  = static_cast<ColorMode>(std::clamp(j.value("color_mode", 0), 0, 4));
+		autoRange_         = j.value("auto_range", autoRange_);
+		showPlots_         = j.value("show_plots", showPlots_);
+		showPerf_          = j.value("show_perf", showPerf_);
+		showProbes_        = j.value("show_probes", showProbes_);
+		effects_->setTurbidity(j.value("turbidity", false));
+	}
+	catch (std::exception const &e)
+	{
+		log::warn("{}: {}", settingsPath().string(), e.what());
+	}
+}
+
+void App::saveSettings() const
+{
+	nlohmann::json j{{"case", solver_->caseData().name},
+	                 {"steps_per_frame", stepsPerFrame_},
+	                 {"streamlines", render_.showLines},
+	                 {"mesh", render_.showMesh},
+	                 {"color_mode", static_cast<int>(render_.colorMode)},
+	                 {"auto_range", autoRange_},
+	                 {"turbidity", effects_->turbidity()},
+	                 {"show_plots", showPlots_},
+	                 {"show_perf", showPerf_},
+	                 {"show_probes", showProbes_}};
+	std::ofstream(settingsPath()) << j.dump(2) << '\n';
 }
 
 }        // namespace swe

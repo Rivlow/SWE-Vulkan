@@ -202,9 +202,18 @@ void Renderer::homeCamera(OrbitCamera &camera, float zScale) const
 void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Image target, vk::ImageView targetView,
                       OrbitCamera const &camera, RenderSettings const &settings, float time)
 {
+	// 3D view rectangle (clamped to the target)
+	glm::vec4 vp = settings.viewport;
+	if (vp.z < 1.0f || vp.w < 1.0f)
+		vp = glm::vec4(0.0f, 0.0f, float(extent_.width), float(extent_.height));
+	vp.x = std::clamp(vp.x, 0.0f, float(extent_.width) - 1.0f);
+	vp.y = std::clamp(vp.y, 0.0f, float(extent_.height) - 1.0f);
+	vp.z = std::clamp(vp.z, 1.0f, float(extent_.width) - vp.x);
+	vp.w = std::clamp(vp.w, 1.0f, float(extent_.height) - vp.y);
+
 	// scene constants (this frame slot is not in use by the GPU: its fence has been waited for)
 	SceneParams sp;
-	float       aspect = extent_.height > 0 ? float(extent_.width) / float(extent_.height) : 1.0f;
+	float       aspect = vp.z / vp.w;
 	sp.view_proj       = camera.proj(aspect) * camera.view();
 	sp.cam_pos         = glm::vec4(camera.position, 1.0f);
 	sp.sun             = glm::vec4(sunDirection(), 0.0f);
@@ -217,8 +226,12 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 	sp.Lx              = Lx_;
 	sp.Ly              = Ly_;
 	sp.flags           = flags_;
-	sp.viewport_w      = float(extent_.width);
-	sp.viewport_h      = float(extent_.height);
+	sp.color_mode      = static_cast<uint32_t>(settings.colorMode);
+	sp.cmap_min        = settings.cmapMin;
+	sp.cmap_max        = settings.cmapMax;
+	sp.cmap_opacity    = settings.cmapOpacity;
+	sp.viewport_w      = vp.z;
+	sp.viewport_h      = vp.w;
 	std::memcpy(sceneUbo_[frame].mapped(), &sp, sizeof(sp));
 
 	// the solver's last step wrote Q: make it visible to the vertex/fragment fetches
@@ -258,8 +271,8 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 	                                    .colorAttachmentCount = 1,
 	                                    .pColorAttachments    = &color,
 	                                    .pDepthAttachment     = &depth});
-	cb.setViewport(0, vk::Viewport(0.0f, 0.0f, float(extent_.width), float(extent_.height), 0.0f, 1.0f));
-	cb.setScissor(0, vk::Rect2D({0, 0}, extent_));
+	cb.setViewport(0, vk::Viewport(vp.x, vp.y, vp.z, vp.w, 0.0f, 1.0f));
+	cb.setScissor(0, vk::Rect2D({int32_t(vp.x), int32_t(vp.y)}, {uint32_t(vp.z), uint32_t(vp.w)}));
 	std::array<vk::DescriptorSet, 3> sets{solver_.set(), effects_.set(), *sets_[frame]};
 	cb.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipelineLayout_, 0, sets, nullptr);
 	cb.bindIndexBuffer(indices_.handle(), 0, vk::IndexType::eUint32);

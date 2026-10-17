@@ -35,6 +35,8 @@ class Solver
 	void setCfl(double cfl);
 	void setManning(double n);
 	void setBoundary(int side, BoundaryCondition const &bc);
+	// Cells (index i * ny + j) whose state is read back each frame, at most MAX_PROBES. Waits for the device.
+	void setProbes(std::vector<uint32_t> const &cells);
 
 	// Appends `steps` time steps followed by a scalar readback into `slot` to a submission batch.
 	void appendSteps(std::vector<vk::CommandBufferSubmitInfo> &batch, uint32_t steps, uint32_t slot);
@@ -67,8 +69,8 @@ class Solver
 	void updateParams();
 	void recordStep();
 	void recordReadback(uint32_t slot);
-	void dispatchGrid(vk::raii::CommandBuffer &cb, char const *entry) const;
-	void bind(vk::raii::CommandBuffer &cb, char const *entry) const;
+	void dispatchGrid(vk::raii::CommandBuffer const &cb, char const *entry) const;
+	void bind(vk::raii::CommandBuffer const &cb, char const *entry) const;
 	void pushStage(vk::raii::CommandBuffer &cb, StagePC const &pc) const;
 
 	vkc::Context const &ctx_;
@@ -87,6 +89,7 @@ class Solver
 
 	// paramsBuf_ is host-visible: updateParams() waits for the device, then writes it directly
 	vkc::Buffer paramsBuf_, scalars_, zb_, Q_, Q_old_, K_, F_L_, F_R_, G_D_, G_U_, S_b_, sink_, inflow_;
+	vkc::Buffer probeBuf_, diag_;        // probe cell list (host-visible), per-workgroup diagnostics
 	std::array<vkc::Buffer, kReadbackSlots> readback_;
 
 	vk::raii::CommandBuffer                             stepCmd_ = nullptr;

@@ -17,10 +17,14 @@ class Effects;
 
 struct RenderSettings
 {
-	float z_scale   = 2.0f;
-	bool  showWater = true;
-	bool  showMesh  = false;
-	bool  showLines = true;
+	float     z_scale   = 2.0f;
+	bool      showWater = true;
+	bool      showMesh  = false;
+	bool      showLines = true;
+	ColorMode colorMode = ColorMode::Realistic;
+	float     cmapMin = 0.0f, cmapMax = 1.0f, cmapOpacity = 0.9f;
+	// 3D view rectangle in pixels (the central area left free by the docked panels); empty = whole target
+	glm::vec4 viewport{0.0f};
 };
 
 // 3D view of the simulation: bed, water and model base, drawn straight from the solver's buffers

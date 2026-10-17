@@ -48,6 +48,12 @@ public static const uint S_SMAX      = 1;
 public static const uint S_DT        = 2;
 public static const uint S_TIME      = 3;
 public static const uint S_NSTEPS    = 4;
+public static const uint S_VOLUME    = 16;  // diagnostics (written by diag_final)
+public static const uint S_WET_CELLS = 17;
+public static const uint S_HMAX      = 18;
+public static const uint S_UMAX      = 19;
+public static const uint S_PROBES    = 32;  // 8 probes x (h, u, v, eta)
+public static const uint MAX_PROBES  = 8;
 
 [[vk::binding(0, 0)]] public ConstantBuffer<SolverParams> P;
 [[vk::binding(1, 0)]] public RWStructuredBuffer<uint>     scalars;
@@ -63,6 +69,8 @@ public static const uint S_NSTEPS    = 4;
 [[vk::binding(11, 0)]] public StructuredBuffer<uint>      sink;    // 1 = outlet cell (1-element dummy when absent)
 // Own buffer (not a scalars slot): bc_inflow_norm runs unsynchronised next to finalize_dt.
 [[vk::binding(12, 0)]] public RWStructuredBuffer<float>   inflow;  // sum of h^(5/3) * width per side
+[[vk::binding(13, 0)]] public StructuredBuffer<uint>      probe_cells;   // [0] = count, then cell indices
+[[vk::binding(14, 0)]] public RWStructuredBuffer<float4>  diag;          // per-workgroup partial diagnostics
 
 [[vk::push_constant]] public ConstantBuffer<StagePC> pc;
 

@@ -23,6 +23,9 @@ usage: swe [options]
   --validation / --no-validation   Vulkan validation layers (default: on in Debug)
   --sync-validation    also enable synchronization validation (slow)
   --steps-per-frame <n>  solver steps per displayed frame                [30]
+  --color <0..4>       water colouring: realistic, depth, speed, Froude, elevation
+  --mesh               wireframe overlay
+  --z-scale <f>        vertical exaggeration (default: case value)
   --capture <png>      save a screenshot after --capture-frames frames, then quit
   --capture-frames <n>                                                   [120]
   --headless           no window (batch mode)

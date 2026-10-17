@@ -10,6 +10,7 @@ import effects_data;
 import scene;
 import noise;
 import palette;
+import colormap;
 
 struct WaterVarying
 {
@@ -22,7 +23,23 @@ struct WaterVarying
     float  turb     : TURB;        // advected turbidity
     float  shadow   : SHADOW;
     float  ao       : AO;
+    float  cval     : CMAPVALUE;   // quantity shown by the colour map
 };
+
+float colormap_value(uint k, float h)
+{
+    float4 q = Q[k];
+    float  u = velocity(h, q.y), v = velocity(h, q.z);
+    float  speed = sqrt(u * u + v * v);
+    switch (SC.color_mode)
+    {
+    case COLOR_DEPTH:     return h;
+    case COLOR_SPEED:     return speed;
+    case COLOR_FROUDE:    return speed / sqrt(P.g * max(h, 1e-3f));
+    case COLOR_ELEVATION: return zb[k] + h;
+    default:              return 0.0f;
+    }
+}
 
 [shader("vertex")]
 WaterVarying waterVert(uint vid : SV_VertexID)
@@ -61,6 +78,7 @@ WaterVarying waterVert(uint vid : SV_VertexID)
     o.turb     = turb[vid];
     o.shadow   = shadow[vid];
     o.ao       = ao[vid];
+    o.cval     = SC.color_mode != COLOR_REALISTIC ? colormap_value(vid, h) : 0.0f;
     return o;
 }
 
@@ -84,6 +102,18 @@ WaterOut waterFrag(WaterVarying v)
     float3 n   = normalize(v.n);
     float  h   = max(v.h, 0.0f);
     float  ao = v.ao, sun_vis = v.shadow;
+
+    WaterOut o;
+    if (SC.color_mode != COLOR_REALISTIC)
+    {
+        // scientific view: colour map of the chosen quantity, lightly shaded so the relief of the surface reads
+        float  t     = (v.cval - SC.cmap_min) / max(SC.cmap_max - SC.cmap_min, 1e-12f);
+        float  shade = (0.78f + 0.3f * max(dot(n, sun), 0.0f) * sun_vis) * (0.75f + 0.25f * ao);
+        float  a     = SC.cmap_opacity * sstep(0.0f, 0.02f, h);
+        o.add = float4(a * turbo(t) * shade, 1.0f);
+        o.mul = float4((1.0f - a).xxx, 0.0f);
+        return o;
+    }
 
     // absorption (Beer-Lambert): the tinted bed shows through all the more as the water is shallow;
     // turbid water is brown and much less transparent (optional)
@@ -109,7 +139,6 @@ WaterOut waterFrag(WaterVarying v)
 
     // out = mix(mix(shade * mix(bed * (0.45 + SHALLOW), tint, opacity), SKY, fres) + glint, foam_col, fm)
     //     = bed * K + B
-    WaterOut o;
     float3 K = (1.0f - fm) * (1.0f - fres) * shade * (1.0f - opacity) * (0.45f + SHALLOW);
     float3 B = (1.0f - fm) * ((1.0f - fres) * shade * opacity * tint + fres * SKY + glint) + fm * foam_col;
     o.add = float4(B, 1.0f);

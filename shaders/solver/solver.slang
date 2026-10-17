@@ -275,6 +275,92 @@ void combine_fix_dry(uint3 tid : SV_DispatchThreadID)
     Q[c] = float4(fix_dry(combine(c, step_dt())), 0.0f);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Diagnostics and probes (once per frame, in the readback command buffer)
+// ---------------------------------------------------------------------------------------------
+groupshared float4 g_diag[256];
+
+// x = volume (sum h dx dy), y = wet cells (h > 2e-3), z = max h, w = max speed (h >= h_dry)
+float4 diag_combine(float4 a, float4 b)
+{
+    return float4(a.x + b.x, a.y + b.y, max(a.z, b.z), max(a.w, b.w));
+}
+
+void diag_reduce(uint t)
+{
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128; stride > 0; stride >>= 1)
+    {
+        if (t < stride)
+            g_diag[t] = diag_combine(g_diag[t], g_diag[t + stride]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+uint diag_groups_x() { return (P.ny + 15) / 16; }
+uint diag_groups()   { return diag_groups_x() * ((P.nx + 15) / 16); }
+
+[shader("compute")]
+GRID_THREADS
+void diag_partial(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint   j = tid.x, i = tid.y;
+    float4 d = float4(0.0f);
+    if (i < P.nx && j < P.ny)
+    {
+        float4 q = Q[idx(i, j)];
+        float  h = q.x;
+        d.x = max(h, 0.0f) * P.dx * P.dy;
+        d.y = h > 2e-3f ? 1.0f : 0.0f;
+        d.z = h;
+        if (h >= P.h_dry)
+        {
+            float u = velocity(h, q.y), v = velocity(h, q.z);
+            d.w = sqrt(u * u + v * v);
+        }
+    }
+    g_diag[gi] = d;
+    diag_reduce(gi);
+    if (gi == 0)
+        diag[gid.y * diag_groups_x() + gid.x] = g_diag[0];
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void diag_final(uint gi : SV_GroupIndex)
+{
+    float4 acc = float4(0.0f);
+    uint   n   = diag_groups();
+    for (uint k = gi; k < n; k += 256)
+        acc = diag_combine(acc, diag[k]);
+    g_diag[gi] = acc;
+    diag_reduce(gi);
+    if (gi == 0)
+    {
+        scalars[S_VOLUME]    = asuint(g_diag[0].x);
+        scalars[S_WET_CELLS] = asuint(g_diag[0].y);
+        scalars[S_HMAX]      = asuint(g_diag[0].z);
+        scalars[S_UMAX]      = asuint(g_diag[0].w);
+    }
+}
+
+[shader("compute")]
+[numthreads(8, 1, 1)]
+void probes(uint3 tid : SV_DispatchThreadID)
+{
+    uint p = tid.x;
+    if (p >= min(probe_cells[0], MAX_PROBES))
+        return;
+    uint   c = probe_cells[1 + p];
+    float4 q = Q[c];
+    float  h = q.x;
+    uint   s = S_PROBES + 4 * p;
+    scalars[s + 0] = asuint(h);
+    scalars[s + 1] = asuint(velocity(h, q.y));
+    scalars[s + 2] = asuint(velocity(h, q.z));
+    scalars[s + 3] = asuint(zb[c] + h);
+}
+
 // Q^{n+1} = Q^n + dt sum_s b[s] K_s, fix_dry, friction, outlet cells emptied
 [shader("compute")]
 GRID_THREADS

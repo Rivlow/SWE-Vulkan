@@ -28,9 +28,28 @@ swe --sync-validation                 :: validation Vulkan + synchronisation (le
 swe --help
 ```
 
-Souris : clic gauche = rotation libre, molette = zoom, clic milieu = translation. Espace : pause, F12 : capture
-(`captures\`). Panneau « Contrôles » : pas par image, eau, maillage, exagération verticale, schéma, CFL,
-Manning, cas, reset simulation / caméra.
+## Interface
+
+Panneaux ancrables (disposition par défaut au premier lancement, puis mémorisée dans `imgui.ini`) ; la vue 3D
+occupe la zone centrale libre.
+
+| Panneau            | Contenu                                                                                   |
+|--------------------|-------------------------------------------------------------------------------------------|
+| Simulation         | cas, pause / recommencer, pas par image, temps simulé, facteur temps réel, bilan de volume, emprise, maxima |
+| Schéma numérique   | Runge-Kutta, CFL, Manning, conditions aux limites par bord (mur / débit / niveau), à chaud  |
+| Affichage          | coloration (réaliste, h, \|u\|, Froude, cote) + légende, plage auto, eau / maillage / lignes / turbidité, exagération, captures, enregistrement |
+| Sondes             | Ctrl+clic sur le terrain (8 max) : h, \|u\|, η, marqueurs numérotés en 3D                    |
+| Courbes            | ImPlot : niveau, hauteur, vitesse des sondes, volume et emprise, pas de temps               |
+| Performances       | timestamps GPU par image (solveur / effets / rendu), pas/s, Mmailles·pas/s                  |
+
+Souris : clic gauche = rotation libre, molette = zoom, clic milieu = translation, Ctrl+clic = sonde.
+Clavier : Espace pause, Ctrl+R recommencer, Origine recadrer, F12 capture (`captures\`), F1 aide.
+Fichier → Enregistrer : séquence PNG (`captures\rec_*\`, écrite en tâche de fond), à assembler avec
+`ffmpeg -framerate 30 -i frame_%05d.png out.mp4`. Les réglages (dernier cas, pas par image, coloration…) sont
+gardés dans `swe_settings.json`.
+
+Options utiles pour scripter des vues : `--color 0..4`, `--probe i,j` (répétable), `--mesh`, `--z-scale f`,
+`--steps-per-frame n`, `--capture fichier.png --capture-frames n`.
 
 ## Rendu
 
