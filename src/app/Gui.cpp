@@ -188,7 +188,7 @@ void App::drawMenuBar()
 	if (ImGui::BeginMenu("Simulation"))
 	{
 		ImGui::MenuItem("Pause", "Espace", &paused_);
-		if (ImGui::MenuItem("Recommencer", "Ctrl+R"))
+		if (ImGui::MenuItem("Recommencer", "R"))
 			resetSimulation();
 		if (ImGui::BeginMenu("Cas"))
 		{
@@ -260,18 +260,16 @@ void App::drawSimulationPanel()
 	ImGui::SameLine();
 	if (ImGui::Button("Recommencer", ImVec2(bw, 0)))
 		resetSimulation();
-	tip("Ctrl+R : remet l'état initial du cas");
+	tip("R : remet l'état initial du cas");
 	ImGui::SetNextItemWidth(-90);
 	ImGui::SliderInt("pas / image", &stepsPerFrame_, 1, 500, "%d", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
 	tip("Nombre de pas de temps calculés entre deux images : plus = simulation plus rapide, image moins fluide");
 
 	// clock
 	ImGui::SeparatorText("Temps");
-	double ratio = stepsPerSec_ * scalars_.dt;
 	ImGui::Text("t  = %s   (%u pas)", formatTime(scalars_.t).c_str(), scalars_.n_steps);
 	ImGui::Text("dt = %.3e s   s_max = %.3f m/s", scalars_.dt, scalars_.s_max);
-	ImGui::Text("%.0f pas/s   x%.3g temps réel", stepsPerSec_, ratio);
-	tip("Temps simulé par seconde réelle");
+	ImGui::Text("%.0f pas/s", stepsPerSec_);
 	if (!std::isfinite(scalars_.t) || !std::isfinite(scalars_.dt) || !std::isfinite(scalars_.volume))
 		ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "La simulation a divergé : Recommencer");
 
@@ -678,7 +676,7 @@ void App::drawHelp()
 		row("Ctrl + clic", "poser une sonde");
 		ImGui::SeparatorText("Clavier");
 		row("Espace", "pause / reprise");
-		row("Ctrl + R", "recommencer");
+		row("R", "recommencer");
 		row("Origine", "recadrer la caméra");
 		row("F12", "capture d'écran (captures/)");
 		row("F1", "cette aide");

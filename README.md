@@ -43,7 +43,7 @@ occupe la zone centrale libre.
 | Performances       | timestamps GPU par image (solveur / effets / rendu), pas/s, Mmailles·pas/s                  |
 
 Souris : clic gauche = rotation libre, molette = zoom, clic milieu = translation, Ctrl+clic = sonde.
-Clavier : Espace pause, Ctrl+R recommencer, Origine recadrer, F12 capture (`captures\`), F1 aide.
+Clavier : Espace pause, R recommencer, Origine recadrer, F12 capture (`captures\`), F1 aide.
 Fichier → Enregistrer : séquence PNG (`captures\rec_*\`, écrite en tâche de fond), à assembler avec
 `ffmpeg -framerate 30 -i frame_%05d.png out.mp4`. Les réglages (dernier cas, pas par image, coloration…) sont
 gardés dans `swe_settings.json`.

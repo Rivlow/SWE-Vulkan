@@ -345,7 +345,7 @@ void App::handleInput()
 			paused_ = !paused_;
 		if (ImGui::IsKeyPressed(ImGuiKey_F12, false))
 			captureRequest_ = std::filesystem::path("captures") / ("swe_" + timestamp() + ".png");
-		if (ImGui::IsKeyPressed(ImGuiKey_R, false) && io.KeyCtrl)
+		if (ImGui::IsKeyPressed(ImGuiKey_R, false))
 			resetSimulation();
 		if (ImGui::IsKeyPressed(ImGuiKey_Home, false))
 			camera_.reset();
