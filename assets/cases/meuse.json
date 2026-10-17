@@ -1,0 +1,13 @@
+{
+  "label": "Meuse à Liège (confluence, piles de pont)",
+  "comment": "Bathymétrie SPW 50 cm moyennée sur 2 m (cache de cases/geotiff.py), Lambert 72, cotes m DNG. La Meuse coule vers le nord.",
+  "type": "river",
+  "bathymetry": "data/bathy_235577_146334_600_2.npy",
+  "cell": 2.0,
+  "eta_abs": 59.5,
+  "wall_height": 1.5,
+  "manning_n": 0.03,
+  "scheme": "ssprk2",
+  "bc": { "west": ["wall"], "east": ["wall"], "south": ["inflow", 600.0], "north": ["level", "eta_0"] },
+  "render": { "depth_ref": 4.0, "z_scale_0": 8.0 }
+}

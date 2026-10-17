@@ -13,6 +13,7 @@ struct TerrainVarying
     float  slope : SLOPE;       // real slope (no exaggeration)
     float  z     : BED;
     float  wet   : WET;         // 1 where h > 2e-3, interpolated -> soft shore band
+    float  out   : OUTSIDE;     // 1 outside the useful domain
 };
 
 [shader("vertex")]
@@ -32,6 +33,7 @@ TerrainVarying terrainVert(uint vid : SV_VertexID)
     o.slope = sqrt(dzx * dzx + dzy * dzy) / SC.z_scale;
     o.z     = z;
     o.wet   = h > 2e-3f ? 1.0f : 0.0f;
+    o.out   = outside_at(vid);
     return o;
 }
 
@@ -53,11 +55,12 @@ float3 land_color(float x, float y, float slope)
     return lerp(parcel, canopy, forest);
 }
 
-float3 terrain_color(float x, float y, float z, float3 n, float slope, float wet, float wet_blur)
+float3 terrain_color(float x, float y, float z, float3 n, float slope, float wet, float wet_blur, float out)
 {
     float3 grass;
     if ((SC.flags & SCENE_LANDCOVER) != 0)
-        grass = land_color(x, y, slope);
+        // outside the domain: plain tint (no useless detail)
+        grass = out > 0.5f ? lerp(GRASS_A, GRASS_B, fbm(1.6f * x, 1.6f * y)) : land_color(x, y, slope);
     else
     {
         float t = fbm(1.6f * x, 1.6f * y);
@@ -73,14 +76,17 @@ float3 terrain_color(float x, float y, float z, float3 n, float slope, float wet
     float3 stone = STONE * (0.85f + 0.3f * value_noise(6.0f * x, 6.0f * y));
     col = lerp(col, stone, sstep(0.75f, 0.45f, n.y));
     col *= 1.0f + 0.15f * min(z / SC.depth_ref, 1.0f);
-    return col;
+    // outside the useful domain: desaturated and darkened
+    float  grey = dot(col, float3(0.3f, 0.5f, 0.2f));
+    float3 dim  = 0.6f * lerp(col, float3(grey), 0.8f);
+    return lerp(col, dim, out);
 }
 
 [shader("fragment")]
 float4 terrainFrag(TerrainVarying v) : SV_Target
 {
     float3 n    = normalize(v.n);
-    float3 base = terrain_color(v.disp.x, v.disp.z, v.z, n, v.slope, v.wet, v.wet);
+    float3 base = terrain_color(v.disp.x, v.disp.z, v.z, n, v.slope, v.wet, v.wet, v.out);
     return float4(light(base, n, SC.sun.xyz, 0.55f, 0.75f, 1.0f, 1.0f), 1.0f);
 }
 

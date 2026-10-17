@@ -4,8 +4,9 @@
     python tools/validate.py --all                            # every scheme on dam_break + lake at rest
 
 For each run: tools/dump_reference.py (cached in out/ref_*), swe --headless --dump, tools/compare.py.
-Tolerances: relative L1 <= 1e-5 and at most --front-cells cells above 1e-5 (round-off is amplified at shocks
-and wet/dry fronts: Taichi CPU vs Taichi Vulkan shows the same pattern, see the M1 notes in README).
+Tolerances: relative L1 <= 1e-5 and at most max(--front-cells, 0.05 % of the cells) above 1e-5 (round-off is
+amplified at shocks and wet/dry fronts: Taichi CPU vs Taichi Vulkan shows the same pattern, see README).
+The bed elevation zb must match exactly (same numpy preprocessing ported to C++).
 """
 import argparse
 import subprocess
@@ -45,7 +46,8 @@ def validate(exe, case, scheme, steps, tol, front_cells, refresh=False, extra_re
             *extra_cpp]):
         return False
     print(f"--- {tag}")
-    return run([PY, "tools/compare.py", ref, cpp, "--tol", tol, "--front-cells", front_cells], quiet=False) == 0
+    return run([PY, "tools/compare.py", ref, cpp, "--tol", tol, "--front-cells", front_cells,
+                "--front-frac", 0 if front_cells == 0 else 5e-4], quiet=False) == 0
 
 
 def main():
@@ -66,6 +68,9 @@ def main():
         results["dam_break euler 50 (strict)"] = validate(exe, "dam_break", "euler", 50, 1e-6, 0, args.refresh)
         for s in SCHEMES:
             results[f"dam_break {s} 200"] = validate(exe, "dam_break", s, 200, args.tol, args.front_cells, args.refresh)
+        # real data: inflow / level boundaries + Manning (meuse), outlet + 0.48 M cells (vesdre)
+        for c in ("meuse", "vesdre"):
+            results[f"{c} ssprk2 100"] = validate(exe, c, "ssprk2", 100, args.tol, args.front_cells, args.refresh)
         print("\n=== summary")
         for k, v in results.items():
             print(f"{'PASS' if v else 'FAIL'}  {k}")

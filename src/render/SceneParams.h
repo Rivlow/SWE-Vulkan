@@ -9,6 +9,7 @@ namespace swe {
 enum SceneFlags : uint32_t
 {
 	SCENE_LANDCOVER = 1,
+	SCENE_OUTSIDE   = 2,
 };
 
 struct SceneParams        // std140 uniform buffer

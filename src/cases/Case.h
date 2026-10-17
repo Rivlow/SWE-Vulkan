@@ -19,6 +19,8 @@ struct BoundaryCondition
 struct CaseData
 {
 	std::string name;
+	std::string label;          // human-readable title (GUI)
+	double      z_ref = 0.0;    // elevations are relative to z_ref (f32 precision), in m
 	uint32_t    nx = 0, ny = 0;
 	double      Lx = 0, Ly = 0;
 	double      dx() const { return Lx / nx; }

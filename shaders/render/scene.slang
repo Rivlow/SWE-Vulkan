@@ -8,6 +8,7 @@ module scene;
 import params;
 
 public static const uint SCENE_LANDCOVER = 1;   // large domains: forests / parcels instead of plain grass
+public static const uint SCENE_OUTSIDE   = 2;   // the `outside` mask is meaningful
 
 public struct SceneParams           // std140, 144 bytes
 {
@@ -29,6 +30,13 @@ public struct SceneParams           // std140, 144 bytes
 };
 
 [[vk::binding(0, 1)]] public ConstantBuffer<SceneParams> SC;
+// cells outside the useful domain (e.g. outside the catchment): greyed out (1 = outside)
+[[vk::binding(1, 1)]] public StructuredBuffer<uint>      outside;
+
+public float outside_at(uint k)
+{
+    return (SC.flags & SCENE_OUTSIDE) != 0 && outside[k] != 0 ? 1.0f : 0.0f;
+}
 
 public int2 clamp_ij(int i, int j)
 {

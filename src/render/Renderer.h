@@ -67,7 +67,7 @@ class Renderer
 	vk::raii::Pipeline     skirtBed_ = nullptr, skirtWater_ = nullptr;
 
 	vkc::Image  color_, depth_;
-	vkc::Buffer indices_;
+	vkc::Buffer indices_, outside_;
 	uint32_t    indexCount_ = 0, skirtVertexCount_ = 0;
 
 	// case-dependent scene constants

@@ -30,6 +30,8 @@ def main():
     ap.add_argument("--tol", type=float, default=1e-5, help="max relative error per component")
     ap.add_argument("--exact", action="store_true", help="require bit-identical arrays")
     ap.add_argument("--front-cells", type=int, default=0, help="cells allowed above --tol (fronts), L1 still checked")
+    ap.add_argument("--front-frac", type=float, default=0.0,
+                    help="same as --front-cells as a fraction of the cell count (the larger applies)")
     args = ap.parse_args()
 
     q_ref, zb_ref, m_ref = load(args.ref)
@@ -62,7 +64,7 @@ def main():
         rel_max = float(diff.max()) / scale
         rel_l1 = float(diff.sum()) / l1
         n_bad = int((diff > args.tol * scale).sum())
-        allowed = 0 if name == "zb" else args.front_cells
+        allowed = 0 if name == "zb" else max(args.front_cells, int(args.front_frac * a.size))
         good = (n_bad <= allowed) and rel_l1 <= args.tol
         flag = "" if good else "  <-- FAIL"
         print(f"{name:>5} {scale:11.4e} {float(diff.max()):11.4e} {rel_max:10.2e} {rel_l1:10.2e} {n_bad:10d}{flag}")

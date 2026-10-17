@@ -1,4 +1,5 @@
 #pragma once
+#include "cases/Cases.h"
 #include "render/Camera.h"
 #include "render/Renderer.h"
 #include "solver/Solver.h"
@@ -89,7 +90,8 @@ class App
 	vk::Extent2D                         captureExtent_{};
 
 	// GUI state
-	bool showDemo_ = false;
+	std::vector<CaseInfo> caseList_;
+	bool                  showDemo_ = false;
 };
 
 }        // namespace swe

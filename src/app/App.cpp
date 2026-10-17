@@ -61,6 +61,7 @@ App::App(Options const &opts) :
 	solver_   = std::make_unique<Solver>(*ctx_);
 	renderer_ = std::make_unique<Renderer>(*ctx_, *solver_, colorFormat_);
 	renderer_->resize(swapchain_->extent);
+	caseList_ = listCases(resolveAssetDir(opts_.assetDir));
 	loadCase(opts_.caseName);
 	if (opts_.stepsPerFrame > 0)
 		stepsPerFrame_ = opts_.stepsPerFrame;
@@ -284,15 +285,52 @@ void App::drawControls()
 	if (ImGui::SliderFloat("Manning n", &manning, 0.0f, 0.1f, "%.3f"))
 		solver_->setManning(manning);
 
-	ImGui::SeparatorText("Cas");
-	if (ImGui::BeginCombo("##case", c.name.c_str()))
+	if (ImGui::CollapsingHeader("Conditions aux limites"))
 	{
-		for (auto const &name : caseNames())
-			if (ImGui::Selectable(name.c_str(), name == c.name) && name != c.name)
-				loadCase(name);
+		static char const *sideNames[4] = {"Ouest", "Est", "Sud", "Nord"};
+		static char const *kindNames[3] = {"mur", "débit entrant", "niveau imposé"};
+		for (int s = 0; s < 4; ++s)
+		{
+			ImGui::PushID(s);
+			auto bc   = c.bc[s];
+			int  kind = static_cast<int>(bc.kind);
+			ImGui::SetNextItemWidth(130);
+			bool changed = ImGui::Combo(sideNames[s], &kind, kindNames, 3);
+			if (changed && kind != static_cast<int>(bc.kind))
+			{
+				bc.kind = static_cast<BcKind>(kind);
+				// sensible defaults: still-water level, or a modest discharge
+				bc.value = bc.kind == BcKind::Level ? c.eta_0 : bc.kind == BcKind::Inflow ? 10.0 : 0.0;
+			}
+			if (bc.kind != BcKind::Wall)
+			{
+				ImGui::SameLine();
+				ImGui::SetNextItemWidth(110);
+				double v = bc.value;
+				char const *fmt = bc.kind == BcKind::Inflow ? "%.1f m3/s" : "%.2f m";
+				if (ImGui::InputDouble("##value", &v, 0.0, 0.0, fmt, ImGuiInputTextFlags_EnterReturnsTrue))
+				{
+					bc.value = v;
+					changed  = true;
+				}
+			}
+			if (changed)
+				solver_->setBoundary(s, bc);
+			ImGui::PopID();
+		}
+		ImGui::TextDisabled("Niveaux relatifs à z_ref = %.0f m", c.z_ref);
+	}
+
+	ImGui::SeparatorText("Cas");
+	ImGui::SetNextItemWidth(-1);
+	if (ImGui::BeginCombo("##case", c.label.c_str()))
+	{
+		for (auto const &info : caseList_)
+			if (ImGui::Selectable(info.label.c_str(), info.name == c.name) && info.name != c.name)
+				loadCase(info.name);
 		ImGui::EndCombo();
 	}
-	ImGui::Text("%u x %u mailles (%.3g m)", c.nx, c.ny, c.dx());
+	ImGui::Text("%u x %u mailles (%.3g m), %.2f M", c.nx, c.ny, c.dx(), c.cells() * 1e-6);
 	ImGui::TextDisabled("%s", ctx_->properties.deviceName.data());
 	ImGui::Checkbox("Démo ImGui", &showDemo_);
 	ImGui::End();

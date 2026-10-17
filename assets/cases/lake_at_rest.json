@@ -1,0 +1,11 @@
+{
+  "label": "Lac au repos (test d'équilibre)",
+  "type": "lake_at_rest",
+  "nx": 250, "ny": 250,
+  "Lx": 10.0, "Ly": 10.0,
+  "eta_0": 0.5,
+  "manning_n": 0.0,
+  "scheme": "ssprk2",
+  "bc": { "west": ["wall"], "east": ["wall"], "south": ["wall"], "north": ["wall"] },
+  "render": { "depth_ref": 1.0, "z_scale_0": 2.0 }
+}

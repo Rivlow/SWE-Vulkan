@@ -41,6 +41,25 @@ vertex shaders, aucun maillage CPU), en MSAA 4×. Les couleurs et l'éclairage r
 du fond : elle est appliquée exactement avec du *dual-source blending* (`image = fond × K + B`), sur le pixel de
 terrain réellement rendu derrière.
 
+## Cas
+
+Chaque cas est un fichier `assets/cases/<nom>.json` (paramètres de `main.py`), chargeable à chaud depuis le
+panneau « Cas » ; les données sont les caches de `../SWE/data` copiés dans `assets/data`.
+
+| Cas            | Type           | Données                               | Particularités                          |
+|----------------|----------------|---------------------------------------|-----------------------------------------|
+| `dam_break`    | `dam_break`    | analytique 250×250                    | murs                                    |
+| `lake_at_rest` | `lake_at_rest` | analytique 250×250                    | test d'équilibre, île sèche             |
+| `meuse`        | `river`        | `bathy_235577_146334_600_2.npy` 300×300 | débit entrant 600 m³/s, niveau aval, Manning |
+| `vesdre`       | `dtm_lake`     | `dtm_vesdre_all.npz` ×2 → 874×548     | lac initial, exutoire, hors-bassin grisé |
+
+Le prétraitement numpy (`fill_outside`, `refine_bilinear`, `refine_nearest`, `z_ref`, exutoire) est porté en
+C++ (`src/cases/GridOps`) et redonne exactement le même `zb`. Les conditions aux limites (mur / débit entrant /
+niveau imposé), le CFL et le Manning se modifient à chaud.
+
+Note : `vesdre.json` reprend `lake_level = 1000` de `main.py`, ce qui noie tout le bassin (le commentaire du
+Python évoque plutôt ~10 m d'eau sur un lac à 290 m, soit `lake_level ≈ 300`).
+
 ## Organisation
 
 | Python (`../SWE`)              | C++ / Slang                                        |
@@ -76,3 +95,6 @@ Résultats (M1, RTX 5070 Ti) :
   au plus 64 cellules au-dessus de 1e-5.
 - Lac au repos (1000 pas) : |eta − 0.5| ≤ 1e-6 ; courants parasites ~1e-5, identiques au Python
   (même cellule, même amplitude : arrondi f32 de l'équilibre hydrostatique).
+- Meuse (100 pas, débit + niveau + Manning) : `zb` identique, écart max ~3e-6.
+- Vesdre (100 pas, 0,48 M mailles) : `zb` identique, L1 ~1e-6, ~100 cellules de front au-dessus de 1e-5,
+  comme Taichi CPU contre Taichi Vulkan (94). Tolérance de front : max(64, 0,05 % des mailles).

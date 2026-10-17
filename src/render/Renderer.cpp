@@ -33,21 +33,22 @@ Renderer::Renderer(vkc::Context const &ctx, Solver const &solver, vk::Format col
 	auto counts = limits.framebufferColorSampleCounts & limits.framebufferDepthSampleCounts;
 	samples_    = (counts & vk::SampleCountFlagBits::e4) ? vk::SampleCountFlagBits::e4 : vk::SampleCountFlagBits::e1;
 
-	vk::DescriptorSetLayoutBinding binding{.binding         = 0,
-	                                       .descriptorType  = vk::DescriptorType::eUniformBuffer,
-	                                       .descriptorCount = 1,
-	                                       .stageFlags      = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment};
-	setLayout_ = vk::raii::DescriptorSetLayout(ctx_.device, {.bindingCount = 1, .pBindings = &binding});
+	auto const graphics = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+	std::array<vk::DescriptorSetLayoutBinding, 2> bindings{
+	    vk::DescriptorSetLayoutBinding{.binding = 0, .descriptorType = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1, .stageFlags = graphics},
+	    vk::DescriptorSetLayoutBinding{.binding = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = graphics}};
+	setLayout_ = vk::raii::DescriptorSetLayout(ctx_.device, {.bindingCount = static_cast<uint32_t>(bindings.size()), .pBindings = bindings.data()});
 
 	std::array<vk::DescriptorSetLayout, 2> layouts{solver_.setLayout(), *setLayout_};
 	pipelineLayout_ = vk::raii::PipelineLayout(ctx_.device, {.setLayoutCount = static_cast<uint32_t>(layouts.size()),
 	                                                         .pSetLayouts    = layouts.data()});
 
-	vk::DescriptorPoolSize poolSize{vk::DescriptorType::eUniformBuffer, kFrames};
+	std::array<vk::DescriptorPoolSize, 2> poolSizes{{{vk::DescriptorType::eUniformBuffer, kFrames},
+	                                                 {vk::DescriptorType::eStorageBuffer, kFrames}}};
 	pool_ = vk::raii::DescriptorPool(ctx_.device, {.flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
 	                                               .maxSets       = kFrames,
-	                                               .poolSizeCount = 1,
-	                                               .pPoolSizes    = &poolSize});
+	                                               .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
+	                                               .pPoolSizes    = poolSizes.data()});
 	std::array<vk::DescriptorSetLayout, kFrames> setLayouts;
 	setLayouts.fill(*setLayout_);
 	auto sets = vk::raii::DescriptorSets(ctx_.device, {.descriptorPool     = *pool_,
@@ -141,6 +142,25 @@ void Renderer::setCase(CaseData const &c)
 			uint32_t v00 = i * c.ny + j, v10 = (i + 1) * c.ny + j, v01 = i * c.ny + j + 1, v11 = (i + 1) * c.ny + j + 1;
 			idx.insert(idx.end(), {v00, v10, v11, v00, v11, v01});
 		}
+	// outside mask (1 dummy element when the case has none)
+	std::vector<uint32_t> out(std::max<size_t>(c.outside.size(), 1), 0u);
+	for (size_t k = 0; k < c.outside.size(); ++k)
+		out[k] = c.outside[k];
+	if (!c.outside.empty())
+		flags_ |= SCENE_OUTSIDE;
+	outside_ = vkc::Buffer::storage(ctx_, out.size() * sizeof(uint32_t), "outside");
+	outside_.upload(ctx_, out.data(), out.size() * sizeof(uint32_t));
+	for (uint32_t f = 0; f < kFrames; ++f)
+	{
+		auto info = outside_.info();
+		ctx_.device.updateDescriptorSets(vk::WriteDescriptorSet{.dstSet          = *sets_[f],
+		                                                        .dstBinding      = 1,
+		                                                        .descriptorCount = 1,
+		                                                        .descriptorType  = vk::DescriptorType::eStorageBuffer,
+		                                                        .pBufferInfo     = &info},
+		                                nullptr);
+	}
+
 	indexCount_       = static_cast<uint32_t>(idx.size());
 	skirtVertexCount_ = 2 * (c.nx + c.ny) * 6;
 	indices_          = vkc::Buffer(ctx_, idx.size() * sizeof(uint32_t),

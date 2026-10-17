@@ -1,0 +1,15 @@
+{
+  "label": "Vesdre : rupture du barrage de la Gileppe",
+  "comment": "MNT 100 m découpé sur les sous-bassins (cache de cases/wolf_dtm.py), raffiné x2 -> mailles de 50 m. lake_level = 1000 comme dans main.py : tout le sous-bassin 17 sous 1000 m est en eau au départ.",
+  "type": "dtm_lake",
+  "dtm": "data/dtm_vesdre_all.npz",
+  "refine": 2,
+  "lake_basin": 17,
+  "lake_level": 1000.0,
+  "wall_height": 20.0,
+  "outlet": true,
+  "manning_n": 0.04,
+  "scheme": "ssprk2",
+  "bc": { "west": ["wall"], "east": ["wall"], "south": ["wall"], "north": ["wall"] },
+  "render": { "depth_ref": 5.0, "z_scale_0": 5.0 }
+}

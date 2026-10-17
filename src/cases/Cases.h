@@ -6,13 +6,16 @@
 
 namespace swe {
 
-// Builds a case by name ("dam_break", ...). Data files are looked up under assetDir/data.
+struct CaseInfo
+{
+	std::string name;        // file stem of assets/cases/<name>.json
+	std::string label;
+};
+
+// Cases described by assets/cases/*.json (sorted by name).
+std::vector<CaseInfo> listCases(std::string const &assetDir);
+
+// Builds a case from assets/cases/<name>.json. Data files are relative to assetDir.
 CaseData makeCase(std::string const &name, std::string const &assetDir);
-
-std::vector<std::string> caseNames();
-
-// Individual builders
-CaseData makeDamBreak();
-CaseData makeLakeAtRest();
 
 }        // namespace swe
