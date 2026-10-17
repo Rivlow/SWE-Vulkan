@@ -1,0 +1,55 @@
+#pragma once
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
+namespace swe {
+
+// Command-line options. Every flag is optional; see printUsage() in main.cpp.
+struct Options
+{
+	bool        headless       = false;
+	bool        selftest       = false;
+	bool        validation     = true;         // Debug default on, Release default off
+	bool        syncValidation = false;        // --sync-validation: synchronization hazards (slow)
+	int         gpu            = -1;           // --gpu <index>: force a physical device
+	std::string caseName       = "dam_break";  // --case
+	std::string scheme;                        // --scheme (empty = case default)
+	int         steps          = 0;            // --steps (headless)
+	std::string dumpDir;                       // --dump <dir> (headless)
+	std::string assetDir;                      // --assets <dir>
+	bool        help           = false;
+};
+
+inline Options parseOptions(int argc, char **argv)
+{
+	Options o;
+#ifdef NDEBUG
+	o.validation = false;
+#endif
+	auto next = [&](int &i) -> std::string {
+		if (i + 1 >= argc)
+			throw std::runtime_error(std::string("missing value after ") + argv[i]);
+		return argv[++i];
+	};
+	for (int i = 1; i < argc; ++i)
+	{
+		std::string_view a = argv[i];
+		if (a == "--headless")               o.headless = true;
+		else if (a == "--selftest")          o.selftest = true;
+		else if (a == "--validation")        o.validation = true;
+		else if (a == "--no-validation")     o.validation = false;
+		else if (a == "--sync-validation")   o.syncValidation = o.validation = true;
+		else if (a == "--gpu")               o.gpu = std::stoi(next(i));
+		else if (a == "--case")              o.caseName = next(i);
+		else if (a == "--scheme")            o.scheme = next(i);
+		else if (a == "--steps")             o.steps = std::stoi(next(i));
+		else if (a == "--dump")              o.dumpDir = next(i);
+		else if (a == "--assets")            o.assetDir = next(i);
+		else if (a == "-h" || a == "--help") o.help = true;
+		else throw std::runtime_error("unknown option: " + std::string(a));
+	}
+	return o;
+}
+
+}        // namespace swe

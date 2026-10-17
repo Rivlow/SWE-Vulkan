@@ -1,0 +1,10 @@
+build/
+vcpkg_installed/
+out/
+imgui.ini
+*.spv
+*.user
+.vs/
+.cache/
+__pycache__/
+build.log
