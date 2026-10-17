@@ -1,5 +1,5 @@
-// Per-frame scene parameters. Set 0 of every render pipeline is the solver set (Q, zb, P: see params.slang),
-// set 1 is this uniform buffer. Mirror of src/render/SceneParams.h.
+// Per-frame scene parameters. Render pipelines use set 0 = solver set (Q, zb, P: see params.slang),
+// set 1 = effect fields (effects_data.slang), set 2 = this uniform buffer. Mirror of src/render/SceneParams.h.
 //
 // Display coordinates (as in ui/renderer.py): physical (x, y, z) -> (x S, z z_scale S, -y S), Y up,
 // S = 10 / max(Lx, Ly) so the domain is always ~10 units wide.
@@ -25,13 +25,13 @@ public struct SceneParams           // std140, 144 bytes
     public float    Ly;
     public uint     flags;
     public uint     color_mode;
-    public uint     _pad0;
-    public uint     _pad1;
+    public float    viewport_w;     // pixels (screen-space line width)
+    public float    viewport_h;
 };
 
-[[vk::binding(0, 1)]] public ConstantBuffer<SceneParams> SC;
+[[vk::binding(0, 2)]] public ConstantBuffer<SceneParams> SC;
 // cells outside the useful domain (e.g. outside the catchment): greyed out (1 = outside)
-[[vk::binding(1, 1)]] public StructuredBuffer<uint>      outside;
+[[vk::binding(1, 2)]] public StructuredBuffer<uint>      outside;
 
 public float outside_at(uint k)
 {

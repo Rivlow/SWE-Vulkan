@@ -21,6 +21,8 @@ add_slang_shader(solver   "${CMAKE_SOURCE_DIR}/shaders/solver/solver.slang")
 add_slang_shader(terrain  "${CMAKE_SOURCE_DIR}/shaders/render/terrain.slang")
 add_slang_shader(water    "${CMAKE_SOURCE_DIR}/shaders/render/water.slang")
 add_slang_shader(skirt    "${CMAKE_SOURCE_DIR}/shaders/render/skirt.slang")
+add_slang_shader(streamlines "${CMAKE_SOURCE_DIR}/shaders/render/streamlines.slang")
+add_slang_shader(effects  "${CMAKE_SOURCE_DIR}/shaders/effects/effects.slang")
 
 # ---- application ----------------------------------------------------------
 file(GLOB_RECURSE SWE_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")

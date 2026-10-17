@@ -59,7 +59,8 @@ App::App(Options const &opts) :
 	initImGui();
 
 	solver_   = std::make_unique<Solver>(*ctx_);
-	renderer_ = std::make_unique<Renderer>(*ctx_, *solver_, colorFormat_);
+	effects_  = std::make_unique<Effects>(*ctx_, *solver_);
+	renderer_ = std::make_unique<Renderer>(*ctx_, *solver_, *effects_, colorFormat_);
 	renderer_->resize(swapchain_->extent);
 	caseList_ = listCases(resolveAssetDir(opts_.assetDir));
 	loadCase(opts_.caseName);
@@ -78,6 +79,7 @@ App::~App()
 	// Vulkan objects must die before the window/GLFW.
 	captureBuffer_ = {};
 	renderer_.reset();
+	effects_.reset();
 	solver_.reset();
 	for (auto &f : frames_)
 		f = Frame{};
@@ -159,6 +161,7 @@ void App::loadCase(std::string const &name)
 	if (!opts_.scheme.empty())
 		data.scheme = opts_.scheme;
 	solver_->load(data);
+	effects_->setCase(solver_->caseData());
 	renderer_->setCase(solver_->caseData());
 	zScale0_        = static_cast<float>(data.z_scale_0);
 	render_.z_scale = zScale0_;
@@ -262,6 +265,11 @@ void App::drawControls()
 	ImGui::Checkbox("Eau", &render_.showWater);
 	ImGui::SameLine();
 	ImGui::Checkbox("Maillage", &render_.showMesh);
+	ImGui::SameLine();
+	ImGui::Checkbox("Lignes de courant", &render_.showLines);
+	bool turbid = effects_->turbidity();
+	if (ImGui::Checkbox("Eau turbide (crue chargée)", &turbid))
+		effects_->setTurbidity(turbid);
 	ImGui::SliderFloat("Exagération z", &render_.z_scale, 1.0f, 2.5f * zScale0_, "%.2f");
 	ImGui::TextDisabled("Clic gauche : rotation, molette : zoom,\nclic milieu : translation, F12 : capture");
 
@@ -339,6 +347,7 @@ void App::drawControls()
 void App::resetSimulation()
 {
 	solver_->reset();
+	effects_->reset();
 	scalars_   = {};
 	prevSteps_ = 0;
 }
@@ -414,8 +423,19 @@ void App::recordFrame(Frame &frame, uint32_t imageIndex)
 	cb.reset();
 	cb.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
+	// effects of this frame (they read the state the solver batch has just produced)
+	double   tFrame = paused_ ? 0.0 : double(stepsPerFrame_) * scalars_.dt;        // estimate (substep count only)
+	float    realDt = paused_ ? 0.0f : std::min(ImGui::GetIO().DeltaTime, 0.1f);
+	bool     lines  = render_.showLines && render_.showWater;
+	effects_->record(cb, EffectsFrame{.zScale      = render_.z_scale,
+	                                  .realDt      = realDt,
+	                                  .substeps    = effects_->substeps(tFrame, scalars_.s_max),
+	                                  .streamlines = lines});
+
 	// 3D scene (multisampled, resolved into the swapchain image)
-	renderer_->record(cb, frameIndex_, image, view, camera_, render_, scalars_.t);
+	RenderSettings settings = render_;
+	settings.showLines      = lines;
+	renderer_->record(cb, frameIndex_, image, view, camera_, settings, scalars_.t);
 
 	// GUI on top, single-sampled
 	vkc::memoryBarrier(cb, vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,

@@ -1,5 +1,6 @@
 #include "render/Renderer.h"
 
+#include "render/Effects.h"
 #include "solver/Solver.h"
 #include "util/Log.h"
 #include "vk/Context.h"
@@ -25,8 +26,8 @@ glm::vec3 sunDirection()
 
 }        // namespace
 
-Renderer::Renderer(vkc::Context const &ctx, Solver const &solver, vk::Format colorFormat) :
-    ctx_(ctx), solver_(solver), colorFormat_(colorFormat)
+Renderer::Renderer(vkc::Context const &ctx, Solver const &solver, Effects const &effects, vk::Format colorFormat) :
+    ctx_(ctx), solver_(solver), effects_(effects), colorFormat_(colorFormat)
 {
 	// 4x MSAA if colour and depth both support it
 	auto limits = ctx_.properties.limits;
@@ -39,7 +40,8 @@ Renderer::Renderer(vkc::Context const &ctx, Solver const &solver, vk::Format col
 	    vk::DescriptorSetLayoutBinding{.binding = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = graphics}};
 	setLayout_ = vk::raii::DescriptorSetLayout(ctx_.device, {.bindingCount = static_cast<uint32_t>(bindings.size()), .pBindings = bindings.data()});
 
-	std::array<vk::DescriptorSetLayout, 2> layouts{solver_.setLayout(), *setLayout_};
+	// set 0 = solver (Q, zb), set 1 = effect fields, set 2 = scene
+	std::array<vk::DescriptorSetLayout, 3> layouts{solver_.setLayout(), effects_.setLayout(), *setLayout_};
 	pipelineLayout_ = vk::raii::PipelineLayout(ctx_.device, {.setLayoutCount = static_cast<uint32_t>(layouts.size()),
 	                                                         .pSetLayouts    = layouts.data()});
 
@@ -70,6 +72,7 @@ Renderer::Renderer(vkc::Context const &ctx, Solver const &solver, vk::Format col
 	terrainModule_ = vkc::loadShader(ctx_, "terrain");
 	waterModule_   = vkc::loadShader(ctx_, "water");
 	skirtModule_   = vkc::loadShader(ctx_, "skirt");
+	linesModule_   = vkc::loadShader(ctx_, "streamlines");
 	createPipelines();
 }
 
@@ -120,6 +123,16 @@ void Renderer::createPipelines()
 	d.vertexEntry    = "skirtWaterVert";
 	d.name           = "skirt-water";
 	skirtWater_      = vkc::makeGraphicsPipeline(ctx_, d);
+
+	// streamlines: screen-space quads blended over the water, no depth write
+	d.vertexModule   = *linesModule_;
+	d.vertexEntry    = "lineVert";
+	d.fragmentModule = *linesModule_;
+	d.fragmentEntry  = "lineFrag";
+	d.blend          = vkc::Blend::Alpha;
+	d.depthWrite     = false;
+	d.name           = "streamlines";
+	lines_           = vkc::makeGraphicsPipeline(ctx_, d);
 }
 
 void Renderer::setCase(CaseData const &c)
@@ -204,6 +217,8 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 	sp.Lx              = Lx_;
 	sp.Ly              = Ly_;
 	sp.flags           = flags_;
+	sp.viewport_w      = float(extent_.width);
+	sp.viewport_h      = float(extent_.height);
 	std::memcpy(sceneUbo_[frame].mapped(), &sp, sizeof(sp));
 
 	// the solver's last step wrote Q: make it visible to the vertex/fragment fetches
@@ -245,7 +260,7 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 	                                    .pDepthAttachment     = &depth});
 	cb.setViewport(0, vk::Viewport(0.0f, 0.0f, float(extent_.width), float(extent_.height), 0.0f, 1.0f));
 	cb.setScissor(0, vk::Rect2D({0, 0}, extent_));
-	std::array<vk::DescriptorSet, 2> sets{solver_.set(), *sets_[frame]};
+	std::array<vk::DescriptorSet, 3> sets{solver_.set(), effects_.set(), *sets_[frame]};
 	cb.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipelineLayout_, 0, sets, nullptr);
 	cb.bindIndexBuffer(indices_.handle(), 0, vk::IndexType::eUint32);
 
@@ -268,6 +283,11 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 		{
 			cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *waterWire_);
 			cb.drawIndexed(indexCount_, 1, 0, 0, 0);
+		}
+		if (settings.showLines)
+		{
+			cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *lines_);
+			cb.draw(effects_.lineVertexCount(), 1, 0, 0);
 		}
 	}
 	cb.endRendering();

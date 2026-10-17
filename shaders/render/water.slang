@@ -6,17 +6,22 @@
 // pixel actually rendered behind (per pixel, not per vertex). Blend: src0 * ONE + dst * SRC1_COLOR.
 import params;
 import reconstruction;
+import effects_data;
 import scene;
 import noise;
 import palette;
 
 struct WaterVarying
 {
-    float4 pos  : SV_Position;
-    float3 disp : DISP;
-    float3 n    : NORMAL;
-    float  h    : DEPTH;
-    float  wet  : WET;
+    float4 pos      : SV_Position;
+    float3 disp     : DISP;
+    float3 n        : NORMAL;
+    float  h        : DEPTH;
+    float  wet_blur : WETBLUR;
+    float  foam     : FOAMF;       // advected foam field
+    float  turb     : TURB;        // advected turbidity
+    float  shadow   : SHADOW;
+    float  ao       : AO;
 };
 
 [shader("vertex")]
@@ -50,8 +55,12 @@ WaterVarying waterVert(uint vid : SV_VertexID)
     o.disp = display_pos(i, j, eta);
     o.pos  = project(o.disp);
     o.n    = float3(-dex, 1.0f, dey);
-    o.h    = h;
-    o.wet  = h > 2e-3f ? 1.0f : 0.0f;
+    o.h        = h;
+    o.wet_blur = wet_blur[vid];
+    o.foam     = foam[vid];
+    o.turb     = turb[vid];
+    o.shadow   = shadow[vid];
+    o.ao       = ao[vid];
     return o;
 }
 
@@ -74,11 +83,14 @@ WaterOut waterFrag(WaterVarying v)
     float3 sun = SC.sun.xyz;
     float3 n   = normalize(v.n);
     float  h   = max(v.h, 0.0f);
-    float  ao = 1.0f, sun_vis = 1.0f;          // relief lighting arrives with milestone M4
+    float  ao = v.ao, sun_vis = v.shadow;
 
-    // absorption (Beer-Lambert): the tinted bed shows through all the more as the water is shallow
+    // absorption (Beer-Lambert): the tinted bed shows through all the more as the water is shallow;
+    // turbid water is brown and much less transparent (optional)
+    float  T       = (E.flags & EFFECTS_TURBIDITY) != 0 ? saturate(v.turb) : 0.0f;
     float3 tint    = lerp(SHALLOW, DEEP, 1.0f - exp(-h / (0.6f * SC.depth_ref)));
-    float  opacity = 1.0f - exp(-h / SC.water_clarity);
+    tint           = lerp(tint, MUD, 0.85f * T);
+    float  opacity = 1.0f - exp(-h / (SC.water_clarity * (1.0f - 0.85f * T)));
     float  shade   = (0.8f + 0.35f * max(dot(n, sun), 0.0f) * sun_vis) * (0.6f + 0.4f * ao);
 
     // sky reflection (Schlick Fresnel) + sun glint (Blinn-Phong), none in the shade
@@ -88,9 +100,10 @@ WaterOut waterFrag(WaterVarying v)
     float3 hv   = normalize(view + sun);
     float3 glint = float3(1.0f, 0.97f, 0.9f) * 0.7f * wet_ * sun_vis * pow(max(dot(n, hv), 0.0f), 80.0f);
 
-    // foam: shoreline fringe (the advected foam field arrives with milestone M4)
+    // foam: field carried by the flow, textured at sub-cell scale, plus a fringe on the water's edge
     float grain = 0.55f + 0.45f * value_noise(9.0f * v.disp.x, 9.0f * v.disp.z);
-    float foam  = sstep(0.85f, 0.55f, v.wet) * sstep(0.06f, 0.0f, h) * 0.35f;
+    float foam  = v.foam * grain;
+    foam = max(foam, sstep(0.85f, 0.55f, v.wet_blur) * sstep(0.06f, 0.0f, h) * 0.35f);
     float fm    = min(foam, 0.8f);
     float3 foam_col = FOAM * (0.75f + 0.25f * sun_vis);
 

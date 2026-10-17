@@ -13,12 +13,14 @@ namespace swe {
 
 namespace vkc { class Context; }
 class Solver;
+class Effects;
 
 struct RenderSettings
 {
 	float z_scale   = 2.0f;
 	bool  showWater = true;
 	bool  showMesh  = false;
+	bool  showLines = true;
 };
 
 // 3D view of the simulation: bed, water and model base, drawn straight from the solver's buffers
@@ -28,7 +30,7 @@ class Renderer
   public:
 	static constexpr uint32_t kFrames = 2;
 
-	Renderer(vkc::Context const &ctx, Solver const &solver, vk::Format colorFormat);
+	Renderer(vkc::Context const &ctx, Solver const &solver, Effects const &effects, vk::Format colorFormat);
 
 	// Rebuilds the per-case resources (index buffer, base depth...). Call after Solver::load.
 	void setCase(CaseData const &data);
@@ -51,6 +53,7 @@ class Renderer
 
 	vkc::Context const &ctx_;
 	Solver const       &solver_;
+	Effects const      &effects_;
 	vk::Format          colorFormat_;
 	vk::Format          depthFormat_ = vk::Format::eD32Sfloat;
 	vk::SampleCountFlagBits samples_ = vk::SampleCountFlagBits::e4;
@@ -62,9 +65,9 @@ class Renderer
 	std::array<vk::raii::DescriptorSet, kFrames> sets_{nullptr, nullptr};
 	std::array<vkc::Buffer, kFrames>             sceneUbo_;
 
-	vk::raii::ShaderModule terrainModule_ = nullptr, waterModule_ = nullptr, skirtModule_ = nullptr;
+	vk::raii::ShaderModule terrainModule_ = nullptr, waterModule_ = nullptr, skirtModule_ = nullptr, linesModule_ = nullptr;
 	vk::raii::Pipeline     terrain_ = nullptr, terrainWire_ = nullptr, water_ = nullptr, waterWire_ = nullptr;
-	vk::raii::Pipeline     skirtBed_ = nullptr, skirtWater_ = nullptr;
+	vk::raii::Pipeline     skirtBed_ = nullptr, skirtWater_ = nullptr, lines_ = nullptr;
 
 	vkc::Image  color_, depth_;
 	vkc::Buffer indices_, outside_;

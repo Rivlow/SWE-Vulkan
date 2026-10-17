@@ -1,6 +1,7 @@
 #pragma once
 #include "cases/Cases.h"
 #include "render/Camera.h"
+#include "render/Effects.h"
 #include "render/Renderer.h"
 #include "solver/Solver.h"
 #include "util/Cli.h"
@@ -63,6 +64,7 @@ class App
 	std::unique_ptr<vkc::Context>      ctx_;
 	std::unique_ptr<vkc::Swapchain>    swapchain_;
 	std::unique_ptr<Solver>            solver_;
+	std::unique_ptr<Effects>           effects_;
 	std::unique_ptr<Renderer>          renderer_;
 	std::array<Frame, kFramesInFlight> frames_;
 	uint32_t                           frameIndex_         = 0;

@@ -19,7 +19,8 @@ struct SceneParams        // std140 uniform buffer
 	glm::vec4 sun{0.0f};
 	float     S = 1, z_scale = 1, depth_ref = 1, water_clarity = 1;
 	float     z_base = 0, time = 0, Lx = 0, Ly = 0;
-	uint32_t  flags = 0, color_mode = 0, _pad0 = 0, _pad1 = 0;
+	uint32_t  flags = 0, color_mode = 0;
+	float     viewport_w = 1, viewport_h = 1;
 };
 static_assert(sizeof(SceneParams) == 144);
 
