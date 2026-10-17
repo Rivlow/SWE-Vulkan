@@ -18,6 +18,11 @@ struct Options
 	int         steps          = 0;            // --steps (headless)
 	std::string dumpDir;                       // --dump <dir> (headless)
 	std::string assetDir;                      // --assets <dir>
+	std::string capturePath;                   // --capture <png>: screenshot after --capture-frames frames, then quit
+	int         captureFrames  = 120;
+	int         stepsPerFrame  = -1;           // --steps-per-frame (window)
+	bool        showMesh       = false;        // --mesh
+	float       zScale         = -1.0f;        // --z-scale (default: case value)
 	bool        help           = false;
 };
 
@@ -46,6 +51,11 @@ inline Options parseOptions(int argc, char **argv)
 		else if (a == "--steps")             o.steps = std::stoi(next(i));
 		else if (a == "--dump")              o.dumpDir = next(i);
 		else if (a == "--assets")            o.assetDir = next(i);
+		else if (a == "--capture")           o.capturePath = next(i);
+		else if (a == "--capture-frames")    o.captureFrames = std::stoi(next(i));
+		else if (a == "--steps-per-frame")   o.stepsPerFrame = std::stoi(next(i));
+		else if (a == "--mesh")              o.showMesh = true;
+		else if (a == "--z-scale")           o.zScale = std::stof(next(i));
 		else if (a == "-h" || a == "--help") o.help = true;
 		else throw std::runtime_error("unknown option: " + std::string(a));
 	}

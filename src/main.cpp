@@ -22,6 +22,9 @@ usage: swe [options]
   --assets <dir>       asset directory (cases/, data/)
   --validation / --no-validation   Vulkan validation layers (default: on in Debug)
   --sync-validation    also enable synchronization validation (slow)
+  --steps-per-frame <n>  solver steps per displayed frame                [30]
+  --capture <png>      save a screenshot after --capture-frames frames, then quit
+  --capture-frames <n>                                                   [120]
   --headless           no window (batch mode)
     --selftest         run the compute self-test and exit
     --steps <n>        number of solver steps

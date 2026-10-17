@@ -18,6 +18,9 @@ include(cmake/SlangShaders.cmake)
 # ---- shaders --------------------------------------------------------------
 add_slang_shader(selftest "${CMAKE_SOURCE_DIR}/shaders/selftest.slang")
 add_slang_shader(solver   "${CMAKE_SOURCE_DIR}/shaders/solver/solver.slang")
+add_slang_shader(terrain  "${CMAKE_SOURCE_DIR}/shaders/render/terrain.slang")
+add_slang_shader(water    "${CMAKE_SOURCE_DIR}/shaders/render/water.slang")
+add_slang_shader(skirt    "${CMAKE_SOURCE_DIR}/shaders/render/skirt.slang")
 
 # ---- application ----------------------------------------------------------
 file(GLOB_RECURSE SWE_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")

@@ -133,8 +133,16 @@ bool Context::isSuitable(vk::raii::PhysicalDevice const &pd) const
 	    !f.get<vk::PhysicalDeviceVulkan13Features>().synchronization2 ||
 	    !f.get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering)
 		return false;
-	if (!headless && !hasExtension(pd.enumerateDeviceExtensionProperties(), vk::KHRSwapchainExtensionName))
-		return false;
+	if (!headless)
+	{
+		if (!hasExtension(pd.enumerateDeviceExtensionProperties(), vk::KHRSwapchainExtensionName))
+			return false;
+		// the renderer reads the solver's storage buffers from vertex/fragment shaders and blends water
+		// with a second fragment output
+		auto core = pd.getFeatures();
+		if (!core.dualSrcBlend || !core.vertexPipelineStoresAndAtomics || !core.fragmentStoresAndAtomics)
+			return false;
+	}
 	return findQueueFamily(pd) >= 0;
 }
 
@@ -181,10 +189,13 @@ void Context::createDevice()
 	vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features, vk::PhysicalDeviceVulkan12Features,
 	                   vk::PhysicalDeviceVulkan13Features>
 	    features{
-	        {.features = {.fillModeNonSolid  = supported.fillModeNonSolid,
-	                      .wideLines         = supported.wideLines,
-	                      .samplerAnisotropy = supported.samplerAnisotropy}},
-	        {},
+	        {.features = {.dualSrcBlend                   = supported.dualSrcBlend,        // water transparency
+	                      .fillModeNonSolid               = supported.fillModeNonSolid,    // wireframe overlay
+	                      .wideLines                      = supported.wideLines,
+	                      .samplerAnisotropy              = supported.samplerAnisotropy,
+	                      .vertexPipelineStoresAndAtomics = supported.vertexPipelineStoresAndAtomics,
+	                      .fragmentStoresAndAtomics       = supported.fragmentStoresAndAtomics}},
+	        {.shaderDrawParameters = true},        // SV_VertexID is lowered to VertexIndex - BaseVertex
 	        {.scalarBlockLayout = true, .timelineSemaphore = true},
 	        {.synchronization2 = true, .dynamicRendering = true},
 	    };

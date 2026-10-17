@@ -20,14 +20,26 @@ Les shaders (`shaders/**.slang`) sont compilés au build dans `bin/shaders/*.spv
 
 ```bat
 swe                                   :: fenêtre, cas dam_break
-swe --case dam_break --scheme rk4
+swe --case lake_at_rest --scheme rk4
 swe --headless --steps 200 --dump out\run   :: Q.npy, zb.npy, meta.json
 swe --headless --selftest
+swe --capture out\vue.png --capture-frames 120   :: capture après 120 images puis quitte
 swe --sync-validation                 :: validation Vulkan + synchronisation (lent)
 swe --help
 ```
 
-Espace : pause. Panneau « Contrôles » : pas par image, schéma, CFL, Manning, reset.
+Souris : clic gauche = rotation libre, molette = zoom, clic milieu = translation. Espace : pause, F12 : capture
+(`captures\`). Panneau « Contrôles » : pas par image, eau, maillage, exagération verticale, schéma, CFL,
+Manning, cas, reset simulation / caméra.
+
+## Rendu
+
+Le terrain, l'eau et le socle sont dessinés directement depuis les buffers du solveur (`Q`, `zb` lus dans les
+vertex shaders, aucun maillage CPU), en MSAA 4×. Les couleurs et l'éclairage reprennent les formules de
+`ui/renderer.py`, mais par pixel. La transparence de l'eau, que le Python simulait par sommet
+(`mix(fond·(0.45+SHALLOW), teinte, opacité)` puis ombrage, Fresnel, reflet, écume), est linéaire en la couleur
+du fond : elle est appliquée exactement avec du *dual-source blending* (`image = fond × K + B`), sur le pixel de
+terrain réellement rendu derrière.
 
 ## Organisation
 

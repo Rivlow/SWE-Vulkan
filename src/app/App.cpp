@@ -1,8 +1,10 @@
 #include "app/App.h"
 
 #include "app/Headless.h"
+#include "app/Screenshot.h"
 #include "cases/Cases.h"
 #include "util/Log.h"
+#include "vk/Pipelines.h"
 
 #include <GLFW/glfw3.h>
 #include <imgui.h>
@@ -10,19 +12,25 @@
 #include <imgui_impl_vulkan.h>
 #include <implot.h>
 
+#include <chrono>
+#include <cmath>
 #include <stdexcept>
 
 namespace swe {
 
 namespace {
 
-// Background of the Python viewer (canvas.set_background_color).
-constexpr std::array<float, 4> kSkyBackground{0.80f, 0.87f, 0.93f, 1.0f};
-
 void checkVk(VkResult r)
 {
 	if (r != VK_SUCCESS)
 		log::error("imgui vulkan backend: VkResult {}", static_cast<int>(r));
+}
+
+std::filesystem::path timestampedCapturePath()
+{
+	auto now = std::chrono::system_clock::now();
+	auto t   = std::chrono::floor<std::chrono::seconds>(now);
+	return std::filesystem::path("captures") / std::format("swe_{:%Y%m%d_%H%M%S}.png", t);
 }
 
 }        // namespace
@@ -50,11 +58,15 @@ App::App(Options const &opts) :
 
 	initImGui();
 
-	auto data = makeCase(opts_.caseName, resolveAssetDir(opts_.assetDir));
-	if (!opts_.scheme.empty())
-		data.scheme = opts_.scheme;
-	solver_ = std::make_unique<Solver>(*ctx_);
-	solver_->load(data);
+	solver_   = std::make_unique<Solver>(*ctx_);
+	renderer_ = std::make_unique<Renderer>(*ctx_, *solver_, colorFormat_);
+	renderer_->resize(swapchain_->extent);
+	loadCase(opts_.caseName);
+	if (opts_.stepsPerFrame > 0)
+		stepsPerFrame_ = opts_.stepsPerFrame;
+	render_.showMesh = opts_.showMesh;
+	if (opts_.zScale > 0)
+		render_.z_scale = opts_.zScale;
 }
 
 App::~App()
@@ -63,6 +75,8 @@ App::~App()
 		ctx_->device.waitIdle();
 	shutdownImGui();
 	// Vulkan objects must die before the window/GLFW.
+	captureBuffer_ = {};
+	renderer_.reset();
 	solver_.reset();
 	for (auto &f : frames_)
 		f = Frame{};
@@ -115,6 +129,7 @@ void App::initImGui()
 	info.UseDynamicRendering = true;
 	info.CheckVkResultFn     = &checkVk;
 
+	// The GUI is drawn in a second, single-sampled pass straight onto the swapchain image.
 	auto &pipe                                               = info.PipelineInfoMain;
 	pipe.MSAASamples                                         = VK_SAMPLE_COUNT_1_BIT;
 	pipe.PipelineRenderingCreateInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
@@ -137,8 +152,25 @@ void App::shutdownImGui()
 	imguiReady_ = false;
 }
 
+void App::loadCase(std::string const &name)
+{
+	auto data = makeCase(name, resolveAssetDir(opts_.assetDir));
+	if (!opts_.scheme.empty())
+		data.scheme = opts_.scheme;
+	solver_->load(data);
+	renderer_->setCase(solver_->caseData());
+	zScale0_        = static_cast<float>(data.z_scale_0);
+	render_.z_scale = zScale0_;
+	renderer_->homeCamera(camera_, zScale0_);
+	scalars_   = {};
+	prevSteps_ = 0;
+}
+
 void App::run()
 {
+	if (!opts_.capturePath.empty())
+		log::info("capture: {} after {} frames", opts_.capturePath, opts_.captureFrames);
+
 	while (!glfwWindowShouldClose(window_))
 	{
 		glfwPollEvents();
@@ -151,24 +183,49 @@ void App::run()
 		ImGui_ImplVulkan_NewFrame();
 		ImGui_ImplGlfw_NewFrame();
 		ImGui::NewFrame();
+		handleInput();
 		drawGui();
 		ImGui::Render();
 
+		if (!opts_.capturePath.empty() && frameCount_ == static_cast<uint64_t>(opts_.captureFrames))
+			captureRequest_ = opts_.capturePath;
+
 		drawFrame();
+		++frameCount_;
+
+		// --capture: quit once the image has been written
+		if (!opts_.capturePath.empty() && frameCount_ > static_cast<uint64_t>(opts_.captureFrames) && !capturePending_ &&
+		    !captureRequest_)
+			glfwSetWindowShouldClose(window_, GLFW_TRUE);
 	}
 	ctx_->device.waitIdle();
+	if (capturePending_)
+		saveCapture();
+}
+
+void App::handleInput()
+{
+	auto &io = ImGui::GetIO();
+	if (!io.WantCaptureKeyboard)
+	{
+		if (ImGui::IsKeyPressed(ImGuiKey_Space, false))
+			paused_ = !paused_;
+		if (ImGui::IsKeyPressed(ImGuiKey_F12, false))
+			captureRequest_ = timestampedCapturePath();
+	}
+
+	// Camera: normalised cursor with origin bottom-left (as in ui/camera.py); no drag starting on the GUI
+	glm::vec2 size(std::max(io.DisplaySize.x, 1.0f), std::max(io.DisplaySize.y, 1.0f));
+	glm::vec2 cursor(io.MousePos.x / size.x, 1.0f - io.MousePos.y / size.y);
+	int       button = ImGui::IsMouseDown(ImGuiMouseButton_Left) ? 1 : ImGui::IsMouseDown(ImGuiMouseButton_Middle) ? 2 : 0;
+	bool      blocked = io.WantCaptureMouse;
+	camera_.update(cursor, button, blocked ? 0.0f : io.MouseWheel, blocked);
 }
 
 void App::drawGui()
 {
-	auto &io = ImGui::GetIO();
 	ImGui::DockSpaceOverViewport(0, nullptr, ImGuiDockNodeFlags_PassthruCentralNode);
-
-	if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_Space, false))
-		paused_ = !paused_;
-
 	drawControls();
-
 	if (showDemo_)
 		ImGui::ShowDemoWindow(&showDemo_);
 }
@@ -177,7 +234,7 @@ void App::drawControls()
 {
 	auto &io = ImGui::GetIO();
 	ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_FirstUseEver);
-	ImGui::SetNextWindowSize(ImVec2(360, 330), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(360, 470), ImGuiCond_FirstUseEver);
 	if (!ImGui::Begin("Contrôles"))
 	{
 		ImGui::End();
@@ -196,6 +253,16 @@ void App::drawControls()
 	ImGui::SliderInt("Pas / rendu", &stepsPerFrame_, 1, 500, "%d", ImGuiSliderFlags_AlwaysClamp);
 	if (ImGui::Button("Reset simulation"))
 		resetSimulation();
+	ImGui::SameLine();
+	if (ImGui::Button("Reset caméra"))
+		camera_.reset();
+
+	ImGui::SeparatorText("Affichage");
+	ImGui::Checkbox("Eau", &render_.showWater);
+	ImGui::SameLine();
+	ImGui::Checkbox("Maillage", &render_.showMesh);
+	ImGui::SliderFloat("Exagération z", &render_.z_scale, 1.0f, 2.5f * zScale0_, "%.2f");
+	ImGui::TextDisabled("Clic gauche : rotation, molette : zoom,\nclic milieu : translation, F12 : capture");
 
 	ImGui::SeparatorText("Schéma numérique");
 	if (ImGui::BeginCombo("Runge-Kutta", schemes().at(solver_->schemeName()).label.c_str()))
@@ -218,7 +285,14 @@ void App::drawControls()
 		solver_->setManning(manning);
 
 	ImGui::SeparatorText("Cas");
-	ImGui::Text("%s : %u x %u mailles (%.3g m)", c.name.c_str(), c.nx, c.ny, c.dx());
+	if (ImGui::BeginCombo("##case", c.name.c_str()))
+	{
+		for (auto const &name : caseNames())
+			if (ImGui::Selectable(name.c_str(), name == c.name) && name != c.name)
+				loadCase(name);
+		ImGui::EndCombo();
+	}
+	ImGui::Text("%u x %u mailles (%.3g m)", c.nx, c.ny, c.dx());
 	ImGui::TextDisabled("%s", ctx_->properties.deviceName.data());
 	ImGui::Checkbox("Démo ImGui", &showDemo_);
 	ImGui::End();
@@ -247,6 +321,8 @@ void App::drawFrame()
 		prevSteps_ = s.n_steps;
 		scalars_   = s;
 	}
+	if (capturePending_)
+		saveCapture();
 
 	auto [acquire, imageIndex] = swapchain_->swapchain.acquireNextImage(UINT64_MAX, *frame.imageAvailable, nullptr);
 	if (acquire == vk::Result::eErrorOutOfDateKHR)
@@ -296,18 +372,21 @@ void App::recordFrame(Frame &frame, uint32_t imageIndex)
 {
 	auto &cb    = frame.cmd;
 	auto  image = swapchain_->images[imageIndex];
+	auto  view  = *swapchain_->views[imageIndex];
 	cb.reset();
 	cb.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
-	vkc::transitionImage(cb, image, vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal,
-	                     vk::PipelineStageFlagBits2::eColorAttachmentOutput, {},
-	                     vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite);
+	// 3D scene (multisampled, resolved into the swapchain image)
+	renderer_->record(cb, frameIndex_, image, view, camera_, render_, scalars_.t);
 
-	vk::RenderingAttachmentInfo color{.imageView   = *swapchain_->views[imageIndex],
+	// GUI on top, single-sampled
+	vkc::memoryBarrier(cb, vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
+	                   vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+	                   vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite);
+	vk::RenderingAttachmentInfo color{.imageView   = view,
 	                                  .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
-	                                  .loadOp      = vk::AttachmentLoadOp::eClear,
-	                                  .storeOp     = vk::AttachmentStoreOp::eStore,
-	                                  .clearValue  = vk::ClearColorValue(kSkyBackground)};
+	                                  .loadOp      = vk::AttachmentLoadOp::eLoad,
+	                                  .storeOp     = vk::AttachmentStoreOp::eStore};
 	cb.beginRendering(vk::RenderingInfo{.renderArea           = {.offset = {0, 0}, .extent = swapchain_->extent},
 	                                    .layerCount           = 1,
 	                                    .colorAttachmentCount = 1,
@@ -315,10 +394,50 @@ void App::recordFrame(Frame &frame, uint32_t imageIndex)
 	ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), *cb);
 	cb.endRendering();
 
-	vkc::transitionImage(cb, image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::ePresentSrcKHR,
-	                     vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
-	                     vk::PipelineStageFlagBits2::eBottomOfPipe, {});
+	if (captureRequest_)
+	{
+		recordCapture(cb, image);
+		capturePending_ = captureRequest_;
+		captureRequest_.reset();
+	}
+	else
+		vkc::transitionImage(cb, image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::ePresentSrcKHR,
+		                     vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
+		                     vk::PipelineStageFlagBits2::eBottomOfPipe, {});
 	cb.end();
+}
+
+void App::recordCapture(vk::raii::CommandBuffer const &cb, vk::Image image)
+{
+	auto           extent = swapchain_->extent;
+	vk::DeviceSize size   = vk::DeviceSize(extent.width) * extent.height * 4;
+	if (!captureBuffer_ || captureBuffer_.size() < size)
+		captureBuffer_ = vkc::Buffer::host(*ctx_, size, vk::BufferUsageFlagBits::eTransferDst, "capture");
+	captureExtent_ = extent;
+
+	vkc::transitionImage(cb, image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eTransferSrcOptimal,
+	                     vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
+	                     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+	cb.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, captureBuffer_.handle(),
+	                     vk::BufferImageCopy{.bufferOffset      = 0,
+	                                         .imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+	                                         .imageExtent       = {extent.width, extent.height, 1}});
+	vkc::memoryBarrier(cb, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+	                   vk::PipelineStageFlagBits2::eHost, vk::AccessFlagBits2::eHostRead);
+	vkc::transitionImage(cb, image, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::ePresentSrcKHR,
+	                     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+	                     vk::PipelineStageFlagBits2::eBottomOfPipe, {});
+}
+
+void App::saveCapture()
+{
+	// called once the fence of the frame that recorded the copy has signalled (or after waitIdle)
+	ctx_->device.waitIdle();
+	bool bgra = colorFormat_ == vk::Format::eB8G8R8A8Unorm || colorFormat_ == vk::Format::eB8G8R8A8Srgb;
+	if (writePng(*capturePending_, static_cast<uint8_t const *>(captureBuffer_.mapped()), captureExtent_.width,
+	             captureExtent_.height, bgra))
+		log::info("capture saved: {}", std::filesystem::absolute(*capturePending_).string());
+	capturePending_.reset();
 }
 
 void App::onSwapchainRecreated()
@@ -326,6 +445,7 @@ void App::onSwapchainRecreated()
 	ImGui_ImplVulkan_SetMinImageCount(swapchain_->minImageCount);
 	if (swapchain_->surfaceFormat.format != colorFormat_)
 		throw std::runtime_error("swapchain format changed on recreation (unsupported)");
+	renderer_->resize(swapchain_->extent);
 }
 
 }        // namespace swe
