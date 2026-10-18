@@ -27,6 +27,7 @@ static_assert(sizeof(EffectsParams) == 64);
 enum EffectsFlags : uint32_t
 {
 	EFFECTS_TURBIDITY = 1,
+	EFFECTS_GW_LINES  = 2,        // streamlines of the aquifer flow
 };
 
 struct EffectsPC        // push constants
@@ -55,6 +56,9 @@ class Effects
 	void reset();                              // clears the carried effects and respawns streamlines; waits
 	void setTurbidity(bool on);
 	bool turbidity() const { return (params_.flags & EFFECTS_TURBIDITY) != 0; }
+	// streamlines of the aquifer (pore velocity -kh grad H / Sy) instead of the surface water; respawns them
+	void setGroundwaterLines(bool on);
+	bool groundwaterLines() const { return (params_.flags & EFFECTS_GW_LINES) != 0; }
 
 	// Number of advection substeps for a frame advancing the simulation by tFrame at speed sMax
 	uint32_t substeps(double tFrame, double sMax) const;

@@ -1,0 +1,12 @@
+{
+  "label": "TEMP drain test: dam break, CFL 0.9",
+  "type": "dam_break",
+  "nx": 250, "ny": 250,
+  "Lx": 10.0, "Ly": 10.0,
+  "eta_0": 1.0,
+  "manning_n": 0.0,
+  "cfl": 0.9,
+  "scheme": "euler",
+  "bc": { "west": ["wall"], "east": ["wall"], "south": ["wall"], "north": ["wall"] },
+  "render": { "depth_ref": 1.0, "z_scale_0": 2.0 }
+}

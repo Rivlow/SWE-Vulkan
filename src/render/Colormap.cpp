@@ -21,4 +21,12 @@ glm::vec3 turbo(float x)
 	                  0.0f, 1.0f);
 }
 
+// Blue - white - brown, same colours as shaders/render/scene.slang diverging()
+glm::vec3 diverging(float x)
+{
+	glm::vec3 const blue(0.12f, 0.38f, 0.85f), white(0.95f, 0.95f, 0.92f), brown(0.55f, 0.32f, 0.10f);
+	x = std::clamp(x, 0.0f, 1.0f);
+	return x < 0.5f ? glm::mix(blue, white, 2.0f * x) : glm::mix(white, brown, 2.0f * x - 1.0f);
+}
+
 }        // namespace swe

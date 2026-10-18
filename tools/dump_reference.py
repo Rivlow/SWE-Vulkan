@@ -5,17 +5,72 @@
 Writes Q.npy (nx, ny, 3), zb.npy (nx, ny) and meta.json, the same layout as `swe --headless --dump`.
 The Python project is not modified: main.py is executed with its `case` / `time_scheme` lines replaced,
 inside a stand-in `__main__` module (the solver modules read their globals with `from __main__ import ...`).
+
+--shu-osher: run a copy of the project (out/_swe_shu_osher) whose Runge-Kutta loop is rewritten in Shu-Osher form,
+Q <- Q^n + b (Q + dt L(Q) - Q^n), with the operation order of euler_stage in shaders/solver/solver.slang. The C++ solver
+uses that form (exact positivity with the drain limiter); the Butcher form of the original differs by round-off
+only, but round-off is amplified at shocks (and through dt = f(s_max)), so a 200-step comparison needs this.
 """
 import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import types
 from pathlib import Path
 
 DEFAULT_SWE = Path(__file__).resolve().parents[2] / "SWE"
+ROOT = Path(__file__).resolve().parents[1]
+
+BUTCHER_LOOP = """    for s in ti.static(range(tableau.stages)):
+        if ti.static(tableau.is_used(s)):
+            # Q_s = Q^n + dt * sum_j A[s][j] K_j   (Q_0 = Q^n : Q contient déjà Q^n)
+            if ti.static(s > 0):
+                combine(Q, tableau.A[s])
+                fix_dry(Q)
+            residual(Q, K[s])
+
+    # Q^{n+1} = Q^n + dt * sum_s b[s] K_s
+    combine(Q, tableau.b)
+    fix_dry(Q)
+"""
+SHU_OSHER_LOOP = """    # Shu-Osher form (dump_reference.py --shu-osher): same operation order as euler_stage in solver.slang
+    for s in ti.static(range(len(SHU_OSHER[time_scheme]))):
+        residual(Q, K[0])
+        a_s, b_s = ti.static(SHU_OSHER[time_scheme][s])
+        for i, j in Q:
+            qe = Q[i, j] + dt[None] * K[0][i, j]
+            if ti.static(a_s != 0.0):
+                Q[i, j] = Q_old[i, j] + b_s * (qe - Q_old[i, j])
+            else:
+                Q[i, j] = qe
+        fix_dry(Q)
+"""
+SHU_OSHER_TABLE = """SHU_OSHER = {"euler": [(0.0, 1.0)], "ssprk2": [(0.0, 1.0), (0.5, 0.5)],
+             "ssprk3": [(0.0, 1.0), (0.75, 0.25), (1.0 / 3, 2.0 / 3)]}
+"""
+
+
+def shu_osher_copy(swe):
+    """Copy of the Python project with solver/time_integration.py in Shu-Osher form (refreshed every run)."""
+    dst = ROOT / "out" / "_swe_shu_osher"
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.mkdir(parents=True)
+    shutil.copy2(swe / "main.py", dst / "main.py")
+    for d in ("solver", "cases", "ui", "data"):
+        if (swe / d).exists():
+            shutil.copytree(swe / d, dst / d, ignore=shutil.ignore_patterns("__pycache__"))
+    ti_path = dst / "solver" / "time_integration.py"
+    src = ti_path.read_text(encoding="utf-8")
+    if BUTCHER_LOOP not in src or "HAS_SINK = sink is not None\n" not in src:
+        raise SystemExit("--shu-osher: solver/time_integration.py has changed, update the patch in dump_reference.py")
+    src = src.replace(BUTCHER_LOOP, SHU_OSHER_LOOP)
+    src = src.replace("HAS_SINK = sink is not None\n", "HAS_SINK = sink is not None\n" + SHU_OSHER_TABLE)
+    ti_path.write_text(src, encoding="utf-8")
+    return dst
 
 
 def main():
@@ -30,9 +85,14 @@ def main():
                     help="override a top-level assignment of main.py (e.g. --set eta_0=0.5)")
     ap.add_argument("--still-water", type=float, default=None, metavar="ETA",
                     help="after init, replace the state by still water at level ETA (lake at rest test)")
+    ap.add_argument("--shu-osher", action="store_true", help="Runge-Kutta loop in Shu-Osher form (see above)")
     args = ap.parse_args()
 
     swe = Path(args.swe).resolve()
+    if args.shu_osher:
+        if args.scheme not in ("euler", "ssprk2", "ssprk3"):
+            raise SystemExit("--shu-osher: only euler, ssprk2, ssprk3 have a Shu-Osher form")
+        swe = shu_osher_copy(swe)
     out = Path(args.out).resolve()
     src = (swe / "main.py").read_text(encoding="utf-8")
 
@@ -86,8 +146,9 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     np.save(out / "Q.npy", Q.to_numpy().astype(np.float32))
     np.save(out / "zb.npy", zb.to_numpy().astype(np.float32))
-    meta = {"source": f"taichi-{args.arch}", "case": args.case, "scheme": args.scheme, "steps": args.steps,
-            "nx": int(ns["nx"]), "ny": int(ns["ny"]), "t": t, "dt": dt, "s_max": s_max}
+    meta = {"source": f"taichi-{args.arch}" + ("-shu-osher" if args.shu_osher else ""), "case": args.case,
+            "scheme": args.scheme, "steps": args.steps, "nx": int(ns["nx"]), "ny": int(ns["ny"]), "t": t, "dt": dt,
+            "s_max": s_max}
     (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     print(f"[ref] {args.case} {args.scheme} {args.steps} steps in {elapsed:.3f} s: t = {t:.6f} s, dt = {dt:.4e} s, "
           f"s_max = {s_max:.4f} -> {out}")

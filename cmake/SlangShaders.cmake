@@ -20,6 +20,7 @@ function(add_slang_shader NAME SOURCE)
     COMMAND "${SLANGC_EXECUTABLE}" "${SOURCE}"
             -target spirv -profile spirv_1_4 -emit-spirv-directly
             -capability spvGroupNonUniform -capability spvGroupNonUniformArithmetic
+            -capability spvGroupNonUniformBallot -capability spvGroupNonUniformVote
             -fvk-use-entrypoint-name
             -I "${CMAKE_SOURCE_DIR}/shaders/common"
             -I "${CMAKE_SOURCE_DIR}/shaders/solver"

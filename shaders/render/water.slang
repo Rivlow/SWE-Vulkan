@@ -26,6 +26,12 @@ struct WaterVarying
     float  cval     : CMAPVALUE;   // quantity shown by the colour map
 };
 
+// colour map of a surface quantity (groundwater quantities colour the ground, the water stays realistic)
+bool water_color_mode()
+{
+    return SC.color_mode != COLOR_REALISTIC && SC.color_mode < COLOR_GW_TABLE_DEPTH;
+}
+
 float colormap_value(uint k, float h)
 {
     float4 q = Q[k];
@@ -78,15 +84,19 @@ WaterVarying waterVert(uint vid : SV_VertexID)
     o.turb     = turb[vid];
     o.shadow   = shadow[vid];
     o.ao       = ao[vid];
-    o.cval     = SC.color_mode != COLOR_REALISTIC ? colormap_value(vid, h) : 0.0f;
+    o.cval     = water_color_mode() ? colormap_value(vid, h) : 0.0f;
     return o;
 }
 
 // Wireframe overlay ("Maillage"): same surface as waterVert, position only (fragment: terrain.slang wireFrag)
 [shader("vertex")]
-float4 waterWireVert(uint vid : SV_VertexID) : SV_Position
+WireVarying waterWireVert(uint vid : SV_VertexID)
 {
-    return waterVert(vid).pos;
+    WaterVarying w = waterVert(vid);
+    WireVarying  o;
+    o.pos  = w.pos;
+    o.disp = w.disp;
+    return o;
 }
 
 struct WaterOut
@@ -98,13 +108,15 @@ struct WaterOut
 [shader("fragment")]
 WaterOut waterFrag(WaterVarying v)
 {
+    if (cropped_out(v.disp))
+        discard;
     float3 sun = SC.sun.xyz;
     float3 n   = normalize(v.n);
     float  h   = max(v.h, 0.0f);
     float  ao = v.ao, sun_vis = v.shadow;
 
     WaterOut o;
-    if (SC.color_mode != COLOR_REALISTIC)
+    if (water_color_mode())
     {
         // scientific view: colour map of the chosen quantity, lightly shaded so the relief of the surface reads
         float  t     = (v.cval - SC.cmap_min) / max(SC.cmap_max - SC.cmap_min, 1e-12f);
@@ -124,6 +136,13 @@ WaterOut waterFrag(WaterVarying v)
     // thin films (a few cm) would be invisible: give them a floor so flooding fronts can be followed
     if ((SC.flags & SCENE_THIN_WATER) != 0)
         opacity = max(opacity, 0.45f * sstep(0.002f, 0.03f, h));
+    // groundwater map on the ground: light, nearly clear water so the map reads through it
+    float bed_tint = 0.45f;
+    if (gw_color_mode())
+    {
+        opacity  *= 0.25f;
+        bed_tint = 0.85f;
+    }
     float  shade   = (0.8f + 0.35f * max(dot(n, sun), 0.0f) * sun_vis) * (0.6f + 0.4f * ao);
 
     // sky reflection (Schlick Fresnel) + sun glint (Blinn-Phong), none in the shade
@@ -142,7 +161,7 @@ WaterOut waterFrag(WaterVarying v)
 
     // out = mix(mix(shade * mix(bed * (0.45 + SHALLOW), tint, opacity), SKY, fres) + glint, foam_col, fm)
     //     = bed * K + B
-    float3 K = (1.0f - fm) * (1.0f - fres) * shade * (1.0f - opacity) * (0.45f + SHALLOW);
+    float3 K = (1.0f - fm) * (1.0f - fres) * shade * (1.0f - opacity) * min(bed_tint + SHALLOW, 1.0f);
     float3 B = (1.0f - fm) * ((1.0f - fres) * shade * opacity * tint + fres * SKY + glint) + fm * foam_col;
     // selection / zone overlays on the water too (applied to the additive part)
     int2 c = cell_of(v.disp);

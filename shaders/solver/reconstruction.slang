@@ -82,18 +82,23 @@ public Recon reconstruct_linear(float4 q_minus, float4 q_center, float4 q_plus,
     return r;
 }
 
+// Solver kernels read the bed from Q.w (one 16-byte load per cell instead of two streams).
+Recon reconstruct_cells(float4 q_minus, float4 q_center, float4 q_plus)
+{
+    return reconstruct_linear(q_minus, q_center, q_plus, q_minus.w, q_center.w, q_plus.w);
+}
+
 // m = west face, p = east face of cell (i, j). Boundary cells: constant reconstruction.
 public Recon reconstruct_X(uint i, uint j)
 {
-    uint  c = idx(i, j);
-    Recon r;
+    float4 q = Q[idx(i, j)];
+    Recon  r;
     if (0 < i && i < P.nx - 1)
-        r = reconstruct_linear(Q[idx(i - 1, j)], Q[c], Q[idx(i + 1, j)],
-                               zb[idx(i - 1, j)], zb[c], zb[idx(i + 1, j)]);
+        r = reconstruct_cells(Q[idx(i - 1, j)], q, Q[idx(i + 1, j)]);
     else
     {
-        r.m = float4(Q[c].xyz, zb[c]);
-        r.p = r.m;
+        r.m = q;
+        r.p = q;
     }
     return r;
 }
@@ -101,15 +106,14 @@ public Recon reconstruct_X(uint i, uint j)
 // m = south face, p = north face of cell (i, j). Boundary cells: constant reconstruction.
 public Recon reconstruct_Y(uint i, uint j)
 {
-    uint  c = idx(i, j);
-    Recon r;
+    float4 q = Q[idx(i, j)];
+    Recon  r;
     if (0 < j && j < P.ny - 1)
-        r = reconstruct_linear(Q[idx(i, j - 1)], Q[c], Q[idx(i, j + 1)],
-                               zb[idx(i, j - 1)], zb[c], zb[idx(i, j + 1)]);
+        r = reconstruct_cells(Q[idx(i, j - 1)], q, Q[idx(i, j + 1)]);
     else
     {
-        r.m = float4(Q[c].xyz, zb[c]);
-        r.p = r.m;
+        r.m = q;
+        r.p = q;
     }
     return r;
 }

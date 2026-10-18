@@ -26,6 +26,7 @@ public struct EffectsParams             // std140, 64 bytes
 };
 
 public static const uint EFFECTS_TURBIDITY = 1;
+public static const uint EFFECTS_GW_LINES  = 2;   // streamlines follow the aquifer flow (drawn in blue on the ground)
 
 public struct Seed
 {

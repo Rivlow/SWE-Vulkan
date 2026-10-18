@@ -1,4 +1,6 @@
 #pragma once
+#include "app/Cli.h"
+#include "app/History.h"
 #include "app/MapPanel.h"
 #include "cases/Cases.h"
 #include "geo/Carve.h"
@@ -8,12 +10,12 @@
 #include "render/Camera.h"
 #include "render/Effects.h"
 #include "render/Renderer.h"
-#include "solver/Solver.h"
-#include "util/Cli.h"
+#include "sim/Session.h"
 #include "vk/Buffer.h"
 #include "vk/Context.h"
 #include "vk/Swapchain.h"
 
+#include <imgui.h>
 #include <vulkan/vulkan_raii.hpp>
 
 #include <array>
@@ -28,8 +30,14 @@ struct GLFWwindow;
 
 namespace swe {
 
-// Interactive application: window, frame loop, camera, GUI. Owns the solver, the effects and the renderer.
-// Frame loop in App.cpp, GUI panels in Gui.cpp.
+// Interactive application: window, frame loop, camera, GUI. Owns the simulation session, the effects and the
+// renderer; every edit of the case goes through the Session. Frame loop in App.cpp, GUI in Gui.cpp.
+//
+// The GUI is a four-stage workflow, each stage with its own side panel:
+//   Map        choose an area on the 2D map and import it (or open a saved case)
+//   Terrain    the imported relief in 3D (animated transition from the map)
+//   Conditions initial / boundary conditions on the mesh, paused at t = 0
+//   Simulation run, balance, display, plots
 class App
 {
   public:
@@ -40,6 +48,14 @@ class App
 	App &operator=(App const &) = delete;
 
 	void run();
+
+	enum class Stage
+	{
+		Map,
+		Terrain,
+		Conditions,
+		Simulation,
+	};
 
   private:
 	static constexpr uint32_t kFramesInFlight = Solver::kReadbackSlots;
@@ -62,20 +78,19 @@ class App
 		uint32_t i = 0, j = 0;
 	};
 
-	// time series of the plots (t on the x axis), decimated when they grow too long
-	struct History
-	{
-		std::vector<double>                          t, volume, wetArea, dt;
-		std::array<std::vector<double>, MAX_PROBES>  eta, depth, speed;
-		void clear();
-		void push(SolverScalars const &s, double cellArea, size_t probes);
-		void decimate();
-	};
-
 	struct GpuTimes
 	{
 		double solver = 0, effects = 0, render = 0;        // ms, smoothed
 	};
+
+	// Map -> Terrain transition: the map fades out over the top view of the relief, then the camera swings to
+	// the 3D view while the relief extrudes (z_scale 0 -> case value)
+	struct Transition
+	{
+		bool  active = false;
+		float t      = 0.0f;        // seconds since the start
+	};
+	static constexpr float kFadeSeconds = 0.7f, kSwingStart = 0.45f, kSwingSeconds = 2.2f;
 
 	// App.cpp - frame loop
 	void initWindow();
@@ -83,14 +98,17 @@ class App
 	void shutdownImGui();
 	void createTimestamps();
 	void loadCase(std::string const &name);
+	void onCaseLoaded();
 	void loadImport(ImportOutcome &&outcome);
 	void applyBedEdit(BedEdit const &edit);
+	void processMapRequests();
 	void saveCurrentCase();
 	void resetSimulation();
 	void topView();
-	void addZoneFromSelection(ZoneKind kind, double value, std::string const &label);
-	void removeZone(size_t index);
-	void updateZoneValue(size_t index, double value);
+	void animateCamera(OrbitCamera::Pose const &target, float seconds = 1.0f);
+	OrbitCamera::Pose topPose() const;
+	CellRect selection() const;
+	void applyScriptedEdits();
 	void handleInput();
 	void drawFrame();
 	void recordFrame(Frame &frame, uint32_t imageIndex);
@@ -100,21 +118,41 @@ class App
 	void onSwapchainRecreated();
 	void loadSettings();
 	void saveSettings() const;
+	// stages
+	void setStage(Stage s);
+	void openCase(std::string const &name);        // from the Map stage: load and show the terrain
+	void startTransition();
+	void tickTransition(float dt);
 
-	// Gui.cpp - panels
+	// Gui.cpp - stage bar, side panel, plots band, overlays
 	void drawGui();
-	void setupDockLayout(unsigned int dockspace);
 	void drawMenuBar();
+	void drawStageBar(float y, float height);
+	void drawSidePanel(ImVec2 pos, ImVec2 size);
+	void drawMapStage(ImVec2 pos, ImVec2 size);
+	void drawTerrainPanel();
+	void drawConditionsPanel();
 	void drawSimulationPanel();
-	void drawSchemePanel();
-	void drawDisplayPanel();
-	void drawProbesPanel();
-	void drawEditContents();
-	void drawPlotsPanel();
-	void drawPerfPanel();
+	void drawPlotsBand(ImVec2 pos, ImVec2 size);
+	// panel pieces
+	void drawSelectionHeader();
+	void drawWaterTab();
+	void drawSoilTab();
+	void drawZonesTab();
+	void drawBoundariesTab();
+	void drawChronologyEditor();
+	void drawTransportSection();
+	void drawBalanceSection();
+	void drawProbesSection();
+	void drawDisplaySection();
+	void drawAdvancedSection();
+	void drawCameraButtons();
+	void drawPerfWindow();
 	void drawLegend();
 	void drawProbeMarkers();
 	void drawHelp();
+	void drawProfilePlot();
+	void updateProfileCells();
 	std::optional<Probe> pickCell(glm::vec2 mousePixels) const;
 	void                 updateProbeList();
 	void                 autoColorRange();
@@ -125,7 +163,7 @@ class App
 	GLFWwindow                        *window_ = nullptr;
 	std::unique_ptr<vkc::Context>      ctx_;
 	std::unique_ptr<vkc::Swapchain>    swapchain_;
-	std::unique_ptr<Solver>            solver_;
+	std::unique_ptr<Session>           session_;
 	std::unique_ptr<Effects>           effects_;
 	std::unique_ptr<Renderer>          renderer_;
 	std::unique_ptr<geo::LocalLibrary>   library_;
@@ -142,21 +180,27 @@ class App
 	SolverScalars scalars_{};
 	uint32_t      prevSteps_     = 0;
 	double        stepsPerSec_   = 0.0;
-	bool          paused_        = false;
-	int           stepsPerFrame_ = 30;        // main.py: steps_per_render
-	double        volume0_       = -1.0;      // initial volume (mass balance)
+	bool          paused_        = true;        // everything starts paused: "Lancer" starts the run
+	int           stepsPerFrame_ = 30;          // main.py: steps_per_render
+	double        volume0_       = -1.0;        // initial volume (mass balance)
+	double        balance0_      = 0.0;         // surface + aquifer - chronology inputs at the first readback (conserved)
 	History       history_;
 
 	// Georeferenced case (imports): grid origin and the orthophoto bytes (re-applied after bed edits)
 	std::optional<geo::GridGeometry> caseGeo_;
 	geo::Image                       orthoImage_;
 
+	// Workflow
+	Stage      stage_ = Stage::Map;
+	Transition transition_;
+	bool       meshPreference_ = false;        // "Maillage" of the Simulation stage (the Conditions stage always shows it)
+
 	// View
 	OrbitCamera    camera_;
 	RenderSettings render_;
 	float          zScale0_  = 2.0f;
 	bool           autoRange_ = true;
-	glm::vec4      viewRect_{0.0f};           // central dock area (pixels)
+	glm::vec4      viewRect_{0.0f};           // 3D view rectangle (framebuffer pixels)
 
 	// Probes
 	std::vector<Probe> probes_;
@@ -168,10 +212,22 @@ class App
 	// edit panel state
 	int   waterMode_   = 0;          // 0 depth, 1 level, 2 add
 	float waterValue_  = 1.0f;
-	bool  waterInitial_ = true;
+	double levelValue_ = 0.0;        // "niveau initial sur tout le domaine" (m DNG)
 	int   zoneKind_    = 0;          // 0 source, 1 sink, 2 level
 	float zoneValue_   = 10.0f;
 	char  zoneLabel_[48] = "";
+	Session::SoilParams soil_;       // soil tab values (defaults of the case when the aquifer is on)
+	// infiltration / rain chronologies (edit tools)
+	int   chronoKind_  = 1;          // 0 infiltration, 1 rain
+	float chronoValue_ = 50.0f;      // new zone value
+	bool  chronoMmh_   = true;       // values in mm/h (else m3/s for the whole zone, as wolfgpu)
+
+	// profile (Courbes > Profil): along x at row j, along y at column i, or from probe 1 to probe 2
+	int                       profileMode_  = 0;
+	int                       profileIndex_ = -1;        // row / column; -1 = middle of the domain
+	std::vector<uint32_t>     profileCells_;             // cells sent to the solver
+	std::vector<ProfilePoint> profile_;                  // read back each frame
+	bool                      selectProfileTab_ = false;
 
 	// GPU timing
 	vk::raii::QueryPool queries_         = nullptr;
@@ -189,8 +245,7 @@ class App
 
 	// GUI state
 	std::vector<CaseInfo> caseList_;
-	bool showSimulation_ = true, showScheme_ = true, showDisplay_ = true, showProbes_ = true;
-	bool showPlots_ = true, showPerf_ = false, showHelp_ = false, showDemo_ = false, showMap_ = true, showEdit_ = true;
+	bool showPlots_ = true, showPerf_ = false, showHelp_ = false, showDemo_ = false;
 	bool hideGui_ = false;        // F11: 3D view only
 };
 

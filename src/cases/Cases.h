@@ -18,6 +18,17 @@ std::vector<CaseInfo> listCases(std::string const &assetDir);
 // Builds a case from assets/cases/<name>.json. Data files are relative to assetDir.
 CaseData makeCase(std::string const &name, std::string const &assetDir);
 
+// Command-line choices taking precedence over the case file
+struct CaseOverrides
+{
+	std::string scheme;               // empty = case value
+	int         drainPasses = -1;     // < 0 = case value
+};
+CaseData makeCase(std::string const &name, std::string const &assetDir, CaseOverrides const &overrides);
+
+// Asset directory: `requested` (--assets), else ./assets, else the source tree
+std::string resolveAssetDir(std::string const &requested);
+
 // Geographic origin of an imported case (Lambert 72), when known.
 struct GeoOrigin
 {

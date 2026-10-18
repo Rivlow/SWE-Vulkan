@@ -1,0 +1,14 @@
+{
+  "label": "Résurgence : nappe saturée par une retenue (sec, --water pour la retenue)",
+  "type": "dam_break",
+  "nx": 250, "ny": 250,
+  "Lx": 10.0, "Ly": 10.0,
+  "eta_0": 0.0,
+  "manning_n": 0.03,
+  "scheme": "ssprk2",
+  "bc": { "west": ["wall"], "east": ["wall"], "south": ["wall"], "north": ["wall"] },
+  "render": { "depth_ref": 1.0, "z_scale_0": 2.0 },
+  // Thin soil (30 cm) with the table 2 cm below the ground: the water lost under the dam spreads in the aquifer,
+  // saturates it and comes out again on dry ground (exfiltration, test of the active tiles)
+  "groundwater": { "kv": 1e-3, "kh": 5e-2, "sy": 0.3, "depth": 0.3, "table_depth": 0.02 }
+}

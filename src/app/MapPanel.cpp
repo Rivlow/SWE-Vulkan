@@ -175,7 +175,7 @@ void MapPanel::startProbe()
 		return;
 	progress_.reset();
 	jobIsProbe_ = true;
-	status_     = "Sondage des sources…";
+	status_     = "Sondage des sources...";
 	auto box    = *box_;
 	int  epsg   = boxEpsg_;
 	job_        = std::async(std::launch::async, [this, box, epsg] {
@@ -198,7 +198,7 @@ void MapPanel::startImport()
 		return;
 	progress_.reset();
 	jobIsProbe_ = false;
-	status_     = "Import…";
+	status_     = "Import...";
 	geo::ImportRequest req;
 	req.box        = *box_;
 	req.epsg       = boxEpsg_;
@@ -206,10 +206,9 @@ void MapPanel::startImport()
 	req.mergeBathy = mergeBathy_;
 	req.name       = caseName_;
 	req.label      = caseName_;
-	req.initial    = initialMode_ == 0 ? geo::InitialWater::Dry : initialMode_ == 1 ? geo::InitialWater::Level : geo::InitialWater::LevelInRectangle;
-	req.level      = level_;
+	req.initial    = geo::InitialWater::Dry;        // water, soil and friction: Conditions stage
 	req.levelBox   = *box_;
-	req.manning    = manning_;
+	req.manning    = 0.03;
 	// display hints from the size of the area
 	double span    = std::max(req.box.width(), req.box.height());
 	req.depthRef   = span > 5000 ? 5.0 : span > 1000 ? 4.0 : 2.0;
@@ -222,7 +221,7 @@ void MapPanel::startImport()
         o.result  = builder_.build(req, progress_, &o.error);
         if (!o.result.bed.v.empty() && ortho && !progress_.cancelled())
         {
-            progress_.set(0.95f, "Orthophoto…");
+            progress_.set(0.95f, "Orthophoto...");
             std::string err, attribution;
             o.orthophoto = geo::fetchOrthophoto(req.box, req.epsg, static_cast<uint32_t>(orthoPx), &err, &attribution);
             if (o.orthophoto.empty())
@@ -274,38 +273,22 @@ std::optional<BedEdit> MapPanel::takeBedEdit()
 // Drawing
 // ---------------------------------------------------------------------------------------------
 
-void MapPanel::draw(bool *open, uint64_t frame)
+void MapPanel::drawFull(uint64_t frame)
 {
-	pollJob();
 	collectGarbage(frame);
-	ImGui::SetNextWindowSize(ImVec2(1000, 620), ImGuiCond_FirstUseEver);
-	if (!ImGui::Begin("Carte", open, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse))
-	{
-		ImGui::End();
-		return;
-	}
+	ImGui::PushID("map-full");
+	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade_);
 	drawToolbar();
-	float sidebar = 340.0f;
-	ImGui::BeginChild("map", ImVec2(ImGui::GetContentRegionAvail().x - sidebar - ImGui::GetStyle().ItemSpacing.x, 0), ImGuiChildFlags_Borders,
-	                  ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	ImGui::PopStyleVar();
+	ImGui::BeginChild("map", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 	drawMap(frame);
 	ImGui::EndChild();
-	ImGui::SameLine();
-	ImGui::BeginChild("sidebar", ImVec2(sidebar, 0));
-	drawSidebar();
-	ImGui::EndChild();
-	ImGui::End();
+	ImGui::PopID();
 }
 
-void MapPanel::drawEmbedded(uint64_t frame, float mapHeight)
+void MapPanel::drawImportSidebar()
 {
-	pollJob();
-	collectGarbage(frame);
-	ImGui::PushID("map-embedded");
-	drawToolbar();
-	ImGui::BeginChild("map", ImVec2(0, mapHeight), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-	drawMap(frame);
-	ImGui::EndChild();
+	ImGui::PushID("map-sidebar");
 	drawSidebar();
 	ImGui::PopID();
 }
@@ -374,7 +357,9 @@ void MapPanel::drawMap(uint64_t frame)
 		return;
 	auto *dl = ImGui::GetWindowDrawList();
 	dl->PushClipRect(mapPos_, ImVec2(mapPos_.x + mapSize_.x, mapPos_.y + mapSize_.y), true);
-	dl->AddRectFilled(mapPos_, ImVec2(mapPos_.x + mapSize_.x, mapPos_.y + mapSize_.y), IM_COL32(220, 226, 232, 255));
+	ImU32 const tint = ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, fade_));        // transition: the map fades out
+	dl->AddRectFilled(mapPos_, ImVec2(mapPos_.x + mapSize_.x, mapPos_.y + mapSize_.y),
+	                  ImGui::GetColorU32(ImVec4(220 / 255.0f, 226 / 255.0f, 232 / 255.0f, fade_)));
 
 	// --- tiles at the integer zoom level, scaled by the fractional part
 	int    zi     = static_cast<int>(std::floor(zoom_));
@@ -400,7 +385,7 @@ void MapPanel::drawMap(uint64_t frame)
 				continue;
 			ImTextureID tex = tileTexture({zi, wx, ty, layer_}, frame);
 			if (tex)
-				dl->AddImage(tex, a, b);
+				dl->AddImage(tex, a, b, ImVec2(0, 0), ImVec2(1, 1), tint);
 			else
 			{
 				// fallback: parent tile (zoomed in) while loading
@@ -413,12 +398,20 @@ void MapPanel::drawMap(uint64_t frame)
 						continue;
 					double f  = std::ldexp(1.0, up);
 					double u0 = (wx - px * f) / f, v0 = (ty - py * f) / f;
-					dl->AddImage(ptex, a, b, ImVec2(float(u0), float(v0)), ImVec2(float(u0 + 1.0 / f), float(v0 + 1.0 / f)));
+					dl->AddImage(ptex, a, b, ImVec2(float(u0), float(v0)), ImVec2(float(u0 + 1.0 / f), float(v0 + 1.0 / f)), tint);
 					drawn = true;
 				}
 				++missing;
 			}
 		}
+	}
+
+	// fading out (transition to the 3D view): tiles only, no overlays, no input
+	if (fade_ < 1.0f)
+	{
+		dl->PopClipRect();
+		ImGui::Dummy(mapSize_);
+		return;
 	}
 
 	// --- selection rectangle (projected box: draw its 4 corners)
@@ -564,7 +557,7 @@ void MapPanel::drawMap(uint64_t frame)
 	}
 	if (missing > 0 || tiles_.pendingCount() > 0)
 	{
-		auto txt = std::format("chargement… {}", tiles_.pendingCount());
+		auto txt = std::format("chargement... {}", tiles_.pendingCount());
 		dl->AddText(ImVec2(mapPos_.x + mapSize_.x - 130, mapPos_.y + 8), IM_COL32(40, 40, 40, 255), txt.c_str());
 	}
 	dl->PopClipRect();
@@ -573,11 +566,12 @@ void MapPanel::drawMap(uint64_t frame)
 void MapPanel::drawSidebar()
 {
 	auto const &lib = builder_.library();
-	ImGui::SeparatorText("Zone");
+	ImGui::SeparatorText("Nouvelle zone");
 	if (!box_)
 	{
-		ImGui::TextWrapped("Tracez un rectangle sur la carte (bouton « Tracer une zone » puis cliquer-glisser, ou glisser avec le bouton droit).");
-		ImGui::TextDisabled("Glisser = déplacer, molette = zoom.");
+		ImGui::TextWrapped("Tracez un rectangle sur la carte : « Tracer une zone » puis cliquer-glisser, ou glisser directement "
+		                   "avec le bouton droit.");
+		ImGui::TextDisabled("Glisser = déplacer la carte, molette = zoom.");
 	}
 	else
 	{
@@ -589,35 +583,15 @@ void MapPanel::drawSidebar()
 		double cell = kCells[cellIndex_];
 		size_t nx = static_cast<size_t>(std::round(b.width() / cell)), ny = static_cast<size_t>(std::round(b.height() / cell));
 		size_t cells = nx * ny;
-		double gpuBytes = double(cells) * (16.0 * 4 + 4 + 8 + 16 * 2 + 12 * 4);        // Q, Q_old, K(2), zb, S_b, fluxes, effects
+		double gpuBytes = double(cells) * (16.0 * 3 + 16 * 4 + 4 * 4 + 12 * 4);        // Q, Q_old, mass fluxes, face fluxes (4), zb + cond + alpha (2), effects
 		ImGui::Text("%zu x %zu = %s mailles (~%s GPU)", nx, ny, humanCells(cells).c_str(), humanBytes(gpuBytes).c_str());
 		if (cells > kMaxCells)
 			ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "Trop de mailles : agrandir la maille ou réduire la zone");
 		else if (cells > 4'000'000)
 			ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1), "Grande grille : simulation lente");
 
-		ImGui::SeparatorText("Sources");
-		ImGui::BeginDisabled(job_.valid());
-		if (ImGui::Button("Sonder les sources"))
-			startProbe();
-		ImGui::EndDisabled();
-		ImGui::SameLine();
-		ImGui::TextDisabled("(données locales lues, services en ligne : emprise)");
-		drawSourcesTable();
-
-		ImGui::SeparatorText("Cas");
 		ImGui::SetNextItemWidth(-90);
-		ImGui::InputText("nom", caseName_, sizeof(caseName_));
-		ImGui::SetNextItemWidth(-90);
-		ImGui::Combo("eau initiale", &initialMode_, "sec\0niveau partout\0niveau dans la zone\0");
-		if (initialMode_ != 0)
-		{
-			ImGui::SetNextItemWidth(-90);
-			ImGui::InputDouble("cote (m DNG)", &level_, 0.5, 5.0, "%.2f");
-		}
-		ImGui::SetNextItemWidth(-90);
-		ImGui::SliderFloat("Manning n", &manning_, 0.0f, 0.1f, "%.3f");
-		ImGui::Checkbox("Fusionner la bathymétrie", &mergeBathy_);
+		ImGui::InputText("nom du cas", caseName_, sizeof(caseName_));
 		ImGui::Checkbox("Orthophoto drapée", &fetchOrtho_);
 		if (fetchOrtho_)
 		{
@@ -628,10 +602,17 @@ void MapPanel::drawSidebar()
 			ImGui::Combo("##orthopx", &orthoPixels_, "1024\0" "2048\0" "4096\0");
 			orthoPixels_ = orthoPixels_ == 0 ? 1024 : orthoPixels_ == 1 ? 2048 : orthoPixels_ == 2 ? 4096 : orthoPixels_;
 		}
+		ImGui::Checkbox("Fusionner la bathymétrie", &mergeBathy_);
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("La bathymétrie SPW remplace le MNT là où elle existe");
+		ImGui::Spacing();
 		ImGui::BeginDisabled(job_.valid() || cells > kMaxCells);
-		if (ImGui::Button("Importer et charger", ImVec2(-1, 0)))
+		if (ImGui::Button("Importer le terrain", ImVec2(-1, 0)))
 			startImport();
 		ImGui::EndDisabled();
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+			ImGui::SetTooltip("Télécharge le relief, l'enregistre comme cas et ouvre la vue 3D.\n"
+			                  "L'eau, le sol et les apports se règlent ensuite à l'étape Conditions.");
 	}
 
 	if (job_.valid())
@@ -645,12 +626,27 @@ void MapPanel::drawSidebar()
 		ImGui::TextWrapped("%s", status_.c_str());
 
 	ImGui::Spacing();
-	if (ImGui::CollapsingHeader("Lit de rivière (zones sans bathymétrie)"))
+	if (ImGui::CollapsingHeader("Avancé"))
+	{
+		ImGui::Indent(6.0f);
+		if (box_)
+		{
+			ImGui::SeparatorText("Sources de données");
+			ImGui::BeginDisabled(job_.valid());
+			if (ImGui::Button("Sonder les sources"))
+				startProbe();
+			ImGui::EndDisabled();
+			ImGui::SameLine();
+			ImGui::TextDisabled("(locales lues, en ligne : emprise)");
+			drawSourcesTable();
+		}
+		ImGui::SeparatorText("Lit de rivière (zones sans bathymétrie)");
 		drawBedTools();
-	if (ImGui::CollapsingHeader("Données locales (MNT / bathymétrie SPW)"))
+		ImGui::SeparatorText("Données locales (MNT / bathymétrie SPW)");
 		drawLibrary();
-	ImGui::Spacing();
-	ImGui::TextDisabled("%zu raster(s) locaux indexés", lib.entries().size());
+		ImGui::TextDisabled("%zu raster(s) locaux indexés", lib.entries().size());
+		ImGui::Unindent(6.0f);
+	}
 }
 
 void MapPanel::drawSourcesTable()
@@ -762,13 +758,13 @@ void MapPanel::drawBedTools()
 		tool_        = Tool::None;
 	}
 	ImGui::EndDisabled();
-	ImGui::TextDisabled("Le fond n'est jamais relevé par le creusement ; « Enregistrer le cas »\n(panneau Simulation) garde le résultat.");
+	ImGui::TextDisabled("Le fond n'est jamais relevé par le creusement ; « Enregistrer le cas »\n(étape Conditions) garde le résultat.");
 }
 
 void MapPanel::drawLibrary()
 {
 	auto &lib = builder_.library();
-	ImGui::TextWrapped("Dossiers de GeoTIFF (ou zips) : MNT LiDAR SPW, bathymétrie SPW… Les fichiers contenant « BATHY » sont pris comme bathymétrie.");
+	ImGui::TextWrapped("Dossiers de GeoTIFF (ou zips) : MNT LiDAR SPW, bathymétrie SPW... Les fichiers contenant « BATHY » sont pris comme bathymétrie.");
 	for (size_t k = 0; k < lib.folders().size(); ++k)
 	{
 		ImGui::PushID(int(k));

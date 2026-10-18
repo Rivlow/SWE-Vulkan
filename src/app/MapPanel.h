@@ -34,18 +34,7 @@ struct ImportOutcome
 };
 
 // Bed edit requested from the map (applied by the application to the loaded case)
-struct BedEdit
-{
-	enum class Type
-	{
-		Channel,
-		Polygon,
-	};
-	Type                 type = Type::Channel;
-	std::vector<geo::XY> points;        // Lambert 72
-	double               width = 20.0, depth = 2.0, bankSmoothing = 1.0;        // channel
-	double               dz = 1.0;                                             // polygon: lowering (m)
-};
+using BedEdit = geo::BedEdit;
 
 class MapPanel
 {
@@ -53,10 +42,19 @@ class MapPanel
 	MapPanel(vkc::Context const &ctx, geo::TerrainBuilder &builder);
 	~MapPanel();
 
-	// ImGui window; `frame` = monotonically increasing frame counter (texture lifetime)
-	void draw(bool *open, uint64_t frame);
-	// Same content inside the current window (collapsing section): toolbar, map of `mapHeight` px, controls below
-	void drawEmbedded(uint64_t frame, float mapHeight);
+	// Map stage of the application: toolbar and map filling the current window (`frame` = monotonically
+	// increasing frame counter, texture lifetime), and the import controls drawn in the side panel
+	void drawFull(uint64_t frame);
+	void drawImportSidebar();
+	// Tiles and canvas drawn with this opacity (transition to the 3D view)
+	void setFade(float alpha) { fade_ = alpha; }
+
+	// Polls the asynchronous job (import / probe): call every frame, whether the map is drawn or not
+	void pollJob();
+	// Import running: progress for a status bar
+	bool        importing() const { return job_.valid() && !jobIsProbe_; }
+	float       progressFraction() const { return progress_.fraction(); }
+	std::string progressStage() const { return progress_.stage(); }
 
 	// An import finished since the last call (consumed once)
 	std::optional<ImportOutcome> takeOutcome();
@@ -100,7 +98,6 @@ class MapPanel
 	int         sketchEpsg() const;        // projection of the sketch points (the loaded case, else the box)
 	void        startProbe();
 	void        startImport();
-	void        pollJob();
 
 	vkc::Context const  &ctx_;
 	geo::TerrainBuilder &builder_;
@@ -133,15 +130,13 @@ class MapPanel
 	char                     locationText_[256] = "";
 	std::string              locationError_;
 
-	// import options
+	// import options (initial water, soil and friction are set in the Conditions stage, on the loaded case)
 	int    cellIndex_   = 2;        // index in kCells
 	char   caseName_[64] = "zone_importee";
-	int    initialMode_ = 0;        // 0 dry, 1 level everywhere, 2 level in the box
-	double level_       = 0.0;
 	bool   mergeBathy_  = true;
 	bool   fetchOrtho_  = true;
 	int    orthoPixels_ = 2048;
-	float  manning_     = 0.03f;
+	float  fade_        = 1.0f;
 
 	// async job
 	geo::Progress                  progress_;

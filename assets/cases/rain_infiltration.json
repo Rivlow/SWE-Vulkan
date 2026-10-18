@@ -1,0 +1,22 @@
+{
+  "label": "Pluie et infiltration par zones (chronologies wolfgpu)",
+  "type": "dam_break",
+  "nx": 250, "ny": 250,
+  "Lx": 10.0, "Ly": 10.0,
+  "eta_0": 0.0,
+  "manning_n": 0.03,
+  "scheme": "ssprk2",
+  "bc": { "west": ["wall"], "east": ["wall"], "south": ["wall"], "north": ["wall"] },
+  "render": { "depth_ref": 0.3, "z_scale_0": 2.0 },
+  // Rain on a dry bed (the bump of dam_break), west and east halves as two zones, interpolated in time
+  "rain": {
+    "zones": [[0, 0, 124, 249], [125, 0, 249, 249]],
+    "unit": "mm/h",
+    "lerp": true,
+    "chronology": [[0, [3000, 0]], [20, [3000, 6000]], [40, [0, 0]]]
+  },
+  // wolfgpu infiltration chronology: signed source, here an extraction of 2 l/s over the whole domain
+  "infiltration": { "zones": "all", "chronology": [[10, [-0.002]]] },
+  // and an aquifer under it
+  "groundwater": { "kv": 2e-4, "kh": 1e-2, "sy": 0.3, "depth": 0.5, "table_depth": 0.4 }
+}

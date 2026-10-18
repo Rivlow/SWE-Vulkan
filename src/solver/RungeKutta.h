@@ -1,37 +1,28 @@
 #pragma once
-// Port of solver/runge_kutta.py: explicit Runge-Kutta schemes as Butcher tableaux.
-//   Q_s     = Q^n + dt * sum_{j<s} A[s][j] * K_j      K_s = L(Q_s)
-//   Q^{n+1} = Q^n + dt * sum_s    b[s]    * K_s
-// (autonomous system: the c_s are not needed)
+// Explicit SSP Runge-Kutta schemes in Shu-Osher form: a sequence of Euler steps combined convexly with Q^n,
+//   Q_0 = Q^n,   Q_{s+1} = a_s Q^n + b_s (Q_s + dt L(Q_s)),   Q^{n+1} = Q_S
+// with a_s, b_s >= 0 and a_s + b_s = 1 (evaluated as Q^n + b_s (E(Q_s) - Q^n), see euler_stage in solver.slang).
+// Whatever an Euler step preserves (h >= 0 with the drain limiter) the full step preserves too, exactly, in
+// floating point as well. Only SSP schemes qualify, hence euler / ssprk2 / ssprk3 (rk4 and Dormand-Prince have
+// no such form and were dropped).
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace swe {
 
-struct ButcherTableau
+struct TimeScheme
 {
-	std::string                      label;
-	int                              order = 1;
-	std::vector<std::vector<double>> A;        // strictly lower triangular rows, A[0] = {}
-	std::vector<double>              b;
+	std::string                            label;
+	int                                    order = 1;
+	std::vector<std::pair<double, double>> stages;        // (a_s, b_s)
 
-	int stages() const { return static_cast<int>(b.size()); }
-
-	// Is K_s used at all? (e.g. the FSAL last stage of Dormand-Prince is not)
-	bool is_used(int s) const
-	{
-		if (b[s] != 0.0)
-			return true;
-		for (auto const &row : A)
-			if (static_cast<int>(row.size()) > s && row[s] != 0.0)
-				return true;
-		return false;
-	}
+	int nstages() const { return static_cast<int>(stages.size()); }
 };
 
-// euler, ssprk2, ssprk3, rk4, dopri5 (same values as the Python version)
-std::map<std::string, ButcherTableau> const &schemes();
-ButcherTableau const                        &scheme(std::string const &name);
+// euler, ssprk2, ssprk3
+std::map<std::string, TimeScheme> const &schemes();
+TimeScheme const                        &scheme(std::string const &name);
 
 }        // namespace swe

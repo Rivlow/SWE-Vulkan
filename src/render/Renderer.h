@@ -28,6 +28,12 @@ struct RenderSettings
 	float     orthoMix  = 1.0f;
 	bool      thinWater = true;        // minimum opacity for thin films
 	bool      showZones = true;        // tint solver zones
+	bool      gwContours = false;      // water table contour lines (groundwater cases)
+	float     gwContourStep = 0.1f;    // m
+	bool      gwXray = false;          // water table surface seen through the ground (groundwater cases)
+	// cut box: only the cells crop.x..crop.z, crop.y..crop.w are drawn, the walls (soil column) follow its sides
+	bool       cropOn = false;
+	glm::uvec4 crop{0, 0, 0, 0};
 	// selected cell rectangle (inclusive), none when i1 < i0
 	glm::uvec4 selection{1, 0, 0, 0};
 	// 3D view rectangle in pixels (the central area left free by the docked panels); empty = whole target
@@ -81,18 +87,20 @@ class Renderer
 
 	vk::raii::ShaderModule terrainModule_ = nullptr, waterModule_ = nullptr, skirtModule_ = nullptr, linesModule_ = nullptr;
 	vk::raii::Pipeline     terrain_ = nullptr, terrainWire_ = nullptr, water_ = nullptr, waterWire_ = nullptr;
-	vk::raii::Pipeline     skirtBed_ = nullptr, skirtWater_ = nullptr, lines_ = nullptr;
+	vk::raii::Pipeline     skirtBed_ = nullptr, skirtWater_ = nullptr, lines_ = nullptr, gwTable_ = nullptr;
 
 	vkc::Image   color_, depth_;
 	vkc::Buffer  indices_, outside_;
 	vkc::Texture ortho_, white_;
 	bool         hasOrtho_ = false;
 	void         writeOrthoDescriptors();
-	uint32_t    indexCount_ = 0, skirtVertexCount_ = 0;
+	uint32_t    indexCount_ = 0;
 
 	// case-dependent scene constants
 	float    S_ = 1, depthRef_ = 1, zBase_ = 0, eta0_ = 1, Lx_ = 1, Ly_ = 1;
 	uint32_t flags_ = 0;
+	uint32_t nx_ = 1, ny_ = 1;
+	bool     gwOn_ = false;        // the case has an aquifer (water table surface)
 };
 
 }        // namespace swe

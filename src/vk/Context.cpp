@@ -133,6 +133,12 @@ bool Context::isSuitable(vk::raii::PhysicalDevice const &pd) const
 	    !f.get<vk::PhysicalDeviceVulkan13Features>().synchronization2 ||
 	    !f.get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering)
 		return false;
+	// the solver's reductions and tile compaction use wave intrinsics in compute shaders
+	auto sg = pd.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceSubgroupProperties>().get<vk::PhysicalDeviceSubgroupProperties>();
+	auto ops = vk::SubgroupFeatureFlagBits::eBasic | vk::SubgroupFeatureFlagBits::eArithmetic | vk::SubgroupFeatureFlagBits::eBallot |
+	           vk::SubgroupFeatureFlagBits::eVote;
+	if (!(sg.supportedStages & vk::ShaderStageFlagBits::eCompute) || (sg.supportedOperations & ops) != ops)
+		return false;
 	if (!headless)
 	{
 		if (!hasExtension(pd.enumerateDeviceExtensionProperties(), vk::KHRSwapchainExtensionName))

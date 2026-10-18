@@ -1,0 +1,14 @@
+{
+  "label": "Rupture de barrage sur sol perméable (nappe)",
+  "type": "dam_break",
+  "nx": 250, "ny": 250,
+  "Lx": 10.0, "Ly": 10.0,
+  "eta_0": 1.0,
+  "manning_n": 0.02,
+  "scheme": "ssprk2",
+  "bc": { "west": ["wall"], "east": ["wall"], "south": ["wall"], "north": ["wall"] },
+  "render": { "depth_ref": 1.0, "z_scale_0": 2.0 },
+  // Unconfined aquifer 2 m thick under the bed, table 1.5 m below the ground; strong conductivities so the
+  // exchange shows within seconds
+  "groundwater": { "kv": 2e-3, "kh": 1e-2, "sy": 0.3, "depth": 2.0, "table_depth": 1.5 }
+}

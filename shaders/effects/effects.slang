@@ -74,6 +74,42 @@ float4 sample_state(float x, float y)
     return r;
 }
 
+// Aquifer pore velocity -kh grad(H) / Sy of cell (i, j) (central differences, one-sided at the borders)
+float2 gw_cell_velocity(uint i, uint j)
+{
+    uint   c  = idx(i, j);
+    float4 s  = soil[c];
+    uint   i0 = i > 0 ? i - 1 : i, i1 = min(i + 1, P.nx - 1);
+    uint   j0 = j > 0 ? j - 1 : j, j1 = min(j + 1, P.ny - 1);
+    float  Hx0 = soil[idx(i0, j)].w + gw[idx(i0, j)].x, Hx1 = soil[idx(i1, j)].w + gw[idx(i1, j)].x;
+    float  Hy0 = soil[idx(i, j0)].w + gw[idx(i, j0)].x, Hy1 = soil[idx(i, j1)].w + gw[idx(i, j1)].x;
+    float2 grad = float2((Hx1 - Hx0) / (max(float(i1 - i0), 1.0f) * P.dx), (Hy1 - Hy0) / (max(float(j1 - j0), 1.0f) * P.dy));
+    return -s.y * grad / s.z;
+}
+
+bool gw_lines() { return (E.flags & EFFECTS_GW_LINES) != 0 && (P.flags & FLAG_GROUNDWATER) != 0; }
+
+// Flow followed by the streamlines: (depth, velocity, ground elevation) of the surface water, or of the aquifer
+// (saturated thickness, pore velocity) with EFFECTS_GW_LINES
+float4 sample_flow(float x, float y)
+{
+    if (!gw_lines())
+        return sample_state(x, y);
+    Bilinear b = bilinear(x, y);
+    float4   r = 0.0f;
+    for (uint a = 0; a < 2; ++a)
+        for (uint d = 0; d < 2; ++d)
+        {
+            float w = (a == 1 ? b.tx : 1.0f - b.tx) * (d == 1 ? b.ty : 1.0f - b.ty);
+            uint  k = idx(b.i + a, b.j + d);
+            r += w * float4(gw[k].x, gw_cell_velocity(b.i + a, b.j + d), zb[k]);
+        }
+    return r;
+}
+
+// slowest flow that still gets streamlines (aquifer: any motion, directions only)
+float min_line_speed() { return gw_lines() ? 1e-12f : E.u_min_lines; }
+
 // PCG hash -> uniform [0, 1)
 uint pcg(uint v)
 {
@@ -272,8 +308,8 @@ void respawn(uint s, inout Rng rng)
     for (int k = 0; k < 16 && !found; ++k)
     {
         float2 cand = float2(rng.next() * E.Lx, rng.next() * E.Ly);
-        float4 q    = sample_state(cand.x, cand.y);
-        if (q.x > 0.02f && sqrt(q.y * q.y + q.z * q.z) > E.u_min_lines)
+        float4 q    = sample_flow(cand.x, cand.y);
+        if (q.x > 0.02f && sqrt(q.y * q.y + q.z * q.z) > min_line_speed())
         {
             best  = cand;
             found = true;
@@ -300,12 +336,12 @@ void update_streamlines(uint3 tid : SV_DispatchThreadID)
 
     // the seed drifts with the flow (simulated time), its life runs in real time
     float  t_frame = fx_state[0].t_frame;
-    float4 q       = sample_state(seeds[s].pos.x, seeds[s].pos.y);
+    float4 q       = sample_flow(seeds[s].pos.x, seeds[s].pos.y);
     seeds[s].pos  += t_frame * q.yz;
     seeds[s].age  += fx.frame_dt;
     float2 x0 = seeds[s].pos;
     if (seeds[s].age > seeds[s].life || x0.x < 0.0f || x0.x > E.Lx || x0.y < 0.0f || x0.y > E.Ly ||
-        q.x < 0.02f || sqrt(q.y * q.y + q.z * q.z) < E.u_min_lines)
+        q.x < 0.02f || sqrt(q.y * q.y + q.z * q.z) < min_line_speed())
         respawn(s, rng);
 
     // fade in / out
@@ -317,23 +353,23 @@ void update_streamlines(uint3 tid : SV_DispatchThreadID)
     bool   alive = true;
     for (uint m = 0; m < N_PTS; ++m)
     {
-        float4 qm = sample_state(pos.x, pos.y);
+        float4 qm = sample_flow(pos.x, pos.y);
         float  sp = sqrt(qm.y * qm.y + qm.z * qm.z);
-        if (qm.x < 0.01f || sp < E.u_min_lines || pos.x < 0.0f || pos.x > E.Lx || pos.y < 0.0f || pos.y > E.Ly)
+        if (qm.x < 0.01f || sp < min_line_speed() || pos.x < 0.0f || pos.x > E.Lx || pos.y < 0.0f || pos.y > E.Ly)
             alive = false;
         // white at the head, fading into the water towards the tail (floor: visible in slow areas)
         float tail      = 1.0f - float(m) / float(N_PTS - 1);
-        float intensity = fade * tail * (0.35f + 0.65f * sstep(E.u_min_lines, 1.5f, sp));
+        float intensity = fade * tail * (gw_lines() ? 0.9f : 0.35f + 0.65f * sstep(min_line_speed(), 1.5f, sp));
         LinePoint lp;
         lp.pos       = pos;
-        lp.eta       = qm.w + qm.x;
+        lp.eta       = qm.w + (gw_lines() ? sample_state(pos.x, pos.y).x : qm.x);        // aquifer: on the ground / water
         lp.intensity = alive ? intensity : -1.0f;
         line_pts[s * N_PTS + m] = lp;
         if (alive)
         {
             float2 d1  = qm.yz / max(sp, 1e-6f);
             float2 mid = pos + 0.5f * E.ds * d1;
-            float4 qh  = sample_state(mid.x, mid.y);
+            float4 qh  = sample_flow(mid.x, mid.y);
             float2 d2  = qh.yz;
             pos += E.ds * d2 / max(length(d2), 1e-6f);
         }

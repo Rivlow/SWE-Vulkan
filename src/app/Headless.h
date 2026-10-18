@@ -1,5 +1,5 @@
 #pragma once
-#include "util/Cli.h"
+#include "app/Cli.h"
 
 #include <string>
 
@@ -13,7 +13,8 @@ int runHeadless(Options const &opts, vkc::Context const &ctx);
 // Builds the bed from the configured sources, saves the case (assets) and a GeoTIFF + report in --dump.
 int runImport(Options const &opts);
 
-// --assets, else ./assets, else the source tree
-std::string resolveAssetDir(std::string const &requested);
+class Session;
+// Case edits given on the command line (--water, --zone), applied to the loaded case (window and batch runs)
+void applyCaseEdits(Session &session, Options const &opts);
 
 }        // namespace swe

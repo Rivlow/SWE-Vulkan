@@ -1,10 +1,12 @@
 #include "app/App.h"
 
 #include "app/Headless.h"
-#include "app/Screenshot.h"
 #include "geo/Crs.h"
 #include "geo/Tiles.h"
+#include "sim/Import.h"
+#include "util/Png.h"
 #include "util/Log.h"
+#include "util/Paths.h"
 #include "vk/Pipelines.h"
 
 #include <GLFW/glfw3.h>
@@ -37,7 +39,7 @@ std::string timestamp()
 
 std::filesystem::path settingsPath()
 {
-	return "swe_settings.json";        // next to imgui.ini, in the working directory
+	return paths::dataDir() / "swe_settings.json";
 }
 
 }        // namespace
@@ -71,9 +73,10 @@ App::App(Options const &opts) :
 
 	initImGui();
 
-	solver_   = std::make_unique<Solver>(*ctx_);
-	effects_  = std::make_unique<Effects>(*ctx_, *solver_);
-	renderer_ = std::make_unique<Renderer>(*ctx_, *solver_, *effects_, colorFormat_);
+	session_  = std::make_unique<Session>(*ctx_);
+	session_->solver().setAllTilesActive(opts_.allTiles);
+	effects_  = std::make_unique<Effects>(*ctx_, session_->solver());
+	renderer_ = std::make_unique<Renderer>(*ctx_, session_->solver(), *effects_, colorFormat_);
 	renderer_->resize(swapchain_->extent);
 	caseList_ = listCases(resolveAssetDir(opts_.assetDir));
 
@@ -93,48 +96,167 @@ App::App(Options const &opts) :
 		stepsPerFrame_ = opts_.stepsPerFrame;
 	if (opts_.showMesh)
 		render_.showMesh = true;
+	if (opts_.gwContours > 0.0f)
+	{
+		render_.gwContours    = true;
+		render_.gwContourStep = opts_.gwContours;
+	}
+	render_.gwXray = render_.gwXray || opts_.gwXray;
+	selectProfileTab_ = opts_.showProfile;
+	if (opts_.showProfile && opts_.probes.size() >= 2)
+		profileMode_ = 2;        // probe 1 -> probe 2
+	if (opts_.gwLines)
+		effects_->setGroundwaterLines(true);
+	if (opts_.crop)
+	{
+		render_.cropOn = true;
+		render_.crop   = {opts_.crop->i0, opts_.crop->j0, opts_.crop->i1, opts_.crop->j1};
+	}
 	if (opts_.zScale > 0)
 		render_.z_scale = opts_.zScale;
 	if (opts_.colorMode >= 0)
-		render_.colorMode = static_cast<ColorMode>(std::clamp(opts_.colorMode, 0, 4));
-	hideGui_ = opts_.hideGui;
+		render_.colorMode = static_cast<ColorMode>(std::clamp(opts_.colorMode, 0, int(ColorMode::Count) - 1));
+	hideGui_        = opts_.hideGui;
+	meshPreference_ = render_.showMesh;
+	applyScriptedEdits();
 
-	// scripted edits: water blocks and zones on cell rectangles, top view
-	for (auto const &w : opts_.waterBlocks)
+	// starting stage: the map, unless a case or a stage was asked for; --run starts simulating at once
+	Stage start = opts_.caseExplicit ? Stage::Terrain : Stage::Map;
+	if (opts_.stage >= 0)
+		start = static_cast<Stage>(std::clamp(opts_.stage, 0, 3));
+	if (opts_.run)
+		start = Stage::Simulation;
+	setStage(start);
+	paused_ = !opts_.run;
+	if (start == Stage::Terrain && renderer_->hasOrthophoto() && !opts_.topView)
+		startTransition();        // the relief rises out of the map, as after an import
+	if (opts_.topView)
+		topView();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Workflow stages
+// ---------------------------------------------------------------------------------------------
+
+void App::setStage(Stage s)
+{
+	if (s != Stage::Map && !session_->loaded())
+		return;
+	Stage const previous = stage_;
+	stage_               = s;
+	if (s == Stage::Simulation && previous == Stage::Conditions)
+		paused_ = false;        // "Lancer la simulation"
+	if (s != Stage::Simulation)
+		paused_ = true;
+	if (previous == Stage::Simulation && s != Stage::Simulation)
+		meshPreference_ = render_.showMesh;
+	// the mesh shows where the conditions are placed, the selection tool is the main interaction there
+	render_.showMesh = s == Stage::Conditions ? true : meshPreference_;
+	selectTool_      = s == Stage::Conditions;
+	if (!selectTool_)
 	{
-		unsigned i0, j0, i1, j1;
-		float    depth;
-		if (sscanf_s(w.c_str(), "%u,%u,%u,%u,%f", &i0, &j0, &i1, &j1, &depth) == 5)
-			solver_->editWater(i0, j0, i1, j1, WaterEdit::Depth, depth, true);
-		else
-			log::warn("--water expects i0,j0,i1,j1,depth");
+		selAnchor_.reset();
+		selCurrent_.reset();
+		render_.selection = {1, 0, 0, 0};
 	}
-	for (auto const &z : opts_.zoneDefs)
+	// back to the conditions: the run restarts from the initial state
+	if (s == Stage::Conditions && previous == Stage::Simulation)
+		resetSimulation();
+	if (s == Stage::Map && map_ && caseGeo_)
+		map_->showBox({caseGeo_->x0, caseGeo_->y0, caseGeo_->x0 + caseGeo_->nx * caseGeo_->cell, caseGeo_->y0 + caseGeo_->ny * caseGeo_->cell},
+		              caseGeo_->epsg, previous == Stage::Map);
+	if (previous == Stage::Map && s == Stage::Terrain && !transition_.active)
+		camera_.reset();
+	if (s == Stage::Conditions)
+		soil_ = session_->caseData().gw.enabled ? session_->soilDefaults() : soil_;
+}
+
+// A saved case chosen in the Map stage: loaded, then shown in 3D (animated from the map when it has an orthophoto)
+void App::openCase(std::string const &name)
+{
+	if (name != session_->caseData().name)
+		loadCase(name);
+	if (renderer_->hasOrthophoto())
+		startTransition();
+	else
+		setStage(Stage::Terrain);
+}
+
+OrbitCamera::Pose App::topPose() const
+{
+	auto const &c = session_->caseData();
+	float       S = renderer_->S();
+	glm::vec3   focal(0.5f * float(c.Lx) * S, float(c.eta_0) * render_.z_scale * S, -0.5f * float(c.Ly) * S);
+	return OrbitCamera::topPose(focal, std::max(float(c.Lx), float(c.Ly)) * S, camera_.fovY);
+}
+
+void App::topView()
+{
+	camera_.setPose(topPose());
+}
+
+void App::animateCamera(OrbitCamera::Pose const &target, float seconds)
+{
+	camera_.animateTo(target, seconds);
+}
+
+// Map -> Terrain: start flat, seen from above with the orthophoto, under the fading map
+void App::startTransition()
+{
+	stage_             = Stage::Map;        // so that setStage sees the Map -> Terrain move
+	transition_.active = true;
+	transition_.t      = 0.0f;
+	render_.z_scale    = 0.0f;
+	render_.showOrtho  = true;
+	render_.orthoMix   = 1.0f;
+	map_->setFade(1.0f);
+	// the map frames the footprint, so that the 3D top view appears where the box was
+	if (caseGeo_)
+		map_->showBox({caseGeo_->x0, caseGeo_->y0, caseGeo_->x0 + caseGeo_->nx * caseGeo_->cell, caseGeo_->y0 + caseGeo_->ny * caseGeo_->cell},
+		              caseGeo_->epsg, true);
+	camera_.setPose(topPose());
+	setStage(Stage::Terrain);
+}
+
+void App::tickTransition(float dt)
+{
+	if (!transition_.active)
+		return;
+	transition_.t += dt;
+	float t = transition_.t;
+	map_->setFade(std::clamp(1.0f - t / kFadeSeconds, 0.0f, 1.0f));
+	if (t >= kSwingStart && !camera_.animating() && t < kSwingStart + dt + 1e-3f)
+		camera_.animateTo(camera_.home(), kSwingSeconds);
+	float s = std::clamp((t - kSwingStart) / kSwingSeconds, 0.0f, 1.0f);
+	render_.z_scale = zScale0_ * s * s * (3.0f - 2.0f * s);
+	if (t >= kSwingStart + kSwingSeconds)
 	{
-		char     kind[16];
-		float    value;
-		unsigned i0, j0, i1, j1;
-		if (sscanf_s(z.c_str(), "%15[a-z],%f,%u,%u,%u,%u", kind, static_cast<unsigned>(sizeof(kind)), &value, &i0, &j0, &i1, &j1) == 6)
-		{
-			std::string k(kind);
-			render_.selection = {i0, j0, i1, j1};
-			addZoneFromSelection(k == "sink" ? ZoneKind::Sink : k == "level" ? ZoneKind::Level : ZoneKind::Source,
-			                     k == "level" ? value - solver_->caseData().z_ref : value, k);
-			render_.selection = {1, 0, 0, 0};
-		}
-		else
-			log::warn("--zone expects kind,value,i0,j0,i1,j1 (kind = source | sink | level)");
+		transition_.active = false;
+		render_.z_scale    = zScale0_;
+		map_->setFade(1.0f);
 	}
+}
+
+// Edits given on the command line: water blocks and zones on cell rectangles, top view, probes
+void App::applyScriptedEdits()
+{
+	auto const &c = session_->caseData();
+	applyCaseEdits(*session_, opts_);
 	if (opts_.topView)
 		topView();
 	if (!opts_.probes.empty())
 	{
-		auto const &c = solver_->caseData();
 		for (auto [i, j] : opts_.probes)
 			if (probes_.size() < MAX_PROBES)
 				probes_.push_back({uint32_t(std::clamp(i, 0, int(c.nx) - 1)), uint32_t(std::clamp(j, 0, int(c.ny) - 1))});
 		updateProbeList();
 	}
+}
+
+CellRect App::selection() const
+{
+	auto s = render_.selection;
+	return {s.x, s.y, s.z, s.w};
 }
 
 App::~App()
@@ -143,17 +265,15 @@ App::~App()
 		ctx_->device.waitIdle();
 	for (auto &w : writers_)
 		w.wait();
-	if (solver_)
+	if (session_ && session_->loaded())
 		saveSettings();
 	map_.reset();        // ImGui textures: freed while the backend is alive
 	shutdownImGui();
-	// Vulkan objects must die before the window/GLFW (the map panel owns ImGui textures: before ImGui shutdown
-	// would be ideal, but its descriptors are freed through the backend which is still alive here).
-	map_.reset();
+	// Vulkan objects must die before the window/GLFW
 	queries_ = nullptr;
 	renderer_.reset();
 	effects_.reset();
-	solver_.reset();
+	session_.reset();
 	for (auto &f : frames_)
 		f = Frame{};
 	swapchain_.reset();
@@ -169,9 +289,21 @@ void App::initWindow()
 		throw std::runtime_error("glfwInit failed");
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 	glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-	window_ = glfwCreateWindow(1600, 950, "Saint-Venant 2D - HLLC (Vulkan)", nullptr, nullptr);
+	window_ = glfwCreateWindow(1600, 950, "SWE Vulkan", nullptr, nullptr);
 	if (!window_)
 		throw std::runtime_error("glfwCreateWindow failed");
+	// window icon (the executable's resource covers the taskbar on Windows; this one covers every platform)
+	std::ifstream f(std::filesystem::path(resolveAssetDir(opts_.assetDir)) / "icon.png", std::ios::binary);
+	if (f)
+	{
+		std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), {});
+		auto                 icon = geo::decodeImage(bytes);
+		if (!icon.empty())
+		{
+			GLFWimage image{int(icon.width), int(icon.height), icon.rgba.data()};
+			glfwSetWindowIcon(window_, 1, &image);
+		}
+	}
 	glfwSetWindowUserPointer(window_, this);
 	glfwSetFramebufferSizeCallback(window_, &App::framebufferResizeCallback);
 }
@@ -187,7 +319,8 @@ void App::initImGui()
 	ImGui::CreateContext();
 	ImPlot::CreateContext();
 	auto &io = ImGui::GetIO();
-	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_DockingEnable;
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+	io.IniFilename = nullptr;        // fixed layout: nothing to remember (and no stale docking from older versions)
 	ImGui::StyleColorsDark();
 	auto &style            = ImGui::GetStyle();
 	style.WindowRounding   = 4.0f;
@@ -273,23 +406,23 @@ void App::readTimestamps(uint32_t slot)
 
 void App::loadCase(std::string const &name)
 {
-	auto data = makeCase(name, resolveAssetDir(opts_.assetDir));
-	if (!opts_.scheme.empty())
-		data.scheme = opts_.scheme;
-	solver_->load(data);
-	effects_->setCase(solver_->caseData());
-	renderer_->setCase(solver_->caseData());
-	opts_.caseName  = name;
+	auto assets = resolveAssetDir(opts_.assetDir);
+	session_->load(makeCase(name, assets, opts_.caseOverrides()));
+	opts_.caseName = name;
+	caseGeo_.reset();
+	orthoImage_ = {};
+	onCaseLoaded();
+	auto const &data = session_->caseData();
 	zScale0_        = static_cast<float>(data.z_scale_0);
 	render_.z_scale = zScale0_;
 	renderer_->homeCamera(camera_, zScale0_);
 	probes_.clear();
+	profileCells_.clear();        // the solver forgot them with the old grid
+	profileIndex_ = -1;
+	render_.cropOn = false;
 	updateProbeList();
-	resetSimulation();
 	// georeferenced cases: footprint on the map, orthophoto drape, bed tools
-	auto origin = caseOrigin(name, resolveAssetDir(opts_.assetDir));
-	caseGeo_.reset();
-	orthoImage_ = {};
+	auto origin = caseOrigin(name, assets);
 	if (origin.valid)
 	{
 		caseGeo_ = geo::GridGeometry{data.nx, data.ny, origin.x0, origin.y0, origin.cell, origin.epsg};
@@ -300,7 +433,7 @@ void App::loadCase(std::string const &name)
 		map_->setCaseGeometry(caseGeo_);
 	if (!origin.orthoFile.empty())
 	{
-		std::ifstream f(std::filesystem::path(resolveAssetDir(opts_.assetDir)) / origin.orthoFile, std::ios::binary);
+		std::ifstream f(std::filesystem::path(assets) / origin.orthoFile, std::ios::binary);
 		std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), {});
 		orthoImage_ = geo::decodeImage(bytes);
 		if (!orthoImage_.empty())
@@ -310,127 +443,13 @@ void App::loadCase(std::string const &name)
 	}
 }
 
-// Bed edit from the map: modifies the loaded case in memory (Save keeps it).
-void App::applyBedEdit(BedEdit const &edit)
+// The session (re)loaded its case: views follow, clock and plots restart.
+void App::onCaseLoaded()
 {
-	if (!caseGeo_)
-		return;
-	CaseData c = solver_->caseData();
-	size_t   n = 0;
-	if (edit.type == BedEdit::Type::Channel)
-		n = geo::carveChannel(c.zb, *caseGeo_, geo::ChannelSpec{.axis = edit.points, .width = edit.width, .depth = edit.depth, .bankSmoothing = edit.bankSmoothing});
-	else
-		n = geo::lowerPolygon(c.zb, *caseGeo_, edit.points, static_cast<float>(edit.dz));
-	log::info("bed edit: {} cell(s) modified", n);
-	if (n == 0)
-		return;
-	// still water keeps its surface: the initial depth follows the new bed
-	for (size_t k = 0; k < c.cells(); ++k)
-		if (c.h0[k] > 0.0f)
-		{
-			float eta = solver_->caseData().zb[k] + solver_->caseData().h0[k];
-			c.h0[k]   = std::max(eta - c.zb[k], 0.0f);
-		}
-	solver_->load(c);
-	effects_->setCase(solver_->caseData());
-	renderer_->setCase(solver_->caseData());
+	effects_->setCase(session_->caseData());
+	renderer_->setCase(session_->caseData());
 	if (!orthoImage_.empty())
 		renderer_->setOrthophoto(orthoImage_.width, orthoImage_.height, orthoImage_.rgba.data());
-	resetSimulation();
-}
-
-void App::topView()
-{
-	auto const &c = solver_->caseData();
-	float       S = renderer_->S();
-	glm::vec3   focal(0.5f * float(c.Lx) * S, float(c.eta_0) * render_.z_scale * S, -0.5f * float(c.Ly) * S);
-	camera_.topView(focal, std::max(float(c.Lx), float(c.Ly)) * S);
-}
-
-void App::addZoneFromSelection(ZoneKind kind, double value, std::string const &label)
-{
-	auto const &c   = solver_->caseData();
-	auto        sel = render_.selection;
-	if (sel.z < sel.x || sel.w < sel.y)
-		return;
-	auto zones = c.zones;
-	auto mask  = c.zoneMask;
-	if (zones.size() >= MAX_ZONES)
-	{
-		log::warn("at most {} zones", MAX_ZONES);
-		return;
-	}
-	if (mask.size() != c.cells())
-		mask.assign(c.cells(), 0);
-	CaseData::ZoneDef z{.kind = kind, .value = value, .label = label, .i0 = sel.x, .j0 = sel.y, .i1 = sel.z, .j1 = sel.w};
-	zones.push_back(z);
-	auto id = static_cast<uint8_t>(zones.size());
-	for (uint32_t i = sel.x; i <= sel.z; ++i)
-		for (uint32_t j = sel.y; j <= sel.w; ++j)
-			mask[size_t(i) * c.ny + j] = id;
-	solver_->setZones(zones, mask);
-}
-
-void App::removeZone(size_t index)
-{
-	auto const &c     = solver_->caseData();
-	auto        zones = c.zones;
-	auto        mask  = c.zoneMask;
-	if (index >= zones.size())
-		return;
-	zones.erase(zones.begin() + static_cast<std::ptrdiff_t>(index));
-	for (auto &m : mask)
-	{
-		if (m == index + 1)
-			m = 0;
-		else if (m > index + 1)
-			--m;
-	}
-	solver_->setZones(zones, mask);
-}
-
-void App::updateZoneValue(size_t index, double value)
-{
-	auto zones = solver_->caseData().zones;
-	if (index >= zones.size())
-		return;
-	zones[index].value = value;
-	solver_->setZones(zones, solver_->caseData().zoneMask);
-}
-
-void App::saveCurrentCase()
-{
-	if (!caseGeo_)
-		return;
-	updateImportedCase(solver_->caseData(), resolveAssetDir(opts_.assetDir));
-	caseList_ = listCases(resolveAssetDir(opts_.assetDir));
-	log::info("case '{}' saved", solver_->caseData().name);
-}
-
-// A finished geographic import: saved as a case (JSON + npz + orthophoto), then loaded like any other.
-void App::loadImport(ImportOutcome &&o)
-{
-	auto data = geo::TerrainBuilder::toCase(o.result, o.request);
-	ImportMetadata meta{.x0 = o.result.bed.x0, .y0 = o.result.bed.y0, .cell = o.result.bed.cell, .epsg = o.result.bed.epsg,
-	                    .attributions = o.result.attributions};
-	for (auto const &r : o.result.sources)
-		if (r.used)
-			meta.sources.push_back(r.name);
-	auto assets = resolveAssetDir(opts_.assetDir);
-	if (!o.orthophoto.empty())
-	{
-		meta.orthoFile = "data/" + data.name + "_ortho.png";
-		writePng(std::filesystem::path(assets) / meta.orthoFile, o.orthophoto.rgba.data(), o.orthophoto.width, o.orthophoto.height, false);
-	}
-	saveImportedCase(data, meta, assets);
-	caseList_ = listCases(assets);
-	loadCase(data.name);
-	log::info("imported case '{}' ({} x {} cells at {} m)", data.name, data.nx, data.ny, o.result.bed.cell);
-}
-
-void App::resetSimulation()
-{
-	solver_->reset();
 	effects_->reset();
 	scalars_   = {};
 	prevSteps_ = 0;
@@ -438,47 +457,63 @@ void App::resetSimulation()
 	history_.clear();
 }
 
-void App::History::clear()
+// Bed edit from the map: modifies the loaded case in memory (Save keeps it).
+void App::applyBedEdit(BedEdit const &edit)
 {
-	t.clear();
-	volume.clear();
-	wetArea.clear();
-	dt.clear();
-	for (auto *series : {&eta, &depth, &speed})
-		for (auto &v : *series)
-			v.clear();
+	if (!caseGeo_)
+		return;
+	auto   zb = session_->caseData().zb;
+	size_t n  = geo::applyBedEdit(zb, *caseGeo_, edit);
+	log::info("bed edit: {} cell(s) modified", n);
+	if (n == 0)
+		return;
+	session_->replaceBed(std::move(zb));
+	onCaseLoaded();
+	updateProbeList();
+	profileCells_.clear();        // the reload forgot them
 }
 
-void App::History::push(SolverScalars const &s, double cellArea, size_t probes)
+// Requests of the map panel (finished import, bed edit), whatever the stage shown
+void App::processMapRequests()
 {
-	t.push_back(s.t);
-	volume.push_back(s.volume);
-	wetArea.push_back(s.wetCells * cellArea);
-	dt.push_back(s.dt);
-	for (size_t p = 0; p < MAX_PROBES; ++p)
-	{
-		bool on = p < probes;
-		eta[p].push_back(on ? s.probes[p].eta : NAN);
-		depth[p].push_back(on ? s.probes[p].h : NAN);
-		speed[p].push_back(on ? std::hypot(s.probes[p].u, s.probes[p].v) : NAN);
-	}
-	if (t.size() > 40000)
-		decimate();
+	map_->pollJob();
+	if (auto outcome = map_->takeOutcome())
+		loadImport(std::move(*outcome));
+	if (auto edit = map_->takeBedEdit())
+		applyBedEdit(*edit);
 }
 
-void App::History::decimate()
+void App::saveCurrentCase()
 {
-	auto half = [](std::vector<double> &v) {
-		size_t k = 0;
-		for (size_t i = 0; i < v.size(); i += 2)
-			v[k++] = v[i];
-		v.resize(k);
-	};
-	for (auto *v : {&t, &volume, &wetArea, &dt})
-		half(*v);
-	for (auto *series : {&eta, &depth, &speed})
-		for (auto &v : *series)
-			half(v);
+	if (!caseGeo_)
+		return;
+	updateImportedCase(session_->caseData(), resolveAssetDir(opts_.assetDir));
+	caseList_ = listCases(resolveAssetDir(opts_.assetDir));
+	log::info("case '{}' saved", session_->caseData().name);
+}
+
+// A finished geographic import: saved as a case (JSON + npz + orthophoto), then loaded like any other.
+void App::loadImport(ImportOutcome &&o)
+{
+	auto assets = resolveAssetDir(opts_.assetDir);
+	auto data   = saveImport(o.result, o.request, o.orthophoto, assets);
+	caseList_   = listCases(assets);
+	loadCase(data.name);
+	log::info("imported case '{}' ({} x {} cells at {} m)", data.name, data.nx, data.ny, o.result.bed.cell);
+	if (renderer_->hasOrthophoto())
+		startTransition();
+	else
+		setStage(Stage::Terrain);
+}
+
+void App::resetSimulation()
+{
+	session_->reset();
+	effects_->reset();
+	scalars_   = {};
+	prevSteps_ = 0;
+	volume0_   = -1.0;
+	history_.clear();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -502,7 +537,11 @@ void App::run()
 		ImGui_ImplVulkan_NewFrame();
 		ImGui_ImplGlfw_NewFrame();
 		ImGui::NewFrame();
+		float dt = std::min(ImGui::GetIO().DeltaTime, 0.1f);
+		tickTransition(dt);
+		camera_.tick(dt);
 		drawGui();
+		processMapRequests();
 		handleInput();
 		ImGui::Render();
 
@@ -526,18 +565,32 @@ void App::handleInput()
 	auto &io = ImGui::GetIO();
 	if (!io.WantCaptureKeyboard)
 	{
-		if (ImGui::IsKeyPressed(ImGuiKey_Space, false))
+		if (stage_ == Stage::Simulation && ImGui::IsKeyPressed(ImGuiKey_Space, false))
 			paused_ = !paused_;
 		if (ImGui::IsKeyPressed(ImGuiKey_F12, false))
-			captureRequest_ = std::filesystem::path("captures") / ("swe_" + timestamp() + ".png");
-		if (ImGui::IsKeyPressed(ImGuiKey_R, false))
+			captureRequest_ = paths::dataDir() / "captures" / ("swe_" + timestamp() + ".png");
+		if (stage_ == Stage::Simulation && ImGui::IsKeyPressed(ImGuiKey_R, false))
 			resetSimulation();
 		if (ImGui::IsKeyPressed(ImGuiKey_Home, false))
-			camera_.reset();
+			animateCamera(camera_.home());
 		if (ImGui::IsKeyPressed(ImGuiKey_F1, false))
 			showHelp_ = !showHelp_;
 		if (ImGui::IsKeyPressed(ImGuiKey_F11, false))
 			hideGui_ = !hideGui_;
+	}
+	// the map stage has no 3D interaction; during the transition the camera is scripted (a click ends it)
+	if (stage_ == Stage::Map)
+		return;
+	if (transition_.active)
+	{
+		if (!io.WantCaptureMouse && (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseClicked(ImGuiMouseButton_Middle)))
+		{
+			transition_.active = false;
+			render_.z_scale    = zScale0_;
+			map_->setFade(1.0f);
+			camera_.stop();
+		}
+		return;
 	}
 
 	// Camera, in the 3D view rectangle: normalised cursor with origin bottom-left (as in ui/camera.py)
@@ -600,8 +653,10 @@ void App::drawFrame()
 		throw std::runtime_error("waitForFences failed");
 
 	// The fence covered the solver batch of this slot too: its scalar readback is complete.
-	auto s = solver_->readback(frameIndex_);
-	if (s.n_steps > 0 && s.n_steps >= prevSteps_)
+	auto s = session_->solver().readback(frameIndex_);
+	profile_ = session_->solver().readProfile(frameIndex_);
+	// (the diagnostics run every frame, paused at t = 0 included: the balance is right before "Lancer")
+	if (s.n_steps >= prevSteps_)
 	{
 		double dtFrame = ImGui::GetIO().DeltaTime;
 		if (dtFrame > 0)
@@ -610,10 +665,13 @@ void App::drawFrame()
 		prevSteps_    = s.n_steps;
 		scalars_      = s;
 		if (volume0_ < 0.0)
+		{
+			balance0_ = double(s.volume) + s.gwVolume - s.srcNet;
 			volume0_ = s.volume;
+		}
 		if (advanced)
 		{
-			auto const &c = solver_->caseData();
+			auto const &c = session_->caseData();
 			history_.push(s, c.dx() * c.dy(), probes_.size());
 		}
 	}
@@ -636,7 +694,7 @@ void App::drawFrame()
 	std::vector<vk::CommandBufferSubmitInfo> solverCmds;
 	if (*queries_)
 		solverCmds.push_back({.commandBuffer = *frame.begin});
-	solver_->appendSteps(solverCmds, paused_ ? 0u : static_cast<uint32_t>(stepsPerFrame_), frameIndex_);
+	session_->solver().appendSteps(solverCmds, paused_ ? 0u : static_cast<uint32_t>(stepsPerFrame_), frameIndex_);
 
 	vk::SemaphoreSubmitInfo     waitInfo{.semaphore = *frame.imageAvailable, .stageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput};
 	vk::SemaphoreSubmitInfo     signalInfo{.semaphore = *swapchain_->renderFinished[imageIndex], .stageMask = vk::PipelineStageFlagBits2::eAllCommands};
@@ -693,7 +751,7 @@ void App::recordFrame(Frame &frame, uint32_t imageIndex)
 	RenderSettings settings = render_;
 	settings.showLines      = lines;
 	settings.viewport       = viewRect_;
-	renderer_->record(cb, frameIndex_, image, view, camera_, settings, scalars_.t);
+	renderer_->record(cb, frameIndex_, image, view, camera_, settings, static_cast<float>(scalars_.t));
 
 	// GUI on top, single-sampled
 	vkc::memoryBarrier(cb, vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
@@ -807,12 +865,9 @@ void App::loadSettings()
 		stepsPerFrame_     = std::clamp(j.value("steps_per_frame", stepsPerFrame_), 1, 500);
 		render_.showLines  = j.value("streamlines", render_.showLines);
 		render_.showMesh   = j.value("mesh", render_.showMesh);
-		render_.colorMode  = static_cast<ColorMode>(std::clamp(j.value("color_mode", 0), 0, 4));
+		render_.colorMode  = static_cast<ColorMode>(std::clamp(j.value("color_mode", 0), 0, int(ColorMode::Count) - 1));
 		autoRange_         = j.value("auto_range", autoRange_);
 		showPlots_         = j.value("show_plots", showPlots_);
-		showPerf_          = j.value("show_perf", showPerf_);
-		showProbes_        = j.value("show_probes", showProbes_);
-		showMap_           = j.value("show_map", showMap_);
 		effects_->setTurbidity(j.value("turbidity", false));
 		if (j.contains("map") && map_)
 		{
@@ -829,17 +884,14 @@ void App::loadSettings()
 
 void App::saveSettings() const
 {
-	nlohmann::json j{{"case", solver_->caseData().name},
+	nlohmann::json j{{"case", session_->caseData().name},
 	                 {"steps_per_frame", stepsPerFrame_},
 	                 {"streamlines", render_.showLines},
-	                 {"mesh", render_.showMesh},
+	                 {"mesh", stage_ == Stage::Simulation ? render_.showMesh : meshPreference_},
 	                 {"color_mode", static_cast<int>(render_.colorMode)},
 	                 {"auto_range", autoRange_},
 	                 {"turbidity", effects_->turbidity()},
-	                 {"show_plots", showPlots_},
-	                 {"show_perf", showPerf_},
-	                 {"show_probes", showProbes_},
-	                 {"show_map", showMap_}};
+	                 {"show_plots", showPlots_}};
 	if (map_)
 		j["map"] = {{"lon", map_->center().lon}, {"lat", map_->center().lat}, {"zoom", map_->zoom()}, {"layer", map_->layer()}};
 	std::ofstream(settingsPath()) << j.dump(2) << '\n';

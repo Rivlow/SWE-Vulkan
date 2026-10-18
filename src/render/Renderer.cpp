@@ -101,6 +101,7 @@ void Renderer::createPipelines()
 	d.polygonMode   = vk::PolygonMode::eLine;
 	d.depthWrite    = false;
 	d.depthBias     = -1.0f;
+	d.blend         = vkc::Blend::Alpha;        // lines fade with the distance (wireFrag)
 	d.name          = "terrain-wire";
 	terrainWire_    = vkc::makeGraphicsPipeline(ctx_, d);
 	d.vertexModule  = *waterModule_;
@@ -109,6 +110,7 @@ void Renderer::createPipelines()
 	waterWire_      = vkc::makeGraphicsPipeline(ctx_, d);
 
 	d.polygonMode    = vk::PolygonMode::eFill;
+	d.blend          = vkc::Blend::None;
 	d.depthBias      = 0.0f;
 	d.depthWrite     = true;
 	d.vertexEntry    = "waterVert";
@@ -122,12 +124,27 @@ void Renderer::createPipelines()
 	d.vertexModule   = *skirtModule_;
 	d.vertexEntry    = "skirtBedVert";
 	d.fragmentModule = *skirtModule_;
-	d.fragmentEntry  = "skirtFrag";
+	d.fragmentEntry  = "skirtBedFrag";
 	d.name           = "skirt-bed";
 	skirtBed_        = vkc::makeGraphicsPipeline(ctx_, d);
 	d.vertexEntry    = "skirtWaterVert";
+	d.fragmentEntry  = "skirtFrag";
 	d.name           = "skirt-water";
 	skirtWater_      = vkc::makeGraphicsPipeline(ctx_, d);
+
+	// water table seen through the ground: translucent, no depth test
+	d.vertexModule   = *terrainModule_;
+	d.vertexEntry    = "gwTableVert";
+	d.fragmentModule = *terrainModule_;
+	d.fragmentEntry  = "gwTableFrag";
+	d.blend          = vkc::Blend::Alpha;
+	d.depthTest      = false;
+	d.depthWrite     = false;
+	d.name           = "gw-table";
+	gwTable_         = vkc::makeGraphicsPipeline(ctx_, d);
+	d.depthTest      = true;
+	d.depthWrite     = true;
+	d.blend          = vkc::Blend::None;
 
 	// streamlines: screen-space quads blended over the water, no depth write
 	d.vertexModule   = *linesModule_;
@@ -174,6 +191,11 @@ void Renderer::setCase(CaseData const &c)
 	Lx_       = static_cast<float>(c.Lx);
 	Ly_       = static_cast<float>(c.Ly);
 	zBase_    = *std::min_element(c.zb.begin(), c.zb.end()) - 0.35f * depthRef_;
+	gwOn_     = c.gw.enabled;
+	nx_       = c.nx;
+	ny_       = c.ny;
+	if (gwOn_)        // the block diagram shows the whole soil column, down below the substratum
+		zBase_ = std::min(zBase_, *std::min_element(c.gw.z_sub.begin(), c.gw.z_sub.end()) - 0.35f * depthRef_);
 	flags_    = std::max(c.Lx, c.Ly) > 2000.0 ? SCENE_LANDCOVER : 0u;
 
 	// two triangles per quad of cell centres: (v00, v10, v11) and (v00, v11, v01), as build_indices()
@@ -205,7 +227,6 @@ void Renderer::setCase(CaseData const &c)
 	}
 
 	indexCount_       = static_cast<uint32_t>(idx.size());
-	skirtVertexCount_ = 2 * (c.nx + c.ny) * 6;
 	indices_          = vkc::Buffer(ctx_, idx.size() * sizeof(uint32_t),
 	                                vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst,
 	                                vk::MemoryPropertyFlagBits::eDeviceLocal, "grid-indices");
@@ -256,7 +277,22 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 	sp.Lx              = Lx_;
 	sp.Ly              = Ly_;
 	sp.flags           = flags_ | (hasOrtho_ && settings.showOrtho ? SCENE_ORTHO : 0u) | (settings.thinWater ? SCENE_THIN_WATER : 0u) |
-	                     (settings.showZones ? SCENE_ZONES : 0u);
+	                     (settings.showZones ? SCENE_ZONES : 0u) | (settings.gwContours ? SCENE_GW_CONTOURS : 0u);
+	sp.gw              = glm::vec4(settings.gwContourStep, 0.8f, 0.5f * vp.w / std::tan(0.5f * camera.fovY), 0.0f);        // z = focal length (px)
+	// cut box, clamped to the grid (at least 2 x 2 cells)
+	glm::uvec4 crop{0, 0, nx_ - 1, ny_ - 1};
+	if (settings.cropOn)
+	{
+		crop.x = std::min(settings.crop.x, nx_ - 2);
+		crop.y = std::min(settings.crop.y, ny_ - 2);
+		crop.z = std::clamp(settings.crop.z, crop.x + 1, nx_ - 1);
+		crop.w = std::clamp(settings.crop.w, crop.y + 1, ny_ - 1);
+		sp.flags |= SCENE_CROP;
+	}
+	sp.crop = crop;
+	if (settings.gwXray && gwOn_)
+		sp.flags |= SCENE_GW_XRAY;
+	uint32_t skirtVertices = 2 * ((crop.z - crop.x + 1) + (crop.w - crop.y + 1)) * 6;
 	sp.ortho_mix       = settings.orthoMix;
 	sp.sel             = settings.selection;
 	sp.color_mode      = static_cast<uint32_t>(settings.colorMode);
@@ -313,7 +349,12 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 	cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *terrain_);
 	cb.drawIndexed(indexCount_, 1, 0, 0, 0);
 	cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *skirtBed_);
-	cb.draw(skirtVertexCount_, 1, 0, 0);
+	cb.draw(skirtVertices, 1, 0, 0);
+	if ((sp.flags & SCENE_GW_XRAY) != 0)
+	{
+		cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *gwTable_);
+		cb.drawIndexed(indexCount_, 1, 0, 0, 0);
+	}
 	if (settings.showMesh)
 	{
 		cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *terrainWire_);
@@ -322,7 +363,7 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 	if (settings.showWater)
 	{
 		cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *skirtWater_);
-		cb.draw(skirtVertexCount_, 1, 0, 0);
+		cb.draw(skirtVertices, 1, 0, 0);
 		cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *water_);
 		cb.drawIndexed(indexCount_, 1, 0, 0, 0);
 		if (settings.showMesh)

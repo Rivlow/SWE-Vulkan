@@ -14,6 +14,7 @@ struct LineVarying
     float4 pos       : SV_Position;
     float  across    : ACROSS;     // signed distance from the centre line, pixels
     float  intensity : INTENSITY;
+    float3 disp      : DISP;       // display position (cut box)
 };
 
 float3 line_display(LinePoint p)
@@ -36,6 +37,7 @@ LineVarying lineVert(uint vid : SV_VertexID)
         o.pos = float4(2.0f, 2.0f, 2.0f, 1.0f);
         o.across = 0.0f;
         o.intensity = 0.0f;
+        o.disp = float3(0.0f);
         return o;
     }
     static const uint  END[6]  = { 0, 0, 1, 0, 1, 1 };
@@ -55,13 +57,17 @@ LineVarying lineVert(uint vid : SV_VertexID)
     o.pos       = c;
     o.across    = SIDE[corner] * w;
     o.intensity = atB ? b.intensity : a.intensity;
+    o.disp      = line_display(atB ? b : a);
     return o;
 }
 
 [shader("fragment")]
 float4 lineFrag(LineVarying v) : SV_Target
 {
+    if (cropped_out(v.disp))
+        discard;
     float edge  = 1.0f - saturate((abs(v.across) - HALF_WIDTH) / FEATHER);
     float alpha = saturate(v.intensity) * edge;
-    return float4(FOAM, alpha);
+    // aquifer streamlines: deep blue on the ground
+    return float4((E.flags & EFFECTS_GW_LINES) != 0 ? float3(0.05f, 0.25f, 0.85f) : FOAM, alpha);
 }

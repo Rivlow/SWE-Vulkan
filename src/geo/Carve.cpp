@@ -144,4 +144,11 @@ size_t lowerPolygon(std::vector<float> &zb, GridGeometry const &g, std::vector<X
 	return modified;
 }
 
+size_t applyBedEdit(std::vector<float> &zb, GridGeometry const &g, BedEdit const &edit)
+{
+	if (edit.type == BedEdit::Type::Channel)
+		return carveChannel(zb, g, ChannelSpec{.axis = edit.points, .width = edit.width, .depth = edit.depth, .bankSmoothing = edit.bankSmoothing});
+	return lowerPolygon(zb, g, edit.points, static_cast<float>(edit.dz));
+}
+
 }        // namespace swe::geo

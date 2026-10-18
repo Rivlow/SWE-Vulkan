@@ -2,10 +2,15 @@
 #include "app/Headless.h"
 #include "app/SelfTest.h"
 #include "geo/Crs.h"
-#include "util/Cli.h"
+#include "app/Cli.h"
 #include "util/Log.h"
 #include "vk/Context.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
@@ -18,21 +23,31 @@ void printUsage()
 
 usage: swe [options]
   --case <name>        case to load (dam_break, meuse, vesdre)       [dam_break]
-  --scheme <name>      time scheme (euler, ssprk2, ssprk3, rk4, dopri5)
+  --scheme <name>      time scheme (euler, ssprk2, ssprk3)
+  --drain <n>          drain limiter: Jacobi passes per stage, 0 = off (clamp h < 0)   [case, 4]
   --gpu <index>        force a physical device (see the GPU list printed at start)
   --assets <dir>       asset directory (cases/, data/)
   --validation / --no-validation   Vulkan validation layers (default: on in Debug)
   --sync-validation    also enable synchronization validation (slow)
   --steps-per-frame <n>  solver steps per displayed frame                [30]
-  --color <0..4>       water colouring: realistic, depth, speed, Froude, elevation
+  --color <0..10>      colouring: realistic, depth, speed, Froude, elevation; groundwater cases (on the
+                       ground): table depth, saturation, exchange, infiltrated depth, head; 10 = rain
   --mesh               wireframe overlay
+  --gw-contours <m>    water table contour lines with this step (groundwater cases)
+  --gw-xray            water table seen through the ground; --gw-lines: streamlines of the aquifer
+  --crop i0,j0,i1,j1   cut box: only these cells are drawn, the walls show the soil column
+  --show-profile       open the vertical profile in the plots (with --probe i,j twice: probe 1 -> 2)
+  --stage <s>          start at this stage: carte (default), terrain (default with --case), conditions, simulation
+  --run                start simulating at once (Simulation stage, not paused); otherwise everything starts paused
   --z-scale <f>        vertical exaggeration (default: case value)
   --capture <png>      save a screenshot after --capture-frames frames, then quit
   --capture-frames <n>                                                   [120]
   --headless           no window (batch mode)
     --selftest         run the compute self-test and exit
     --steps <n>        number of solver steps
+    --time <s>         run until the simulated time reaches s (after --steps, if any)
     --dump <dir>       write Q.npy, zb.npy and meta.json after the run
+    --profile <n>      then GPU time of each phase of a step, averaged over n more steps
   --import xmin,ymin,xmax,ymax   geographic import (Lambert 72 m) of the bed, saved as a case
   --import-ll lonmin,latmin,lonmax,latmax   same with a WGS 84 box (projection chosen automatically)
     --cell <m>         target cell size                                          [5]
@@ -45,6 +60,10 @@ usage: swe [options]
   --top                start with the top view
   --water i0,j0,i1,j1,h   water block (depth h) on a cell rectangle, repeatable
   --zone kind,value,i0,j0,i1,j1   per-cell zone (source m3/s | sink | level m DNG), repeatable
+  --rain i0,j0,i1,j1,mm_h         rain zone, constant rate from t = 0 (repeatable; --infiltration: same,
+                       signed infiltration chronology zone)
+                       (--water and --zone also apply to --headless runs)
+  --all-tiles          compute dry tiles too (reference for the active-tile scheme; same results, slower)
 )";
 }
 
@@ -52,6 +71,16 @@ usage: swe [options]
 
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+	// Windows application (no console of its own): when started from a console, log there; when the standard
+	// handles are already redirected (tools, pipes), keep them
+	if (GetStdHandle(STD_OUTPUT_HANDLE) == nullptr && AttachConsole(ATTACH_PARENT_PROCESS))
+	{
+		FILE *f = nullptr;
+		freopen_s(&f, "CONOUT$", "w", stdout);
+		freopen_s(&f, "CONOUT$", "w", stderr);
+	}
+#endif
 	try
 	{
 		auto opts = swe::parseOptions(argc, argv);
@@ -61,7 +90,7 @@ int main(int argc, char **argv)
 			return EXIT_SUCCESS;
 		}
 
-		if (!opts.importBox.empty() || !opts.importBoxLL.empty())
+		if (opts.importBox || opts.importBoxLL)
 		{
 			int code = swe::runImport(opts);
 			swe::geo::shutdown();

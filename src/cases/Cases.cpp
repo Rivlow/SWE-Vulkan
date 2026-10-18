@@ -3,6 +3,7 @@
 #include "cases/GridOps.h"
 #include "cases/Npy.h"
 #include "util/Log.h"
+#include "util/Paths.h"
 
 #include <nlohmann/json.hpp>
 
@@ -41,6 +42,7 @@ void readCommon(CaseData &c, json const &j)
 	c.manning_n = j.value("manning_n", 0.0);
 	c.cfl       = j.value("cfl", 0.4);
 	c.scheme    = j.value("scheme", std::string("ssprk2"));
+	c.drain_passes = std::clamp(j.value("drain_passes", 4), 0, MAX_DRAIN_PASSES);
 	c.legacyInflow = j.value("legacy_inflow", false);
 	if (j.contains("render"))
 	{
@@ -192,18 +194,18 @@ void buildDtmLake(CaseData &c, json const &j, fs::path const &assets)
 			c.h0[k] = lake - zRaw[k];
 	}
 
-	// outlet: lowest cell of the basin and its neighbours inside the basin (~ +-refine cells)
+	// outlet: lowest cell of the basin and its neighbours inside the basin (~ +-refine cells), as a Sink zone
 	if (j.value("outlet", true))
 	{
-		size_t kmin = grid::nanArgMin(zRaw);
-		int    io = int(kmin / c.ny), jo = int(kmin % c.ny), ir = int(r);
-		c.sink.assign(c.cells(), 0u);
-		for (int i = std::max(io - ir, 0); i <= std::min(io + ir, int(c.nx) - 1); ++i)
-			for (int jj = std::max(jo - ir, 0); jj <= std::min(jo + ir, int(c.ny) - 1); ++jj)
-			{
-				size_t k = size_t(i) * c.ny + jj;
-				c.sink[k] = std::isnan(zRaw[k]) ? 0u : 1u;
-			}
+		size_t   kmin = grid::nanArgMin(zRaw);
+		int      io = int(kmin / c.ny), jo = int(kmin % c.ny), ir = int(r);
+		uint32_t i0 = uint32_t(std::max(io - ir, 0)), i1 = uint32_t(std::min(io + ir, int(c.nx) - 1));
+		uint32_t j0 = uint32_t(std::max(jo - ir, 0)), j1 = uint32_t(std::min(jo + ir, int(c.ny) - 1));
+		c.zones    = {{.kind = ZoneKind::Sink, .label = "exutoire", .i0 = i0, .j0 = j0, .i1 = i1, .j1 = j1}};
+		c.zoneMask.assign(c.cells(), 0);
+		for (uint32_t i = i0; i <= i1; ++i)
+			for (uint32_t jj = j0; jj <= j1; ++jj)
+				c.zoneMask[c.index(i, jj)] = std::isnan(zRaw[c.index(i, jj)]) ? 0 : 1;
 	}
 }
 
@@ -239,6 +241,164 @@ void buildImported(CaseData &c, json const &j, fs::path const &assets)
 	if (c.h0.size() != c.cells() || (!c.outside.empty() && c.outside.size() != c.cells()))
 		throw std::runtime_error("imported: inconsistent array sizes");
 	readZones(c, j, npz);
+}
+
+// A per-cell field of the "groundwater" block: a number (uniform), a "file.npy" relative to the assets, or the
+// name of an array of the case's npz (imported cases). Empty when the key is absent.
+std::vector<float> readField(CaseData const &c, json const &g, char const *key, json const &j, fs::path const &assets)
+{
+	if (!g.contains(key))
+		return {};
+	auto const &v = g[key];
+	if (v.is_number())
+		return std::vector<float>(c.cells(), v.get<float>());
+	auto               name = v.get<std::string>();
+	std::vector<float> a;
+	if (name.ends_with(".npy"))
+		a = npy::load(assets / name).asFloat();
+	else if (j.contains("data"))
+		a = npy::loadNpz(assets / j["data"].get<std::string>()).at(name).asFloat();
+	else
+		throw std::runtime_error(std::format("groundwater.{}: '{}' is neither a .npy file nor a case npz array", key, name));
+	if (a.size() != c.cells())
+		throw std::runtime_error(std::format("groundwater.{}: {} values for {} cells", key, a.size(), c.cells()));
+	return a;
+}
+
+// "groundwater": {"kv": 1e-5, "kh": 1e-4, "sy": 0.25, "depth": 10 | "z_sub": ..., "h0": 2 | "head": ... |
+// "table_depth": ..., "datum": "wolfgpu"}. Each field: number, "file.npy" or npz array name (see readField).
+void readGroundwater(CaseData &c, json const &j, fs::path const &assets)
+{
+	auto &gw = c.gw;
+	gw       = {};
+	if (!j.contains("groundwater"))
+		return;
+	auto const &g = j["groundwater"];
+	size_t const n = c.cells();
+	gw.enabled = true;
+	gw.wolfgpu = g.value("datum", std::string("physical")) == "wolfgpu";
+	gw.kv      = readField(c, g, "kv", j, assets);
+	gw.kh      = readField(c, g, "kh", j, assets);
+	gw.sy      = readField(c, g, "sy", j, assets);
+	if (gw.kv.empty())
+		gw.kv.assign(n, 0.0f);
+	if (gw.kh.empty())
+		gw.kh.assign(n, 0.0f);
+	if (gw.sy.empty() || gw.wolfgpu)
+		gw.sy.assign(n, gw.wolfgpu ? 1.0f : 0.25f);
+	for (size_t k = 0; k < n; ++k)
+	{
+		gw.kv[k] = std::max(gw.kv[k], 0.0f);
+		gw.kh[k] = std::max(gw.kh[k], 0.0f);
+		gw.sy[k] = std::clamp(gw.sy[k], 1e-3f, 1.0f);
+	}
+
+	// substratum: wolfgpu's aquifer lies on the bed itself
+	gw.z_sub = readField(c, g, "z_sub", j, assets);
+	if (gw.wolfgpu)
+		gw.z_sub = c.zb;
+	else if (gw.z_sub.empty())
+	{
+		auto depth = readField(c, g, "depth", j, assets);
+		if (depth.empty())
+			depth.assign(n, 10.0f);
+		gw.z_sub.resize(n);
+		for (size_t k = 0; k < n; ++k)
+			gw.z_sub[k] = c.zb[k] - std::max(depth[k], 0.0f);
+	}
+
+	// initial saturated thickness: given directly, or from a head / a depth of the table below the ground
+	gw.h0 = readField(c, g, "h0", j, assets);
+	if (gw.h0.empty())
+	{
+		auto head  = readField(c, g, "head", j, assets);
+		auto depth = readField(c, g, "table_depth", j, assets);
+		gw.h0.assign(n, 0.0f);
+		for (size_t k = 0; k < n; ++k)
+			if (!head.empty())
+				gw.h0[k] = head[k] - gw.z_sub[k];
+			else if (!depth.empty())
+				gw.h0[k] = c.zb[k] - depth[k] - gw.z_sub[k];
+	}
+	for (size_t k = 0; k < n; ++k)
+	{
+		gw.h0[k] = std::max(gw.h0[k], 0.0f);
+		if (!gw.wolfgpu)        // a table above the ground would exfiltrate at once: start at most saturated
+			gw.h0[k] = std::min(gw.h0[k], std::max(c.zb[k] - gw.z_sub[k], 0.0f));
+	}
+}
+
+// "rain" / "infiltration": {"zones": "all" | [[i0, j0, i1, j1], ...] (zone k = rectangle k) | "file.npy" | npz array,
+//  "chronology": [[t, [q_zone1, q_zone2, ...]], ...], "lerp": false, "unit": "m3/s" | "mm/h"}
+// Same chronology as wolfgpu's add_infiltration / add_rain: m3/s for a whole zone, constant after the last line,
+// nothing before the first one. "mm/h" (convenience for rain) is converted to m3/s with the zone areas.
+void readChronology(CaseData &c, CaseData::Chronology &chrono, char const *key, json const &j, fs::path const &assets)
+{
+	chrono = {};
+	if (!j.contains(key))
+		return;
+	auto const &g = j[key];
+	size_t const n = c.cells();
+	auto const  &z = g.at("zones");
+	if (z.is_string() && z.get<std::string>() == "all")
+		chrono.zones.assign(n, 1);
+	else if (z.is_array())
+	{
+		chrono.zones.assign(n, 0);
+		for (size_t k = 0; k < z.size(); ++k)
+		{
+			auto const &r = z[k];
+			for (uint32_t i = r.at(0).get<uint32_t>(); i <= std::min(r.at(2).get<uint32_t>(), c.nx - 1); ++i)
+				for (uint32_t jj = r.at(1).get<uint32_t>(); jj <= std::min(r.at(3).get<uint32_t>(), c.ny - 1); ++jj)
+					chrono.zones[c.index(i, jj)] = static_cast<uint16_t>(k + 1);
+		}
+	}
+	else
+	{
+		json spec = {{"zones", z}};
+		auto f    = readField(c, spec, "zones", j, assets);
+		chrono.zones.resize(n);
+		for (size_t k = 0; k < n; ++k)
+			chrono.zones[k] = static_cast<uint16_t>(std::clamp(f[k], 0.0f, 65535.0f));
+	}
+	chrono.lerp = g.value("lerp", false);
+	for (auto const &line : g.at("chronology"))
+	{
+		chrono.t.push_back(line.at(0).get<double>());
+		chrono.q.push_back(line.at(1).get<std::vector<double>>());
+		if (chrono.q.back().size() != chrono.q.front().size())
+			throw std::runtime_error(std::format("{}: every chronology line needs the same number of zones", key));
+		if (chrono.t.size() > 1 && chrono.t.back() <= chrono.t[chrono.t.size() - 2])
+			throw std::runtime_error(std::format("{}: chronology times must increase", key));
+	}
+	if (g.value("unit", std::string("m3/s")) == "mm/h")
+	{
+		std::vector<double> area(chrono.zoneCount(), 0.0);
+		for (auto zk : chrono.zones)
+			if (zk >= 1 && zk <= area.size())
+				area[zk - 1] += c.dx() * c.dy();
+		for (auto &line : chrono.q)
+			for (size_t k = 0; k < line.size(); ++k)
+				line[k] *= 1e-3 / 3600.0 * area[k];
+	}
+}
+
+json chronologyJson(CaseData::Chronology const &chrono, char const *zonesKey)
+{
+	json lines = json::array();
+	for (size_t l = 0; l < chrono.t.size(); ++l)
+		lines.push_back({chrono.t[l], chrono.q[l]});
+	return {{"zones", zonesKey}, {"lerp", chrono.lerp}, {"chronology", lines}};
+}
+
+json groundwaterJson(CaseData const &c)
+{
+	return {{"datum", c.gw.wolfgpu ? "wolfgpu" : "physical"},
+	        {"kv", "gw_kv"},
+	        {"kh", "gw_kh"},
+	        {"sy", "gw_sy"},
+	        {"z_sub", "gw_z_sub"},
+	        {"h0", "gw_h0"}};
 }
 
 }        // namespace
@@ -299,6 +459,52 @@ json zonesJson(CaseData const &c)
 	return arr;
 }
 
+namespace {
+
+json boundariesJson(CaseData const &c)
+{
+	static char const *sides[4] = {"west", "east", "south", "north"};
+	json               bc;
+	for (int s = 0; s < 4; ++s)
+	{
+		switch (c.bc[s].kind)
+		{
+		case BcKind::Wall: bc[sides[s]] = {"wall"}; break;
+		case BcKind::Inflow: bc[sides[s]] = {"inflow", c.bc[s].value}; break;
+		case BcKind::Level: bc[sides[s]] = {"level", c.bc[s].value}; break;
+		}
+	}
+	return bc;
+}
+
+// Arrays of a saved case (npz): bed, initial depth, optional outside / zone masks
+std::map<std::string, npy::Array> caseArrays(CaseData const &c)
+{
+	std::map<std::string, npy::Array> arrays;
+	arrays["zb"] = npy::makeArray(c.zb, {c.nx, c.ny});
+	arrays["h0"] = npy::makeArray(c.h0, {c.nx, c.ny});
+	if (!c.outside.empty())
+		arrays["outside"] = npy::makeArray(c.outside, {c.nx, c.ny});
+	if (!c.zoneMask.empty())
+		arrays["zones_mask"] = npy::makeArray(c.zoneMask, {c.nx, c.ny});
+	if (c.gw.enabled)
+	{
+		arrays["gw_kv"]    = npy::makeArray(c.gw.kv, {c.nx, c.ny});
+		arrays["gw_kh"]    = npy::makeArray(c.gw.kh, {c.nx, c.ny});
+		arrays["gw_sy"]    = npy::makeArray(c.gw.sy, {c.nx, c.ny});
+		arrays["gw_z_sub"] = npy::makeArray(c.gw.z_sub, {c.nx, c.ny});
+		arrays["gw_h0"]    = npy::makeArray(c.gw.h0, {c.nx, c.ny});
+	}
+	auto zonesF = [&](CaseData::Chronology const &ch) { return std::vector<float>(ch.zones.begin(), ch.zones.end()); };
+	if (c.infiltration.active())
+		arrays["infiltration_zones"] = npy::makeArray(zonesF(c.infiltration), {c.nx, c.ny});
+	if (c.rain.active())
+		arrays["rain_zones"] = npy::makeArray(zonesF(c.rain), {c.nx, c.ny});
+	return arrays;
+}
+
+}        // namespace
+
 GeoOrigin caseOrigin(std::string const &name, std::string const &assetDir)
 {
 	GeoOrigin g;
@@ -332,26 +538,8 @@ void saveImportedCase(CaseData const &c, ImportMetadata const &meta, std::string
 	fs::create_directories(assets / "cases");
 	fs::create_directories(assets / "data");
 
-	std::map<std::string, npy::Array> arrays;
-	arrays["zb"] = npy::makeArray(c.zb, {c.nx, c.ny});
-	arrays["h0"] = npy::makeArray(c.h0, {c.nx, c.ny});
-	if (!c.outside.empty())
-		arrays["outside"] = npy::makeArray(c.outside, {c.nx, c.ny});
-	if (!c.zoneMask.empty())
-		arrays["zones_mask"] = npy::makeArray(c.zoneMask, {c.nx, c.ny});
-	npy::saveNpz(assets / "data" / (c.name + ".npz"), arrays);
+	npy::saveNpz(assets / "data" / (c.name + ".npz"), caseArrays(c));
 
-	static char const *sides[4] = {"west", "east", "south", "north"};
-	json               bc;
-	for (int s = 0; s < 4; ++s)
-	{
-		switch (c.bc[s].kind)
-		{
-		case BcKind::Wall: bc[sides[s]] = {"wall"}; break;
-		case BcKind::Inflow: bc[sides[s]] = {"inflow", c.bc[s].value}; break;
-		case BcKind::Level: bc[sides[s]] = {"level", c.bc[s].value}; break;
-		}
-	}
 	json j{{"label", c.label},
 	       {"type", "imported"},
 	       {"data", "data/" + c.name + ".npz"},
@@ -364,13 +552,20 @@ void saveImportedCase(CaseData const &c, ImportMetadata const &meta, std::string
 	       {"manning_n", c.manning_n},
 	       {"cfl", c.cfl},
 	       {"scheme", c.scheme},
-	       {"bc", bc},
+	       {"drain_passes", c.drain_passes},
+	       {"bc", boundariesJson(c)},
 	       {"render", {{"depth_ref", c.depth_ref}, {"z_scale_0", c.z_scale_0}}},
 	       {"sources", meta.sources},
 	       {"attributions", meta.attributions},
 	       {"zones", zonesJson(c)}};
 	if (!meta.orthoFile.empty())
 		j["orthophoto"] = meta.orthoFile;
+	if (c.gw.enabled)
+		j["groundwater"] = groundwaterJson(c);
+	if (c.infiltration.active())
+		j["infiltration"] = chronologyJson(c.infiltration, "infiltration_zones");
+	if (c.rain.active())
+		j["rain"] = chronologyJson(c.rain, "rain_zones");
 	std::ofstream(assets / "cases" / (c.name + ".json")) << j.dump(2) << '\n';
 }
 
@@ -382,33 +577,24 @@ void updateImportedCase(CaseData const &c, std::string const &assetDir)
 	if (j.value("type", "") != "imported")
 		throw std::runtime_error("only imported cases can be saved in place");
 
-	std::map<std::string, npy::Array> arrays;
-	arrays["zb"] = npy::makeArray(c.zb, {c.nx, c.ny});
-	arrays["h0"] = npy::makeArray(c.h0, {c.nx, c.ny});
-	if (!c.outside.empty())
-		arrays["outside"] = npy::makeArray(c.outside, {c.nx, c.ny});
-	if (!c.zoneMask.empty())
-		arrays["zones_mask"] = npy::makeArray(c.zoneMask, {c.nx, c.ny});
-	npy::saveNpz(assets / j.at("data").get<std::string>(), arrays);
-	j["zones"] = zonesJson(c);
-
-	static char const *sides[4] = {"west", "east", "south", "north"};
-	json               bc;
-	for (int s = 0; s < 4; ++s)
-	{
-		switch (c.bc[s].kind)
-		{
-		case BcKind::Wall: bc[sides[s]] = {"wall"}; break;
-		case BcKind::Inflow: bc[sides[s]] = {"inflow", c.bc[s].value}; break;
-		case BcKind::Level: bc[sides[s]] = {"level", c.bc[s].value}; break;
-		}
-	}
-	j["bc"]        = bc;
+	npy::saveNpz(assets / j.at("data").get<std::string>(), caseArrays(c));
+	j["zones"]     = zonesJson(c);
+	j["bc"]        = boundariesJson(c);
 	j["manning_n"] = c.manning_n;
 	j["cfl"]       = c.cfl;
 	j["scheme"]    = c.scheme;
+	j["drain_passes"] = c.drain_passes;
 	j["eta_0"]     = c.eta_0;
 	j["z_ref"]     = c.z_ref;
+	if (c.gw.enabled)
+		j["groundwater"] = groundwaterJson(c);
+	else
+		j.erase("groundwater");
+	for (auto [key, chrono] : {std::pair{"infiltration", &c.infiltration}, std::pair{"rain", &c.rain}})
+		if (chrono->active())
+			j[key] = chronologyJson(*chrono, std::string(key) == "rain" ? "rain_zones" : "infiltration_zones");
+		else
+			j.erase(key);
 	j["edited"]    = true;
 	std::ofstream(path) << j.dump(2) << '\n';
 }
@@ -463,11 +649,37 @@ CaseData makeCase(std::string const &name, std::string const &assetDir)
 	else
 		throw std::runtime_error("case '" + name + "': unknown type '" + type + "'");
 	readBoundaries(c, j);
+	readGroundwater(c, j, assets);
+	readChronology(c, c.infiltration, "infiltration", j, assets);
+	readChronology(c, c.rain, "rain", j, assets);
 
 	for (float z : c.zb)
 		if (!std::isfinite(z))
 			throw std::runtime_error("case '" + name + "': non-finite bed elevation");
 	return c;
+}
+
+CaseData makeCase(std::string const &name, std::string const &assetDir, CaseOverrides const &overrides)
+{
+	CaseData c = makeCase(name, assetDir);
+	if (!overrides.scheme.empty())
+		c.scheme = overrides.scheme;
+	if (overrides.drainPasses >= 0)
+		c.drain_passes = std::min(overrides.drainPasses, MAX_DRAIN_PASSES);
+	return c;
+}
+
+// --assets, else assets/ next to the executable (packaged application), else in the working directory, else
+// the source tree (development build)
+std::string resolveAssetDir(std::string const &requested)
+{
+	if (!requested.empty())
+		return requested;
+	if (auto next = paths::exeDir() / "assets"; fs::exists(next / "cases"))
+		return next.string();
+	if (fs::exists("assets"))
+		return "assets";
+	return SWE_ASSET_DIR;
 }
 
 }        // namespace swe

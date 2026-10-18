@@ -35,4 +35,21 @@ size_t lowerPolygon(std::vector<float> &zb, GridGeometry const &g, std::vector<X
 
 bool pointInPolygon(std::vector<XY> const &polygon, double x, double y);
 
+// A bed edit drawn on the map: channel along a polyline or lowering of a polygon
+struct BedEdit
+{
+	enum class Type
+	{
+		Channel,
+		Polygon,
+	};
+	Type            type = Type::Channel;
+	std::vector<XY> points;                                               // in the grid's projection
+	double          width = 20.0, depth = 2.0, bankSmoothing = 1.0;        // channel
+	double          dz = 1.0;                                             // polygon: lowering (m)
+};
+
+// Applies `edit` to `zb`; returns the number of modified cells.
+size_t applyBedEdit(std::vector<float> &zb, GridGeometry const &g, BedEdit const &edit);
+
 }        // namespace swe::geo

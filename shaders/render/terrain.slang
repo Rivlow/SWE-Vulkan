@@ -5,6 +5,7 @@ import effects_data;
 import scene;
 import noise;
 import palette;
+import colormap;
 
 struct TerrainVarying
 {
@@ -20,6 +21,8 @@ struct TerrainVarying
     float  wet_mem  : WETMEM;      // wet ground drying slowly
     float  shadow   : SHADOW;      // sun visibility (cast shadows)
     float  ao       : AO;
+    float  gval     : GWVALUE;     // groundwater quantity of the colour map
+    float  head     : GWHEAD;      // water table elevation (contour lines)
 };
 
 [shader("vertex")]
@@ -44,6 +47,9 @@ TerrainVarying terrainVert(uint vid : SV_VertexID)
     o.wet_mem  = wet_mem[vid];
     o.shadow   = shadow[vid];
     o.ao       = ao[vid];
+    bool gw_on = (P.flags & FLAG_GROUNDWATER) != 0;
+    o.gval     = gw_color_mode() ? gw_color_value(vid) : 0.0f;
+    o.head     = gw_on && (SC.flags & SCENE_GW_CONTOURS) != 0 ? gw_head(vid) : 0.0f;
     return o;
 }
 
@@ -121,20 +127,93 @@ float3 terrain_color(TerrainVarying v, float3 n)
 [shader("fragment")]
 float4 terrainFrag(TerrainVarying v) : SV_Target
 {
+    if (cropped_out(v.disp))
+        discard;
     float3 n    = normalize(v.n);
     float3 base = terrain_color(v, n);
+    // groundwater map on the ground (the water above keeps its realistic look)
+    if (gw_color_mode())
+    {
+        float  t   = (v.gval - SC.cmap_min) / max(SC.cmap_max - SC.cmap_min, 1e-12f);
+        float3 map = SC.color_mode == COLOR_GW_EXCHANGE ? diverging(t) : turbo(t);
+        base = lerp(base, map, SC.cmap_opacity);
+    }
+    // contour lines of the water table, constant width on screen
+    if ((SC.flags & SCENE_GW_CONTOURS) != 0 && (P.flags & FLAG_GROUNDWATER) != 0 && SC.gw.x > 0.0f)
+    {
+        float x    = v.head / SC.gw.x;
+        float d    = abs(frac(x + 0.5f) - 0.5f) / max(fwidth(x), 1e-6f);        // distance to a line, in pixels
+        float line = 1.0f - sstep(0.6f, 1.6f, d);
+        bool  major = abs(round(x) - 5.0f * round(x / 5.0f)) < 0.5f;             // every 5th line darker
+        base = lerp(base, float3(0.05f, 0.18f, 0.45f), line * SC.gw.y * (major ? 1.0f : 0.6f));
+    }
     return float4(overlays(light(base, n, SC.sun.xyz, 0.55f, 0.75f, v.ao, v.shadow), v.disp), 1.0f);
 }
 
 // Wireframe overlay ("Maillage"): position only
 [shader("vertex")]
-float4 terrainWireVert(uint vid : SV_VertexID) : SV_Position
+WireVarying terrainWireVert(uint vid : SV_VertexID)
 {
-    return project(display_pos(vid / P.ny, vid % P.ny, zb[vid]));
+    WireVarying o;
+    o.disp = display_pos(vid / P.ny, vid % P.ny, zb[vid]);
+    o.pos  = project(o.disp);
+    return o;
 }
 
 [shader("fragment")]
-float4 wireFrag() : SV_Target
+float4 wireFrag(WireVarying v) : SV_Target
 {
-    return float4(0.08f, 0.10f, 0.12f, 1.0f);
+    if (cropped_out(v.disp))
+        discard;
+    // the lines fade with the size of a cell on screen: far away (cells of a few pixels) the mesh would turn the
+    // whole terrain black. SC.gw.z = focal length in pixels; cell size on screen = focal * cell / distance.
+    float dist   = max(length(v.disp - SC.cam_pos.xyz), 1e-3f);
+    float cellPx = SC.gw.z * min(P.dx, P.dy) * SC.S / dist;
+    float alpha  = 0.85f * smoothstep(3.0f, 14.0f, cellPx);
+    if (alpha < 0.01f)
+        discard;
+    return float4(0.08f, 0.10f, 0.12f, alpha);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Water table seen through the ground (SCENE_GW_XRAY): translucent surface at H = z_sub + h_gw (capped by the
+// ground), drawn without depth test after the ground and before the water
+// ---------------------------------------------------------------------------------------------
+struct TableVarying
+{
+    float4 pos   : SV_Position;
+    float3 disp  : DISP;
+    float  head  : GWHEAD;
+    float  depth : TABLEDEPTH;     // below the ground (m)
+};
+
+[shader("vertex")]
+TableVarying gwTableVert(uint vid : SV_VertexID)
+{
+    float H = min(gw_head(vid), zb[vid]);
+    TableVarying o;
+    o.disp  = display_pos(vid / P.ny, vid % P.ny, H);
+    o.pos   = project(o.disp);
+    o.head  = H;
+    o.depth = zb[vid] - H;
+    return o;
+}
+
+[shader("fragment")]
+float4 gwTableFrag(TableVarying v) : SV_Target
+{
+    if (cropped_out(v.disp))
+        discard;
+    // lighter where the table is close to the ground, contour lines of the table when they are on
+    float3 col = lerp(float3(0.35f, 0.75f, 1.0f), float3(0.05f, 0.25f, 0.75f), saturate(v.depth / max(SC.depth_ref, 1e-3f)));
+    float  a   = 0.45f;
+    if ((SC.flags & SCENE_GW_CONTOURS) != 0 && SC.gw.x > 0.0f)
+    {
+        float x    = v.head / SC.gw.x;
+        float d    = abs(frac(x + 0.5f) - 0.5f) / max(fwidth(x), 1e-6f);
+        float line = 1.0f - sstep(0.6f, 1.6f, d);
+        col = lerp(col, float3(0.02f, 0.08f, 0.3f), line);
+        a   = max(a, 0.8f * line);
+    }
+    return float4(col, a);
 }

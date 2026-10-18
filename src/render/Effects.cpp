@@ -138,6 +138,15 @@ void Effects::setTurbidity(bool on)
 	writeParams();
 }
 
+void Effects::setGroundwaterLines(bool on)
+{
+	if (on == groundwaterLines())
+		return;
+	params_.flags = on ? (params_.flags | EFFECTS_GW_LINES) : (params_.flags & ~EFFECTS_GW_LINES);
+	writeParams();
+	resetLines_ = true;
+}
+
 void Effects::writeParams()
 {
 	// read by in-flight frames: only written with the device idle
