@@ -29,6 +29,13 @@ struct ZoneOption
 	CellRect    rect;
 };
 
+// --bridge i0,j0,i1,j1,z_soffit,deck_thickness (m, soffit in the case's datum: m DNG for imported cases)
+struct BridgeOption
+{
+	CellRect rect;
+	double   zRoof = 0.0, thickness = 1.0;
+};
+
 // --rain / --infiltration i0,j0,i1,j1,mm_per_h: a chronology zone with a constant rate from t = 0
 struct ChronologyZoneOption
 {
@@ -60,6 +67,11 @@ struct Options
 	int         captureFrames  = 120;
 	int         stepsPerFrame  = -1;           // --steps-per-frame (window)
 	bool        showMesh       = false;        // --mesh
+	bool        blocks         = false;        // --blocks: raw cells (flat-topped columns)
+	std::string recordPath;                    // --record <file.swerec>: record h, qx, qy (window and headless)
+	std::string recordDir;                     // --record-dir <dir>: folder of the records (default: records/ next to the exe)
+	double      recordEvery    = 1.0;          // --record-every <s>: simulated seconds between records
+	bool        recordHalf     = false;        // --record-f16: 16-bit cells (h in mm, float16 q) instead of float32
 	float       gwContours     = 0.0f;         // --gw-contours <step>: water table contour lines (m), 0 = off
 	bool        gwXray         = false;        // --gw-xray: water table seen through the ground
 	bool        gwLines        = false;        // --gw-lines: streamlines of the aquifer
@@ -83,13 +95,21 @@ struct Options
 	std::vector<WaterBlockOption> waterBlocks;
 	std::vector<ZoneOption>       zones;
 	std::vector<ChronologyZoneOption> chronologyZones;        // --rain / --infiltration
+	std::vector<BridgeOption>     bridges;                    // --bridge
 	bool                          topView = false;
 	bool        allTiles       = false;        // --all-tiles: compute dry tiles too (reference for the active tiles)
 	int         profileSteps   = 0;            // --profile <n>: GPU time per phase over n more steps (headless)
 	float       zScale         = -1.0f;        // --z-scale (default: case value)
 	bool        help           = false;
 
-	CaseOverrides caseOverrides() const { return {.scheme = scheme, .drainPasses = drainPasses}; }
+	bool        legacyLimiter  = false;        // --legacy-limiter: Venkatakrishnan as in the Python reference (validation)
+	double      hEps = -1.0, hDry = -1.0;      // --h-eps / --h-dry <m>: dry and thin-film thresholds (default: case)
+	bool        reference = false;             // --reference: the Python reference's numerics (tools/validate.py)
+	CaseOverrides caseOverrides() const
+	{
+		return {.scheme = scheme, .drainPasses = drainPasses, .legacyLimiter = legacyLimiter, .reference = reference,
+		        .hEps = hEps, .hDry = hDry};
+	}
 };
 
 // "1.5,2,3" -> {1.5, 2, 3}; throws unless exactly `count` numbers (count = 0: any)
@@ -159,6 +179,10 @@ inline Options parseOptions(int argc, char **argv)
 		else if (a == "--color")             o.colorMode = std::stoi(next(i));
 		else if (a == "--scheme")            o.scheme = next(i);
 		else if (a == "--drain")             o.drainPasses = std::stoi(next(i));
+		else if (a == "--legacy-limiter")    o.legacyLimiter = true;
+		else if (a == "--reference")         o.reference = true;
+		else if (a == "--h-eps")             o.hEps = std::stod(next(i));
+		else if (a == "--h-dry")             o.hDry = std::stod(next(i));
 		else if (a == "--steps")             o.steps = std::stoi(next(i));
 		else if (a == "--time")              o.untilTime = std::stod(next(i));
 		else if (a == "--dump")              o.dumpDir = next(i);
@@ -167,6 +191,11 @@ inline Options parseOptions(int argc, char **argv)
 		else if (a == "--capture-frames")    o.captureFrames = std::stoi(next(i));
 		else if (a == "--steps-per-frame")   o.stepsPerFrame = std::stoi(next(i));
 		else if (a == "--mesh")              o.showMesh = true;
+		else if (a == "--blocks")            o.blocks = true;
+		else if (a == "--record")            o.recordPath = next(i);
+		else if (a == "--record-dir")        o.recordDir = next(i);
+		else if (a == "--record-every")      o.recordEvery = std::stod(next(i));
+		else if (a == "--record-f16")        o.recordHalf = true;
 		else if (a == "--gw-contours")       o.gwContours = std::stof(next(i));
 		else if (a == "--gw-xray")           o.gwXray = true;
 		else if (a == "--gw-lines")          o.gwLines = true;
@@ -231,6 +260,11 @@ inline Options parseOptions(int argc, char **argv)
 		{
 			auto v = parseNumbers(next(i), 5, "--rain / --infiltration i0,j0,i1,j1,mm_per_h");
 			o.chronologyZones.push_back({a == "--rain", parseRect(v, 0), v[4]});
+		}
+		else if (a == "--bridge")
+		{
+			auto v = parseNumbers(next(i), 6, "--bridge i0,j0,i1,j1,z_soffit,thickness");
+			o.bridges.push_back({parseRect(v, 0), v[4], v[5]});
 		}
 		else if (a == "--top")               o.topView = true;
 		else if (a == "--all-tiles")         o.allTiles = true;

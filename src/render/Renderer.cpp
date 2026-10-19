@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <format>
 
 namespace swe {
 
@@ -35,10 +37,13 @@ Renderer::Renderer(vkc::Context const &ctx, Solver const &solver, Effects const 
 	samples_    = (counts & vk::SampleCountFlagBits::e4) ? vk::SampleCountFlagBits::e4 : vk::SampleCountFlagBits::e1;
 
 	auto const graphics = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
-	std::array<vk::DescriptorSetLayoutBinding, 3> bindings{
+	// 0 scene ubo, 1 outside mask, 2 orthophoto, 3 selection bits, 4 face condition flags (scene.slang)
+	std::array<vk::DescriptorSetLayoutBinding, 5> bindings{
 	    vk::DescriptorSetLayoutBinding{.binding = 0, .descriptorType = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1, .stageFlags = graphics},
 	    vk::DescriptorSetLayoutBinding{.binding = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = graphics},
-	    vk::DescriptorSetLayoutBinding{.binding = 2, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = graphics}};
+	    vk::DescriptorSetLayoutBinding{.binding = 2, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = graphics},
+	    vk::DescriptorSetLayoutBinding{.binding = 3, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = graphics},
+	    vk::DescriptorSetLayoutBinding{.binding = 4, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = graphics}};
 	setLayout_ = vk::raii::DescriptorSetLayout(ctx_.device, {.bindingCount = static_cast<uint32_t>(bindings.size()), .pBindings = bindings.data()});
 
 	// set 0 = solver (Q, zb), set 1 = effect fields, set 2 = scene
@@ -47,7 +52,7 @@ Renderer::Renderer(vkc::Context const &ctx, Solver const &solver, Effects const 
 	                                                         .pSetLayouts    = layouts.data()});
 
 	std::array<vk::DescriptorPoolSize, 3> poolSizes{{{vk::DescriptorType::eUniformBuffer, kFrames},
-	                                                 {vk::DescriptorType::eStorageBuffer, kFrames},
+	                                                 {vk::DescriptorType::eStorageBuffer, 3 * kFrames},
 	                                                 {vk::DescriptorType::eCombinedImageSampler, kFrames}}};
 	pool_ = vk::raii::DescriptorPool(ctx_.device, {.flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
 	                                               .maxSets       = kFrames,
@@ -94,31 +99,21 @@ void Renderer::createPipelines()
 	d.fragmentEntry  = "terrainFrag";
 	d.name           = "terrain";
 	terrain_         = vkc::makeGraphicsPipeline(ctx_, d);
+	d.vertexEntry    = "terrainBlockVert";
+	d.name           = "terrain-blocks";
+	terrainBlocks_   = vkc::makeGraphicsPipeline(ctx_, d);
 
-	// wireframe overlays: drawn on top of the filled mesh, slightly pulled towards the camera
-	d.vertexEntry   = "terrainWireVert";
-	d.fragmentEntry = "wireFrag";
-	d.polygonMode   = vk::PolygonMode::eLine;
-	d.depthWrite    = false;
-	d.depthBias     = -1.0f;
-	d.blend         = vkc::Blend::Alpha;        // lines fade with the distance (wireFrag)
-	d.name          = "terrain-wire";
-	terrainWire_    = vkc::makeGraphicsPipeline(ctx_, d);
-	d.vertexModule  = *waterModule_;
-	d.vertexEntry   = "waterWireVert";
-	d.name          = "water-wire";
-	waterWire_      = vkc::makeGraphicsPipeline(ctx_, d);
-
-	d.polygonMode    = vk::PolygonMode::eFill;
-	d.blend          = vkc::Blend::None;
-	d.depthBias      = 0.0f;
-	d.depthWrite     = true;
+	// (the cell boundaries of "Maillage" are drawn per pixel by scene.slang mesh_overlay: no wire pipeline)
+	d.vertexModule   = *waterModule_;
 	d.vertexEntry    = "waterVert";
 	d.fragmentModule = *waterModule_;
 	d.fragmentEntry  = "waterFrag";
 	d.blend          = vkc::Blend::DualSourceMul;
 	d.name           = "water";
 	water_           = vkc::makeGraphicsPipeline(ctx_, d);
+	d.vertexEntry    = "waterBlockVert";
+	d.name           = "water-blocks";
+	waterBlocks_     = vkc::makeGraphicsPipeline(ctx_, d);
 
 	d.blend          = vkc::Blend::None;
 	d.vertexModule   = *skirtModule_;
@@ -127,10 +122,16 @@ void Renderer::createPipelines()
 	d.fragmentEntry  = "skirtBedFrag";
 	d.name           = "skirt-bed";
 	skirtBed_        = vkc::makeGraphicsPipeline(ctx_, d);
+	d.vertexEntry    = "skirtBlockBedVert";
+	d.name           = "skirt-bed-blocks";
+	skirtBedBlocks_  = vkc::makeGraphicsPipeline(ctx_, d);
 	d.vertexEntry    = "skirtWaterVert";
 	d.fragmentEntry  = "skirtFrag";
 	d.name           = "skirt-water";
 	skirtWater_      = vkc::makeGraphicsPipeline(ctx_, d);
+	d.vertexEntry    = "skirtBlockWaterVert";
+	d.name           = "skirt-water-blocks";
+	skirtWaterBlocks_ = vkc::makeGraphicsPipeline(ctx_, d);
 
 	// water table seen through the ground: translucent, no depth test
 	d.vertexModule   = *terrainModule_;
@@ -155,6 +156,38 @@ void Renderer::createPipelines()
 	d.depthWrite     = false;
 	d.name           = "streamlines";
 	lines_           = vkc::makeGraphicsPipeline(ctx_, d);
+}
+
+void Renderer::writeBuffer(uint32_t binding, uint32_t frame, vkc::Buffer const &buffer)
+{
+	auto info = buffer.info();
+	ctx_.device.updateDescriptorSets(vk::WriteDescriptorSet{.dstSet          = *sets_[frame],
+	                                                        .dstBinding      = binding,
+	                                                        .descriptorCount = 1,
+	                                                        .descriptorType  = vk::DescriptorType::eStorageBuffer,
+	                                                        .pBufferInfo     = &info},
+	                                nullptr);
+}
+
+// Per cell, one byte per side: 0 or kind + 1 | group << 3 (scene.slang face_flags)
+void Renderer::setFaceBcs(CaseData const &c)
+{
+	ctx_.device.waitIdle();
+	std::vector<uint32_t> flags(std::max<size_t>(c.cells(), 1), 0u);
+	for (size_t g = 0; g < std::min<size_t>(c.faceBcs.size(), MAX_FACE_BC); ++g)
+		for (uint32_t face : c.faceBcs[g].faces)
+			if (faceCell(face) < c.cells())
+			{
+				uint32_t byte = ((static_cast<uint32_t>(c.faceBcs[g].kind) + 1u) & 7u) | (static_cast<uint32_t>(g) << 3);
+				flags[faceCell(face)] |= byte << (8 * faceSide(face));
+			}
+	if (!faceFlags_ || faceFlags_.size() < flags.size() * sizeof(uint32_t))
+	{
+		faceFlags_ = vkc::Buffer::storage(ctx_, flags.size() * sizeof(uint32_t), "face-flags");
+		for (uint32_t f = 0; f < kFrames; ++f)
+			writeBuffer(4, f, faceFlags_);
+	}
+	faceFlags_.upload(ctx_, flags.data(), flags.size() * sizeof(uint32_t));
 }
 
 void Renderer::writeOrthoDescriptors()
@@ -215,16 +248,17 @@ void Renderer::setCase(CaseData const &c)
 		flags_ |= SCENE_OUTSIDE;
 	outside_ = vkc::Buffer::storage(ctx_, out.size() * sizeof(uint32_t), "outside");
 	outside_.upload(ctx_, out.data(), out.size() * sizeof(uint32_t));
+	// selection bits: host-visible, one buffer per frame in flight, filled by record() when the version changes
+	vk::DeviceSize words = (c.cells() + 31) / 32;
 	for (uint32_t f = 0; f < kFrames; ++f)
 	{
-		auto info = outside_.info();
-		ctx_.device.updateDescriptorSets(vk::WriteDescriptorSet{.dstSet          = *sets_[f],
-		                                                        .dstBinding      = 1,
-		                                                        .descriptorCount = 1,
-		                                                        .descriptorType  = vk::DescriptorType::eStorageBuffer,
-		                                                        .pBufferInfo     = &info},
-		                                nullptr);
+		writeBuffer(1, f, outside_);
+		selection_[f] = vkc::Buffer::host(ctx_, words * sizeof(uint32_t), vk::BufferUsageFlagBits::eStorageBuffer, std::format("selection-{}", f));
+		std::memset(selection_[f].mapped(), 0, selection_[f].size());
+		selectionVersion_[f] = 0;
+		writeBuffer(3, f, selection_[f]);
 	}
+	setFaceBcs(c);
 
 	indexCount_       = static_cast<uint32_t>(idx.size());
 	indices_          = vkc::Buffer(ctx_, idx.size() * sizeof(uint32_t),
@@ -294,7 +328,27 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 		sp.flags |= SCENE_GW_XRAY;
 	uint32_t skirtVertices = 2 * ((crop.z - crop.x + 1) + (crop.w - crop.y + 1)) * 6;
 	sp.ortho_mix       = settings.orthoMix;
-	sp.sel             = settings.selection;
+	// selection: the bits of this frame's buffer follow the application's version
+	if (settings.selectionVersion != selectionVersion_[frame] && selection_[frame])
+	{
+		auto  *dst   = static_cast<uint32_t *>(selection_[frame].mapped());
+		size_t words = selection_[frame].size() / sizeof(uint32_t);
+		size_t n     = std::min(words, settings.selectionBits.size());
+		if (n > 0)
+			std::memcpy(dst, settings.selectionBits.data(), n * sizeof(uint32_t));
+		if (n < words)
+			std::memset(dst + n, 0, (words - n) * sizeof(uint32_t));
+		selectionVersion_[frame] = settings.selectionVersion;
+	}
+	if (!settings.selectionBits.empty())
+		sp.flags |= SCENE_SELECTION;
+	if (settings.showBorders)
+		sp.flags |= SCENE_BORDERS;
+	if (settings.showMesh)
+		sp.flags |= SCENE_MESH;
+	if (settings.blocks)
+		sp.flags |= SCENE_BLOCKS;
+	sp.sel             = glm::uvec4(settings.hoverCell.x, settings.hoverCell.y, 0u, settings.highlight);
 	sp.color_mode      = static_cast<uint32_t>(settings.colorMode);
 	sp.cmap_min        = settings.cmapMin;
 	sp.cmap_max        = settings.cmapMax;
@@ -346,31 +400,34 @@ void Renderer::record(vk::raii::CommandBuffer const &cb, uint32_t frame, vk::Ima
 	cb.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipelineLayout_, 0, sets, nullptr);
 	cb.bindIndexBuffer(indices_.handle(), 0, vk::IndexType::eUint32);
 
-	cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *terrain_);
-	cb.drawIndexed(indexCount_, 1, 0, 0, 0);
-	cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *skirtBed_);
+	// raw cells: 18 vertices per cell, no index buffer (scene.slang block_vertex)
+	bool     blocks     = settings.blocks;
+	uint32_t blockVerts = 18u * nx_ * ny_;
+	auto     drawSurface = [&](vk::raii::Pipeline const &mesh, vk::raii::Pipeline const &block) {
+        if (blocks)
+        {
+            cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *block);
+            cb.draw(blockVerts, 1, 0, 0);
+        }
+        else
+        {
+            cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *mesh);
+            cb.drawIndexed(indexCount_, 1, 0, 0, 0);
+        }
+	};
+	drawSurface(terrain_, terrainBlocks_);
+	cb.bindPipeline(vk::PipelineBindPoint::eGraphics, blocks ? *skirtBedBlocks_ : *skirtBed_);
 	cb.draw(skirtVertices, 1, 0, 0);
 	if ((sp.flags & SCENE_GW_XRAY) != 0)
 	{
 		cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *gwTable_);
 		cb.drawIndexed(indexCount_, 1, 0, 0, 0);
 	}
-	if (settings.showMesh)
-	{
-		cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *terrainWire_);
-		cb.drawIndexed(indexCount_, 1, 0, 0, 0);
-	}
 	if (settings.showWater)
 	{
-		cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *skirtWater_);
+		cb.bindPipeline(vk::PipelineBindPoint::eGraphics, blocks ? *skirtWaterBlocks_ : *skirtWater_);
 		cb.draw(skirtVertices, 1, 0, 0);
-		cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *water_);
-		cb.drawIndexed(indexCount_, 1, 0, 0, 0);
-		if (settings.showMesh)
-		{
-			cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *waterWire_);
-			cb.drawIndexed(indexCount_, 1, 0, 0, 0);
-		}
+		drawSurface(water_, waterBlocks_);
 		if (settings.showLines)
 		{
 			cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *lines_);

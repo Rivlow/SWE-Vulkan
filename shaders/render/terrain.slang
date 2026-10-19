@@ -23,7 +23,46 @@ struct TerrainVarying
     float  ao       : AO;
     float  gval     : GWVALUE;     // groundwater quantity of the colour map
     float  head     : GWHEAD;      // water table elevation (contour lines)
+    nointerpolation uint2 block : BLOCK;   // raw cells: (owner cell, side + 1) of a wall, (0, 0) otherwise
 };
+
+// Attributes of cell k shared by the mesh and the block vertices
+void cell_attributes(uint k, inout TerrainVarying o)
+{
+    o.z        = zb[k];
+    o.wet      = wet[k];
+    o.wet_blur = wet_blur[k];
+    o.out      = outside_at(k);
+    o.flooded  = flooded[k];
+    o.wet_mem  = wet_mem[k];
+    o.shadow   = shadow[k];
+    o.ao       = ao[k];
+    bool gw_on = (P.flags & FLAG_GROUNDWATER) != 0;
+    o.gval     = gw_color_mode() ? gw_color_value(k) : 0.0f;
+    o.head     = gw_on && (SC.flags & SCENE_GW_CONTOURS) != 0 ? gw_head(k) : 0.0f;
+}
+
+// Raw cells: flat-topped columns of the bed (18 vertices per cell, see scene.slang block_vertex)
+[shader("vertex")]
+TerrainVarying terrainBlockVert(uint vid : SV_VertexID)
+{
+    uint  cell = vid / 18;
+    uint  i = cell / P.ny, j = cell % P.ny;
+    bool  has_east = i + 1 < P.nx, has_north = j + 1 < P.ny;
+    float z0 = zb[cell];
+    float ze = has_east ? zb[cell + P.ny] : z0, zn = has_north ? zb[cell + 1] : z0;
+    BlockVertex b = block_vertex(vid, cell, z0, ze, has_east, zn, has_north, false);
+
+    TerrainVarying o;
+    o.disp  = b.disp;
+    o.pos   = project(o.disp);
+    o.n     = b.n;
+    o.slope = 0.0f;
+    cell_attributes(b.owner, o);
+    o.z     = b.wall ? zb[b.owner] : z0;
+    o.block = uint2(b.owner, b.wall ? b.side + 1 : 0);
+    return o;
+}
 
 [shader("vertex")]
 TerrainVarying terrainVert(uint vid : SV_VertexID)
@@ -39,17 +78,8 @@ TerrainVarying terrainVert(uint vid : SV_VertexID)
     o.pos      = project(o.disp);
     o.n        = float3(-dzx, 1.0f, dzy);      // Z = -y
     o.slope    = sqrt(dzx * dzx + dzy * dzy) / SC.z_scale;
-    o.z        = z;
-    o.wet      = wet[vid];
-    o.wet_blur = wet_blur[vid];
-    o.out      = outside_at(vid);
-    o.flooded  = flooded[vid];
-    o.wet_mem  = wet_mem[vid];
-    o.shadow   = shadow[vid];
-    o.ao       = ao[vid];
-    bool gw_on = (P.flags & FLAG_GROUNDWATER) != 0;
-    o.gval     = gw_color_mode() ? gw_color_value(vid) : 0.0f;
-    o.head     = gw_on && (SC.flags & SCENE_GW_CONTOURS) != 0 ? gw_head(vid) : 0.0f;
+    cell_attributes(vid, o);
+    o.block    = uint2(0, 0);
     return o;
 }
 
@@ -147,32 +177,8 @@ float4 terrainFrag(TerrainVarying v) : SV_Target
         bool  major = abs(round(x) - 5.0f * round(x / 5.0f)) < 0.5f;             // every 5th line darker
         base = lerp(base, float3(0.05f, 0.18f, 0.45f), line * SC.gw.y * (major ? 1.0f : 0.6f));
     }
-    return float4(overlays(light(base, n, SC.sun.xyz, 0.55f, 0.75f, v.ao, v.shadow), v.disp), 1.0f);
-}
-
-// Wireframe overlay ("Maillage"): position only
-[shader("vertex")]
-WireVarying terrainWireVert(uint vid : SV_VertexID)
-{
-    WireVarying o;
-    o.disp = display_pos(vid / P.ny, vid % P.ny, zb[vid]);
-    o.pos  = project(o.disp);
-    return o;
-}
-
-[shader("fragment")]
-float4 wireFrag(WireVarying v) : SV_Target
-{
-    if (cropped_out(v.disp))
-        discard;
-    // the lines fade with the size of a cell on screen: far away (cells of a few pixels) the mesh would turn the
-    // whole terrain black. SC.gw.z = focal length in pixels; cell size on screen = focal * cell / distance.
-    float dist   = max(length(v.disp - SC.cam_pos.xyz), 1e-3f);
-    float cellPx = SC.gw.z * min(P.dx, P.dy) * SC.S / dist;
-    float alpha  = 0.85f * smoothstep(3.0f, 14.0f, cellPx);
-    if (alpha < 0.01f)
-        discard;
-    return float4(0.08f, 0.10f, 0.12f, alpha);
+    float3 lit = light(base, n, SC.sun.xyz, 0.55f, 0.75f, v.ao, v.shadow);
+    return float4(v.block.y != 0 ? wall_overlays(lit, v.block.x, v.block.y - 1) : overlays(lit, v.disp), 1.0f);
 }
 
 // ---------------------------------------------------------------------------------------------

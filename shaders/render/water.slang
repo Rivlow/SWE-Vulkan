@@ -24,6 +24,7 @@ struct WaterVarying
     float  shadow   : SHADOW;
     float  ao       : AO;
     float  cval     : CMAPVALUE;   // quantity shown by the colour map
+    nointerpolation uint2 block : BLOCK;   // raw cells: (owner cell, side + 1) of a wall, (0, 0) otherwise
 };
 
 // colour map of a surface quantity (groundwater quantities colour the ground, the water stays realistic)
@@ -85,17 +86,51 @@ WaterVarying waterVert(uint vid : SV_VertexID)
     o.shadow   = shadow[vid];
     o.ao       = ao[vid];
     o.cval     = water_color_mode() ? colormap_value(vid, h) : 0.0f;
+    o.block    = uint2(0, 0);
     return o;
 }
 
-// Wireframe overlay ("Maillage"): same surface as waterVert, position only (fragment: terrain.slang wireFrag)
-[shader("vertex")]
-WireVarying waterWireVert(uint vid : SV_VertexID)
+// Top of the water column of cell k: its free surface when wet, else its bed
+float column_top(uint k)
 {
-    WaterVarying w = waterVert(vid);
-    WireVarying  o;
-    o.pos  = w.pos;
-    o.disp = w.disp;
+    float h = Q[k].x;
+    return zb[k] + (h >= 1e-3f ? h : 0.0f);
+}
+
+// Raw cells: flat water columns from the bed to the free surface (18 vertices per cell, scene.slang
+// block_vertex). The top of a column is its free surface when wet, else its bed (so a wall between a wet cell
+// and a dry one goes down to the dry bed); dry tops are collapsed.
+[shader("vertex")]
+WaterVarying waterBlockVert(uint vid : SV_VertexID)
+{
+    uint  cell = vid / 18;
+    uint  i = cell / P.ny, j = cell % P.ny;
+    bool  has_east = i + 1 < P.nx, has_north = j + 1 < P.ny;
+    float z0 = column_top(cell);
+    float ze = has_east ? column_top(cell + P.ny) : z0, zn = has_north ? column_top(cell + 1) : z0;
+    bool  wet0 = Q[cell].x >= 1e-3f;
+    bool  wete = has_east && Q[cell + P.ny].x >= 1e-3f, wetn = has_north && Q[cell + 1].x >= 1e-3f;
+    // walls only next to water, and only for real steps: between two wet cells the free surface differs by a
+    // few millimetres almost everywhere, and those slivers would tile the water with shaded lines
+    float eps = 2e-3f;
+    bool  stepe = (wet0 || wete) && !(wet0 && wete && abs(ze - z0) < eps);
+    bool  stepn = (wet0 || wetn) && !(wet0 && wetn && abs(zn - z0) < eps);
+    BlockVertex b = block_vertex(vid, cell, z0, stepe ? ze : z0, has_east, stepn ? zn : z0, has_north, !wet0);
+    uint  k = b.owner;
+    float h = Q[k].x;
+
+    WaterVarying o;
+    o.disp     = b.disp;
+    o.pos      = project(o.disp);
+    o.n        = b.n;
+    o.h        = h;
+    o.wet_blur = wet_blur[k];
+    o.foam     = foam[k];
+    o.turb     = turb[k];
+    o.shadow   = shadow[k];
+    o.ao       = ao[k];
+    o.cval     = water_color_mode() ? colormap_value(k, h) : 0.0f;
+    o.block    = uint2(k, b.wall ? b.side + 1 : 0);
     return o;
 }
 
@@ -112,6 +147,9 @@ WaterOut waterFrag(WaterVarying v)
         discard;
     float3 sun = SC.sun.xyz;
     float3 n   = normalize(v.n);
+    // block walls are seen from either side: face the camera
+    if (v.block.y != 0 && dot(n, SC.cam_pos.xyz - v.disp) < 0.0f)
+        n = -n;
     float  h   = max(v.h, 0.0f);
     float  ao = v.ao, sun_vis = v.shadow;
 
@@ -163,11 +201,11 @@ WaterOut waterFrag(WaterVarying v)
     //     = bed * K + B
     float3 K = (1.0f - fm) * (1.0f - fres) * shade * (1.0f - opacity) * min(bed_tint + SHALLOW, 1.0f);
     float3 B = (1.0f - fm) * ((1.0f - fres) * shade * opacity * tint + fres * SKY + glint) + fm * foam_col;
-    // selection / zone overlays on the water too (applied to the additive part)
-    int2 c = cell_of(v.disp);
-    if (in_selection(c) || zone_tint(c).a > 0.0f)
+    // selection / borders / zone overlays on the water too (applied to the additive part, where they change it)
+    float3 base = B + K * 0.5f;
+    float3 over = v.block.y != 0 ? wall_overlays(base, v.block.x, v.block.y - 1) : overlays(base, v.disp);
+    if (any(over != base))
     {
-        float3 over = overlays(B + K * 0.5f, v.disp);
         B = over;
         K = K * 0.3f;
     }

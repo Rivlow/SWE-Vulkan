@@ -24,8 +24,12 @@ struct CaseData
 	// physics / numerics (main.py defaults)
 	double      g         = 9.81;
 	double      cfl       = 0.4;
-	double      h_eps     = 1e-4;
-	double      h_dry     = 1e-3;
+	// Dry threshold (momentum cut, constant reconstruction) and thin-film threshold (desingularised velocity).
+	// main.py used 1e-4 / 1e-3 m: the thin film braked the tip of a flood wave, e.g. the Ritter dam break front
+	// stayed ~3.5 m behind (at t = 4 s) whatever dx. 1e-6 / 1e-5 m: the front converges to the exact one, at no
+	// cost on the time step (same dt on rain runoff over a DTM, vesdre, dam break). "h_eps" / "h_dry" in a case.
+	double      h_eps     = 1e-6;
+	double      h_dry     = 1e-5;
 	double      manning_n = 0.0;
 	std::string scheme    = "ssprk2";
 	// drain limiter: Jacobi passes per stage (0 = off: h < 0 is clamped, which creates mass)
@@ -34,6 +38,13 @@ struct CaseData
 	// inflow sides: false = mass flux exactly the imposed discharge (default); true = HLLC flux of the ghost
 	// state as in the Python reference (used to validate against it)
 	bool legacyInflow = false;
+	// Venkatakrishnan limiter: false = increment to the face (phi = 1 on linear data, the limiter of the paper);
+	// true = the Python reference's, fed the increment to the neighbour (phi = 0.75 on linear data: every slope cut
+	// by a quarter, fronts slowed), kept to validate against it
+	bool legacyLimiter = false;
+	// Python reference mode (tools/validate.py): its limiter, thresholds (1e-4 / 1e-3 m), still-water depths by plain
+	// subtraction and depth updates without the carry of the rounding residual
+	bool reference = false;
 
 	// rendering hints
 	double eta_0     = 1.0;
@@ -55,6 +66,19 @@ struct CaseData
 	};
 	std::vector<ZoneDef>  zones;
 	std::vector<uint8_t>  zoneMask;
+
+	// Weak boundary conditions on cell faces (WOLF-style): a group is a set of faces (cell * 4 + side, see
+	// CaseTypes.h) that behaves like a domain border for the cell that owns it: its flux is the HLLC flux against a
+	// ghost state built from the condition (wall, total inflow discharge spread like a side inflow, imposed level or
+	// depth, free outflow); the cell on the other side of an interior face sees a wall.
+	struct FaceBcDef
+	{
+		BcKind                kind  = BcKind::Wall;
+		double                value = 0.0;        // m3/s (inflow), level relative to z_ref (level), depth (depth)
+		std::string           label;
+		std::vector<uint32_t> faces;
+	};
+	std::vector<FaceBcDef> faceBcs;
 
 	// Unconfined aquifer under the surface (wolfgpu's groundwater layer): vertical Darcy exchange with the
 	// surface water, lateral Boussinesq flow. Per-cell arrays, all of size cells() when enabled.
@@ -85,6 +109,23 @@ struct CaseData
 		size_t zoneCount() const { return q.empty() ? 0 : q[0].size(); }
 	};
 	Chronology infiltration, rain;
+
+	// Bridges (shaders/solver/bridge.slang): a deck over some cells, its soffit and its top (elevations relative to
+	// z_ref). Free surface under it, pressurised flow once the water reaches the soffit, overtopping above the top.
+	// The per-cell arrays (NaN = no bridge) are what the solver uses; `bridges` lists the decks for the GUI / JSON.
+	struct BridgeDef
+	{
+		std::string label;
+		double      zRoof = 0.0, zDeck = 0.0;        // soffit, deck top (relative to z_ref)
+		CellMask    cells;                           // cells under the deck
+	};
+	std::vector<BridgeDef> bridges;
+	std::vector<float>     bridgeRoof, bridgeDeck;  // per cell, NaN where there is no bridge (empty = none)
+	double                 bridgeSlot = 0.05;       // Preissmann slot of the pressurised cells (relative width)
+	bool   hasBridges() const { return !bridgeRoof.empty(); }
+	void   rebuildBridgeArrays();                   // from `bridges`
+	// Water held by a cell of depth h (piezometric): the stored depth under a bridge, h elsewhere
+	double storedDepth(size_t k, double h) const;
 
 	size_t cells() const { return size_t(nx) * ny; }
 	size_t index(uint32_t i, uint32_t j) const { return size_t(i) * ny + j; }

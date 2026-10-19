@@ -23,6 +23,9 @@ struct CaseOverrides
 {
 	std::string scheme;               // empty = case value
 	int         drainPasses = -1;     // < 0 = case value
+	bool        legacyLimiter = false; // --legacy-limiter: Venkatakrishnan limiter of the Python reference
+	bool        reference = false;     // --reference: everything as the Python reference (validation, see CaseData)
+	double      hEps = -1.0, hDry = -1.0;        // --h-eps / --h-dry (m), < 0 = case value
 };
 CaseData makeCase(std::string const &name, std::string const &assetDir, CaseOverrides const &overrides);
 

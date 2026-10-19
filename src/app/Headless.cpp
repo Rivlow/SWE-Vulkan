@@ -6,15 +6,19 @@
 #include "geo/TerrainBuilder.h"
 #include "geo/Tiles.h"
 #include "sim/Import.h"
+#include "sim/Recorder.h"
 #include "sim/Session.h"
 #include "util/Log.h"
+#include "util/Paths.h"
 #include "vk/Context.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <limits>
 
@@ -26,6 +30,11 @@ void applyCaseEdits(Session &session, Options const &opts)
 		session.editWater(w.rect, WaterEdit::Depth, w.depth, true);
 	for (auto const &z : opts.zones)
 		session.addZone(z.rect, z.kind, z.kind == ZoneKind::Level ? z.value - session.caseData().z_ref : z.value, z.name);
+	for (auto const &b : opts.bridges)
+	{
+		double zr = b.zRoof - session.caseData().z_ref;
+		session.addBridge(session.maskOf(b.rect), zr, zr + b.thickness, "pont");
+	}
 	for (auto const &z : opts.chronologyZones)
 	{
 		auto const &c    = session.caseData();
@@ -45,8 +54,45 @@ int runHeadless(Options const &opts, vkc::Context const &ctx)
 	auto const &data   = session.caseData();
 	auto       &solver = session.solver();
 
+	// --record / --record-dir: h, qx, qy every --record-every simulated seconds, taken between two batches of
+	// steps (synchronous snapshots: the first at t = 0, then the first state past each multiple of the interval)
+	Recorder recorder(ctx, solver);
+	if (!opts.recordPath.empty() || !opts.recordDir.empty())
+	{
+		std::filesystem::path path = opts.recordPath;
+		if (path.empty())
+			path = std::filesystem::path(opts.recordDir) /
+			       std::format("{}_{:%Y%m%d_%H%M%S}.swerec", data.name,
+			                   std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()));
+		if (!recorder.start(path, data, opts.recordEvery, opts.recordHalf))
+			return 1;
+	}
+	// Runs `steps` steps; with a recording, in batches that stop at the next snapshot time (estimated with the
+	// current dt, which may grow within a batch: the snapshot is then a little past the multiple, like the
+	// window mode takes it at the first frame past it)
+	auto advance = [&](uint32_t steps) {
+		if (!recorder.active())
+		{
+			solver.run(steps);
+			return;
+		}
+		while (steps > 0)
+		{
+			auto s = solver.scalarsSync();
+			if (!std::isfinite(s.t))
+				return;
+			if (recorder.due(s.t))
+				recorder.snapshotNow(s.t);
+			double   left = s.dt > 0.0f ? (recorder.nextTime() - s.t) / s.dt : 1.0;        // no step yet: dt unknown
+			uint32_t n    = static_cast<uint32_t>(std::clamp(std::ceil(left), 1.0, 2000.0));
+			n             = std::min(n, steps);
+			solver.run(n);
+			steps -= n;
+		}
+	};
+
 	auto t0 = std::chrono::steady_clock::now();
-	solver.run(static_cast<uint32_t>(std::max(opts.steps, 0)));
+	advance(static_cast<uint32_t>(std::max(opts.steps, 0)));
 	if (opts.untilTime > 0.0)
 	{
 		// batches of a quarter of the steps left at the current time step (dt may grow within a batch), single
@@ -54,12 +100,18 @@ int runHeadless(Options const &opts, vkc::Context const &ctx)
 		for (auto s = solver.scalarsSync(); s.t < opts.untilTime && std::isfinite(s.t); s = solver.scalarsSync())
 		{
 			double left = s.dt > 0.0f ? (opts.untilTime - s.t) / s.dt : 1.0;        // no step yet: dt unknown
-			solver.run(static_cast<uint32_t>(std::clamp(0.25 * left, 1.0, 2000.0)));
+			advance(static_cast<uint32_t>(std::clamp(0.25 * left, 1.0, 2000.0)));
 		}
 	}
 	double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
 	auto s = solver.scalarsSync();
+	if (recorder.active())
+	{
+		if (recorder.due(s.t))
+			recorder.snapshotNow(s.t);        // the final state when a snapshot is due
+		recorder.stop();
+	}
 	log::info("{} steps in {:.3f} s ({:.1f} us/step, {:.1f} Mcell-steps/s): t = {:.6f} s, dt = {:.4e} s, s_max = {:.4f} m/s",
 	          s.n_steps, seconds, opts.steps > 0 ? 1e6 * seconds / opts.steps : 0.0,
 	          seconds > 0 ? double(data.cells()) * opts.steps / seconds * 1e-6 : 0.0, s.t, s.dt, s.s_max);
@@ -70,8 +122,8 @@ int runHeadless(Options const &opts, vkc::Context const &ctx)
 	double volume0 = 0.0, volume = 0.0, hMin = std::numeric_limits<double>::infinity();
 	for (size_t k = 0; k < data.cells(); ++k)
 	{
-		volume0 += data.h0[k];
-		volume += state[3 * k];
+		volume0 += data.storedDepth(k, data.h0[k]);        // physical water: stored depth under bridges
+		volume += data.storedDepth(k, state[3 * k]);
 		hMin = std::min<double>(hMin, state[3 * k]);
 	}
 	volume0 *= cellArea;
@@ -80,6 +132,17 @@ int runHeadless(Options const &opts, vkc::Context const &ctx)
 	          data.drain_passes, s.limitedCells, s.clampCells, s.clampMax, hMin);
 	log::info("volume: {:.6f} m3 -> {:.6f} m3 ({:+.3e} relative)", volume0, volume,
 	          volume0 > 0.0 ? (volume - volume0) / volume0 : 0.0);
+	// exact balance of the open boundaries and zones: V - V0 - (what they added) is round-off only
+	{
+		static char const *sides[4] = {"west", "east", "south", "north"};
+		for (int k = 0; k < 4; ++k)
+			if (s.boundaryVolume[k] != 0.0)
+				log::info("  {} side: {:+.6f} m3", sides[k], s.boundaryVolume[k]);
+		for (size_t g = 0; g < data.faceBcs.size() && g < MAX_FACE_BC; ++g)
+			log::info("  face group {} '{}': {:+.6f} m3", g, data.faceBcs[g].label, s.boundaryVolume[4 + g]);
+		for (size_t z = 0; z < data.zones.size() && z < MAX_ZONES; ++z)
+			log::info("  zone {} '{}': {:+.6f} m3", z, data.zones[z].label, s.zoneVolume[z]);
+	}
 
 	// groundwater: surface + aquifer is conserved (no rain, walls), infiltration / exfiltration explain the transfer
 	auto   gwState = solver.groundwaterSync();
@@ -121,6 +184,10 @@ int runHeadless(Options const &opts, vkc::Context const &ctx)
 		          "surface change - (exfil - infil) - added = {:+.3e} m3",
 		          total0, total, (total - total0) / std::max(total0, volume + gwVolume), (volume - volume0) - (exfil - infil) - srcNet);
 	}
+	// surface balance: what the boundaries, zones and chronologies added, minus what the aquifer took
+	double addedTotal = s.boundaryTotal() + srcNet - (infil - exfil);
+	log::info("balance: V - V0 - (boundaries + zones + chronologies - net infiltration) = {:+.6e} m3 ({:+.3e} relative)",
+	          volume - volume0 - addedTotal, (volume - volume0 - addedTotal) / std::max({volume0, volume, std::abs(addedTotal), 1e-30}));
 	uint32_t activeTiles = solver.activeTilesSync();
 	log::info("active tiles on the last step: {} / {} ({:.1f} %)", activeTiles, solver.tileCount(),
 	          100.0 * activeTiles / std::max(solver.tileCount(), 1u));
@@ -150,6 +217,9 @@ int runHeadless(Options const &opts, vkc::Context const &ctx)
 		                    {"steps", s.n_steps},
 		                    {"nx", data.nx},
 		                    {"ny", data.ny},
+		                    {"dx", data.dx()},
+		                    {"dy", data.dy()},
+		                    {"z_ref", data.z_ref},
 		                    {"t", s.t},
 		                    {"dt", s.dt},
 		                    {"s_max", s.s_max},
@@ -159,7 +229,11 @@ int runHeadless(Options const &opts, vkc::Context const &ctx)
 		                    {"limited_cells", s.limitedCells},
 		                    {"clamp_cells", s.clampCells},
 		                    {"clamp_max", s.clampMax},
-		                    {"device", ctx.properties.deviceName.data()}};
+		                    {"device", ctx.properties.deviceName.data()},
+		                    {"boundary_volume", s.boundaryVolume},        // sides W E S N, then face groups (m3, > 0 = in)
+		                    {"zone_volume", s.zoneVolume},
+		                    {"boundary_total", s.boundaryTotal()},
+		                    {"added_total", addedTotal}};        // + chronologies - net infiltration to the aquifer
 		if (!gwState.empty())
 		{
 			npy::save(dir / "gw.npy", {data.nx, data.ny, 4}, gwState);

@@ -13,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <stdexcept>
 
 namespace swe {
@@ -41,9 +42,12 @@ void readCommon(CaseData &c, json const &j)
 	c.label     = j.value("label", c.name);
 	c.manning_n = j.value("manning_n", 0.0);
 	c.cfl       = j.value("cfl", 0.4);
+	c.h_eps     = j.value("h_eps", c.h_eps);        // dry threshold (m): momentum cut below
+	c.h_dry     = j.value("h_dry", c.h_dry);        // thin-film threshold (m): desingularised velocity below
 	c.scheme    = j.value("scheme", std::string("ssprk2"));
 	c.drain_passes = std::clamp(j.value("drain_passes", 4), 0, MAX_DRAIN_PASSES);
 	c.legacyInflow = j.value("legacy_inflow", false);
+	c.legacyLimiter = j.value("legacy_limiter", false);
 	if (j.contains("render"))
 	{
 		c.depth_ref = j["render"].value("depth_ref", 1.0);
@@ -51,7 +55,7 @@ void readCommon(CaseData &c, json const &j)
 	}
 }
 
-// "bc": {"west": ["wall"], "south": ["inflow", 600], "north": ["level", 58.5 | "eta_0"]}
+// "bc": {"west": ["wall"], "south": ["inflow", 600], "north": ["level", 58.5 | "eta_0"], "east": ["free"]}
 void readBoundaries(CaseData &c, json const &j)
 {
 	static char const *sides[4] = {"west", "east", "south", "north"};
@@ -71,6 +75,10 @@ void readBoundaries(CaseData &c, json const &j)
 			c.bc[s].kind  = BcKind::Level;
 			c.bc[s].value = b.at(1).is_string() && b.at(1) == "eta_0" ? c.eta_0 : b.at(1).get<double>();
 		}
+		else if (kind == "free")
+			c.bc[s].kind = BcKind::Free;
+		else if (kind == "depth")
+			c.bc[s] = {BcKind::Depth, b.at(1).get<double>()};
 		else
 			throw std::runtime_error("unknown boundary condition '" + kind + "' (" + c.name + ")");
 	}
@@ -109,7 +117,7 @@ void buildBump(CaseData &c, json const &j, bool damBreak)
 			auto  k  = size_t(i) * c.ny + jj;
 			c.zb[k]  = z;
 			if (!damBreak || x < half)
-				c.h0[k] = std::max(eta0 - z, 0.0f);
+				c.h0[k] = c.reference ? std::max(eta0 - z, 0.0f) : depthForLevel(eta0, z);
 		}
 }
 
@@ -140,7 +148,7 @@ void buildRiver(CaseData &c, json const &j, fs::path const &assets)
 	for (size_t k = 0; k < c.cells(); ++k)
 	{
 		c.zb[k] = (std::isnan(zRaw[k]) ? wallZ : zRaw[k]) - zRef;
-		c.h0[k] = std::max(eta0 - c.zb[k], 0.0f);
+		c.h0[k] = c.reference ? std::max(eta0 - c.zb[k], 0.0f) : depthForLevel(eta0, c.zb[k]);
 	}
 }
 
@@ -191,7 +199,7 @@ void buildDtmLake(CaseData &c, json const &j, fs::path const &assets)
 	{
 		c.zb[k] = zFill[k] - zRef;
 		if (basin[k] == lakeBasin && zRaw[k] < lake)        // NaN compares false
-			c.h0[k] = lake - zRaw[k];
+			c.h0[k] = c.reference ? lake - zRaw[k] : depthForLevel(float(c.eta_0), c.zb[k]);        // flat to the bit
 	}
 
 	// outlet: lowest cell of the basin and its neighbours inside the basin (~ +-refine cells), as a Sink zone
@@ -227,8 +235,9 @@ void buildImported(CaseData &c, json const &j, fs::path const &assets)
 		c.epsg = std::stoi(crs.substr(5));
 	c.zb    = zb.asFloat();
 	c.h0    = npz.count("h0") ? npz.at("h0").asFloat() : std::vector<float>(c.cells(), 0.0f);
-	c.hu0.assign(c.cells(), 0.0f);
-	c.hv0.assign(c.cells(), 0.0f);
+	// initial unit discharges (tests: uniform flow at t = 0), zero when absent
+	c.hu0   = npz.count("hu0") ? npz.at("hu0").asFloat() : std::vector<float>(c.cells(), 0.0f);
+	c.hv0   = npz.count("hv0") ? npz.at("hv0").asFloat() : std::vector<float>(c.cells(), 0.0f);
 	if (npz.count("outside"))
 	{
 		auto o = npz.at("outside").asFloat();
@@ -238,7 +247,8 @@ void buildImported(CaseData &c, json const &j, fs::path const &assets)
 		if (std::ranges::none_of(c.outside, [](uint8_t v) { return v; }))
 			c.outside.clear();
 	}
-	if (c.h0.size() != c.cells() || (!c.outside.empty() && c.outside.size() != c.cells()))
+	if (c.h0.size() != c.cells() || c.hu0.size() != c.cells() || c.hv0.size() != c.cells() ||
+	    (!c.outside.empty() && c.outside.size() != c.cells()))
 		throw std::runtime_error("imported: inconsistent array sizes");
 	readZones(c, j, npz);
 }
@@ -472,9 +482,106 @@ json boundariesJson(CaseData const &c)
 		case BcKind::Wall: bc[sides[s]] = {"wall"}; break;
 		case BcKind::Inflow: bc[sides[s]] = {"inflow", c.bc[s].value}; break;
 		case BcKind::Level: bc[sides[s]] = {"level", c.bc[s].value}; break;
+		case BcKind::Free: bc[sides[s]] = {"free"}; break;
+		case BcKind::Depth: bc[sides[s]] = {"depth", c.bc[s].value}; break;
 		}
 	}
 	return bc;
+}
+
+char const *bcKindName(BcKind k)
+{
+	switch (k)
+	{
+	case BcKind::Inflow: return "inflow";
+	case BcKind::Level: return "level";
+	case BcKind::Free: return "free";
+	case BcKind::Depth: return "depth";
+	default: return "wall";
+	}
+}
+
+std::optional<BcKind> bcKindOf(std::string const &name)
+{
+	for (auto k : {BcKind::Wall, BcKind::Inflow, BcKind::Level, BcKind::Free, BcKind::Depth})
+		if (name == bcKindName(k))
+			return k;
+	return std::nullopt;
+}
+
+// "face_bc": [{"kind": "wall|inflow|level|free|depth", "value": 12.5, "label": "...", "faces": [cell * 4 + side, ...]}]
+void readFaceBcs(CaseData &c, json const &j)
+{
+	c.faceBcs.clear();
+	if (!j.contains("face_bc"))
+		return;
+	for (auto const &f : j["face_bc"])
+	{
+		CaseData::FaceBcDef d;
+		auto                kind = f.value("kind", "wall");
+		auto                k    = bcKindOf(kind);
+		if (!k)
+			throw std::runtime_error("unknown face condition '" + kind + "' (" + c.name + ")");
+		d.kind  = *k;
+		d.value = f.value("value", 0.0);
+		d.label = f.value("label", kind);
+		for (auto const &face : f.value("faces", json::array()))
+			if (auto v = face.get<uint64_t>(); faceCell(uint32_t(v)) < c.cells())
+				d.faces.push_back(static_cast<uint32_t>(v));
+		if (!d.faces.empty() && c.faceBcs.size() < MAX_FACE_BC)
+			c.faceBcs.push_back(std::move(d));
+	}
+}
+
+// "bridges": [{"label": "pont", "z_roof": 61.2, "z_deck": 62.0, "rect": [i0, j0, i1, j1] | "cells": [k, ...]}],
+// "bridge_slot": 0.05. Elevations in the case's datum (m DNG for imported cases), stored relative to z_ref.
+void readBridges(CaseData &c, json const &j)
+{
+	c.bridges.clear();
+	c.bridgeSlot = std::clamp(j.value("bridge_slot", 0.05), 1e-3, 1.0);
+	if (j.contains("bridges"))
+		for (auto const &b : j["bridges"])
+		{
+			CaseData::BridgeDef d;
+			d.label = b.value("label", std::string("pont"));
+			d.zRoof = b.at("z_roof").get<double>() - c.z_ref;
+			d.zDeck = std::max(b.value("z_deck", b.at("z_roof").get<double>()) - c.z_ref, d.zRoof);
+			d.cells.assign(c.cells(), 0);
+			if (b.contains("rect"))
+			{
+				auto r = b["rect"];
+				for (uint32_t i = r.at(0).get<uint32_t>(); i <= std::min(r.at(2).get<uint32_t>(), c.nx - 1); ++i)
+					for (uint32_t jj = r.at(1).get<uint32_t>(); jj <= std::min(r.at(3).get<uint32_t>(), c.ny - 1); ++jj)
+						d.cells[c.index(i, jj)] = 1;
+			}
+			for (auto const &k : b.value("cells", json::array()))
+				if (auto v = k.get<uint64_t>(); v < c.cells())
+					d.cells[v] = 1;
+			c.bridges.push_back(std::move(d));
+		}
+	c.rebuildBridgeArrays();
+}
+
+json bridgesJson(CaseData const &c)
+{
+	json arr = json::array();
+	for (auto const &b : c.bridges)
+	{
+		std::vector<uint64_t> cells;
+		for (size_t k = 0; k < b.cells.size(); ++k)
+			if (b.cells[k])
+				cells.push_back(k);
+		arr.push_back({{"label", b.label}, {"z_roof", b.zRoof + c.z_ref}, {"z_deck", b.zDeck + c.z_ref}, {"cells", cells}});
+	}
+	return arr;
+}
+
+json faceBcsJson(CaseData const &c)
+{
+	json arr = json::array();
+	for (auto const &f : c.faceBcs)
+		arr.push_back({{"kind", bcKindName(f.kind)}, {"value", f.value}, {"label", f.label}, {"faces", f.faces}});
+	return arr;
 }
 
 // Arrays of a saved case (npz): bed, initial depth, optional outside / zone masks
@@ -504,6 +611,36 @@ std::map<std::string, npy::Array> caseArrays(CaseData const &c)
 }
 
 }        // namespace
+
+void CaseData::rebuildBridgeArrays()
+{
+	bridgeRoof.clear();
+	bridgeDeck.clear();
+	if (bridges.empty())
+		return;
+	bridgeRoof.assign(cells(), std::numeric_limits<float>::quiet_NaN());
+	bridgeDeck.assign(cells(), std::numeric_limits<float>::quiet_NaN());
+	for (auto const &b : bridges)
+		for (size_t k = 0; k < b.cells.size() && k < cells(); ++k)
+			if (b.cells[k])
+			{
+				bridgeRoof[k] = static_cast<float>(b.zRoof);
+				bridgeDeck[k] = static_cast<float>(std::max(b.zDeck, b.zRoof));
+			}
+}
+
+// Same law as shaders/solver/bridge.slang stored()
+double CaseData::storedDepth(size_t k, double h) const
+{
+	if (bridgeRoof.empty() || std::isnan(bridgeRoof[k]))
+		return h;
+	double c = std::max(double(bridgeRoof[k]) - zb[k], 0.0), d = std::max(double(bridgeDeck[k]) - bridgeRoof[k], 0.0);
+	if (h <= c)
+		return h;
+	if (h <= c + d)
+		return c + bridgeSlot * (h - c);
+	return c + bridgeSlot * d + (h - c - d);
+}
 
 GeoOrigin caseOrigin(std::string const &name, std::string const &assetDir)
 {
@@ -557,7 +694,13 @@ void saveImportedCase(CaseData const &c, ImportMetadata const &meta, std::string
 	       {"render", {{"depth_ref", c.depth_ref}, {"z_scale_0", c.z_scale_0}}},
 	       {"sources", meta.sources},
 	       {"attributions", meta.attributions},
-	       {"zones", zonesJson(c)}};
+	       {"zones", zonesJson(c)},
+	       {"face_bc", faceBcsJson(c)}};
+	if (!c.bridges.empty())
+	{
+		j["bridges"]     = bridgesJson(c);
+		j["bridge_slot"] = c.bridgeSlot;
+	}
 	if (!meta.orthoFile.empty())
 		j["orthophoto"] = meta.orthoFile;
 	if (c.gw.enabled)
@@ -579,6 +722,14 @@ void updateImportedCase(CaseData const &c, std::string const &assetDir)
 
 	npy::saveNpz(assets / j.at("data").get<std::string>(), caseArrays(c));
 	j["zones"]     = zonesJson(c);
+	j["face_bc"]   = faceBcsJson(c);
+	if (c.bridges.empty())
+		j.erase("bridges");
+	else
+	{
+		j["bridges"]     = bridgesJson(c);
+		j["bridge_slot"] = c.bridgeSlot;
+	}
 	j["bc"]        = boundariesJson(c);
 	j["manning_n"] = c.manning_n;
 	j["cfl"]       = c.cfl;
@@ -624,7 +775,9 @@ std::vector<CaseInfo> listCases(std::string const &assetDir)
 	return out;
 }
 
-CaseData makeCase(std::string const &name, std::string const &assetDir)
+namespace {
+
+CaseData buildCase(std::string const &name, std::string const &assetDir, bool reference)
 {
 	fs::path assets(assetDir);
 	auto     path = assets / "cases" / (name + ".json");
@@ -633,7 +786,8 @@ CaseData makeCase(std::string const &name, std::string const &assetDir)
 	json j = readJson(path);
 
 	CaseData c;
-	c.name    = name;
+	c.name      = name;
+	c.reference = reference;        // still-water depths as the Python computes them
 	auto type = j.at("type").get<std::string>();
 	readCommon(c, j);
 	if (type == "dam_break")
@@ -649,6 +803,8 @@ CaseData makeCase(std::string const &name, std::string const &assetDir)
 	else
 		throw std::runtime_error("case '" + name + "': unknown type '" + type + "'");
 	readBoundaries(c, j);
+	readFaceBcs(c, j);
+	readBridges(c, j);
 	readGroundwater(c, j, assets);
 	readChronology(c, c.infiltration, "infiltration", j, assets);
 	readChronology(c, c.rain, "rain", j, assets);
@@ -659,13 +815,32 @@ CaseData makeCase(std::string const &name, std::string const &assetDir)
 	return c;
 }
 
+}        // namespace
+
+CaseData makeCase(std::string const &name, std::string const &assetDir)
+{
+	return buildCase(name, assetDir, false);
+}
+
 CaseData makeCase(std::string const &name, std::string const &assetDir, CaseOverrides const &overrides)
 {
-	CaseData c = makeCase(name, assetDir);
+	CaseData c = buildCase(name, assetDir, overrides.reference);
+	if (overrides.reference)
+	{
+		c.legacyLimiter = true;
+		c.h_eps         = 1e-4;        // main.py H_EPS, H_DRY
+		c.h_dry         = 1e-3;
+	}
 	if (!overrides.scheme.empty())
 		c.scheme = overrides.scheme;
 	if (overrides.drainPasses >= 0)
 		c.drain_passes = std::min(overrides.drainPasses, MAX_DRAIN_PASSES);
+	if (overrides.legacyLimiter)
+		c.legacyLimiter = true;
+	if (overrides.hEps >= 0.0)
+		c.h_eps = overrides.hEps;
+	if (overrides.hDry >= 0.0)
+		c.h_dry = overrides.hDry;
 	return c;
 }
 

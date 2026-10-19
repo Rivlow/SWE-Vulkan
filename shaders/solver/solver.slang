@@ -3,6 +3,7 @@
 //
 //   build_tiles                                   active tile list + indirect dispatch arguments
 //   [finalize_dt] flux_x flux_y bc_fluxes         (flux kernels also write the bed-slope source)
+//   [face_bc_norm] [face_bc_apply]                weak conditions on cell faces override the listed faces
 //   drain_alpha x K passes                        (drain limiter, Jacobi ping-pong on alpha_a / alpha_b)
 //   euler_stage                                   Q <- a Q^n + b (Q + dt L(Q)), fix_dry [, friction, zones]
 //   [gw_alpha gw_lateral] vertical_step           rain / infiltration chronologies and groundwater, once per step,
@@ -39,6 +40,7 @@ import reconstruction;
 import flux;
 import boundary_condition;
 import groundwater;
+import bridge;
 
 #define GRID_THREADS [numthreads(16, 16, 1)]
 
@@ -172,12 +174,21 @@ void build_tiles(uint3 tid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 // Time step
 // ---------------------------------------------------------------------------------------------
 
-// |u|max + sqrt(g h) of a wet cell (h >= h_dry), 0 for thin films: they do not drive the time step
-float cell_wave_speed(float3 q)
+// |u|max + sqrt(g h) of a wet cell (h >= h_dry), 0 for thin films: they do not drive the time step.
+// Bridge cells: velocity q / h_eff and the celerity of their regime (the slot's under pressure).
+float cell_wave_speed(float3 q, uint c, float z)
 {
     float h = q.x;
     if (h < P.h_dry)
         return 0.0f;
+    if (bridge_at(c))
+    {
+        Lid   l = cell_lid(c, z);
+        float e = h_eff(h, l);
+        if (e < P.h_dry)
+            return 0.0f;
+        return max(abs(velocity(e, q.y)), abs(velocity(e, q.z))) + bridge_celerity(h, l);
+    }
     float u = velocity(h, q.y);
     float v = velocity(h, q.z);
     return wave_speed(h, max(abs(u), abs(v)));
@@ -211,8 +222,9 @@ void reduce_smax(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID)
     bool  wet = false;
     if (i < P.nx && j < P.ny)
     {
-        float3 q = Q[idx(i, j)].xyz;
-        s   = cell_wave_speed(q);
+        float4 q4 = Q[idx(i, j)];
+        float3 q  = q4.xyz;
+        s   = cell_wave_speed(q, idx(i, j), q4.w);
         wet = is_wet(q);
         if (gw_lateral())
             d = gw_diffusivity(soil[idx(i, j)], gw[idx(i, j)].x);
@@ -271,16 +283,23 @@ float step_dt() { return asfloat(scalars[S_DT]); }
 // Spatial operator
 // ---------------------------------------------------------------------------------------------
 
-// Centred bed-slope source (Audusse 2004, 2nd order) of a cell along one direction: S = g/2 (h_- + h_+)(zb_- - zb_+)
-// from the cell's own reconstructed face values; zero when the reconstruction is constant (boundary cells).
-float bed_source(Recon r)
+// Exactly balanced hydrostatic terms (lake at rest to the bit).
+// The scheme is Audusse's hydrostatic reconstruction with a centred bed-slope source: a cell's normal momentum
+// changes by -(F_e - F_w)/dx + S/dx with F the HLLC flux of the h* states plus g/2 (h_side^2 - h*^2) and
+// S = g/2 (h_- + h_+)(z_- - z_+). Written as it is, the large terms g h^2 / 2 cancel only up to round-off (2e-4 m2/s
+// of spurious discharge under 5 m of still water on a rough bed). The same expression is rearranged:
+//   F_side = D + g h_side^2 / 2   with D = f - g h*^2 / 2   (deviation: exactly 0 on a still face)
+//   -(F_e - F_w) + S = -(D_e - D_w) - g/2 (h_- + h_+) (eta_+ - eta_-)
+// The face arrays hold D in the normal momentum component, and the w of F_R / G_U holds the cell's balanced term
+// B = g/2 (h_- + h_+)(eta_- - eta_+), exactly 0 when the reconstructed surface is flat.
+float balanced_source(Recon r)
 {
-    return 0.5f * P.g * (r.m.x + r.p.x) * (r.m.w - r.p.w);
+    return 0.5f * P.g * (r.m.x + r.p.x) * (r.eta_m - r.eta_p);
 }
 
 // Interior x-faces i in [1, nx-1]: face i lies between cells (i-1, j) and (i, j).
-// Also writes the x source of the right cell (i, j) in F_R.w: its reconstruction is already at hand, and
-// every cell i >= 1 has exactly one such face; cell 0 is a boundary cell (source 0, written by bc_fluxes).
+// Also writes the balanced term of the right cell (i, j) in F_R.w: its reconstruction is already at hand, and
+// every cell i >= 1 has exactly one such face; cell 0 is a boundary cell (term 0, written by bc_fluxes).
 [shader("compute")]
 GRID_THREADS
 void flux_x(uint3 gid : SV_GroupID, uint3 lt : SV_GroupThreadID)
@@ -289,24 +308,34 @@ void flux_x(uint3 gid : SV_GroupID, uint3 lt : SV_GroupThreadID)
     uint     i = tc.i, j = tc.j;
     if (i < 1 || i >= P.nx || j >= P.ny)
         return;
-    float g = P.g;
 
     Recon  r_left  = reconstruct_X(i - 1, j);   // p: east face of the left cell
     Recon  r_right = reconstruct_X(i, j);       // m: west face of the right cell
     float3 q_left  = r_left.p.xyz;
     float3 q_right = r_right.m.xyz;
-    float  z_left = r_left.p.w, z_right = r_right.m.w;
-    float  z_face = max(z_left, z_right);
+    float  z_face  = max(r_left.p.w, r_right.m.w);
+    uint   k       = fidx(i, j);
 
-    float3 q_left_star  = hydrostatic_reconstruct(q_left, z_left, z_face);
-    float3 q_right_star = hydrostatic_reconstruct(q_right, z_right, z_face);
+    uint cl = idx(i - 1, j), cr = idx(i, j);
+    if (bridge_at(cl) || bridge_at(cr))
+    {
+        // bridge face (both cells reconstructed constant): the opening of the face, mass in stored depth
+        Lid    lid = face_lid(cl, cr, z_face);
+        float3 sl  = bridge_face_state(q_left, r_left.eta_p, cl, r_left.p.w, z_face, lid);
+        float3 sr  = bridge_face_state(q_right, r_right.eta_m, cr, r_right.m.w, z_face, lid);
+        BridgeFlux b = hllc_bridge(sl, sr, lid);
+        F_L[k] = float4(b.l, 0.0f);
+        F_R[k] = float4(b.r, 0.0f);        // constant reconstruction: no balanced term
+        return;
+    }
 
-    float3 f = Flux_x(q_left_star, q_right_star);
+    float3 q_left_star  = hydrostatic_reconstruct(q_left, r_left.eta_p, z_face);
+    float3 q_right_star = hydrostatic_reconstruct(q_right, r_right.eta_m, z_face);
 
-    uint k = fidx(i, j);
-    F_L[k] = float4(f + float3(0.0f, 0.5f * g * (q_left.x * q_left.x - q_left_star.x * q_left_star.x), 0.0f), 0.0f);
-    F_R[k] = float4(f + float3(0.0f, 0.5f * g * (q_right.x * q_right.x - q_right_star.x * q_right_star.x), 0.0f),
-                    bed_source(r_right));
+    FaceFlux f = Flux_x_dev(q_left_star, q_right_star);        // D seen by the left / right cell
+
+    F_L[k] = float4(f.l, 0.0f);
+    F_R[k] = float4(f.r, balanced_source(r_right));
 }
 
 // Interior y-faces j in [1, ny-1]: face j lies between cells (i, j-1) and (i, j). G_U.w = y source of (i, j).
@@ -318,24 +347,34 @@ void flux_y(uint3 gid : SV_GroupID, uint3 lt : SV_GroupThreadID)
     uint     i = tc.i, j = tc.j;
     if (i >= P.nx || j < 1 || j >= P.ny)
         return;
-    float g = P.g;
 
     Recon  r_down = reconstruct_Y(i, j - 1);    // p: north face of the lower cell
     Recon  r_up   = reconstruct_Y(i, j);        // m: south face of the upper cell
     float3 q_down = r_down.p.xyz;
     float3 q_up   = r_up.m.xyz;
-    float  z_down = r_down.p.w, z_up = r_up.m.w;
-    float  z_face = max(z_down, z_up);
+    float  z_face = max(r_down.p.w, r_up.m.w);
+    uint   k      = gidx(i, j);
 
-    float3 q_down_star = hydrostatic_reconstruct(q_down, z_down, z_face);
-    float3 q_up_star   = hydrostatic_reconstruct(q_up, z_up, z_face);
+    uint cd = idx(i, j - 1), cu = idx(i, j);
+    if (bridge_at(cd) || bridge_at(cu))
+    {
+        // normal frame (h, hv, hu), mapped back
+        Lid    lid = face_lid(cd, cu, z_face);
+        float3 sd  = bridge_face_state(q_down.xzy, r_down.eta_p, cd, r_down.p.w, z_face, lid);
+        float3 su  = bridge_face_state(q_up.xzy, r_up.eta_m, cu, r_up.m.w, z_face, lid);
+        BridgeFlux b = hllc_bridge(sd, su, lid);
+        G_D[k] = float4(b.l.xzy, 0.0f);
+        G_U[k] = float4(b.r.xzy, 0.0f);
+        return;
+    }
 
-    float3 f = Flux_y(q_down_star, q_up_star);
+    float3 q_down_star = hydrostatic_reconstruct(q_down, r_down.eta_p, z_face);
+    float3 q_up_star   = hydrostatic_reconstruct(q_up, r_up.eta_m, z_face);
 
-    uint k = gidx(i, j);
-    G_D[k] = float4(f + float3(0.0f, 0.0f, 0.5f * g * (q_down.x * q_down.x - q_down_star.x * q_down_star.x)), 0.0f);
-    G_U[k] = float4(f + float3(0.0f, 0.0f, 0.5f * g * (q_up.x * q_up.x - q_up_star.x * q_up_star.x)),
-                    bed_source(r_up));
+    FaceFlux f = Flux_y_dev(q_down_star, q_up_star);
+
+    G_D[k] = float4(f.l, 0.0f);
+    G_U[k] = float4(f.r, balanced_source(r_up));
 }
 
 // With FLAG_EXACT_INFLOW the mass flux of an inflow side is the imposed unit discharge (positive inwards);
@@ -392,14 +431,197 @@ void bc_fluxes(uint3 gid : SV_GroupID, uint3 ltid : SV_GroupThreadID)
         uint   c = side_cell(side, k);
         float3 q = Q[c].xyz;
         float  z = zb[c];
+        // boundary cells are reconstructed constant across the boundary: the face depth on their side is q.x, and
+        // the deviation of the cell's side is the one the cell needs
         if (side == 0)          // cell (0, j) is right of the face
-            F_R[fidx(0, k)] = float4(boundary_flux(0, Flux_x(ghost(0, q, z), q), q, z), 0.0f);
+            F_R[fidx(0, k)] = float4(boundary_flux(0, Flux_x_dev(ghost(0, q, z), q).r, q, z), 0.0f);
         else if (side == 1)     // cell (nx-1, j) is left of the face
-            F_L[fidx(P.nx, k)] = float4(boundary_flux(1, Flux_x(q, ghost(1, q, z)), q, z), 0.0f);
+            F_L[fidx(P.nx, k)] = float4(boundary_flux(1, Flux_x_dev(q, ghost(1, q, z)).l, q, z), 0.0f);
         else if (side == 2)     // cell (i, 0) is above the face
-            G_U[gidx(k, 0)] = float4(boundary_flux(2, Flux_y(ghost(2, q, z), q), q, z), 0.0f);
+            G_U[gidx(k, 0)] = float4(boundary_flux(2, Flux_y_dev(ghost(2, q, z), q).r, q, z), 0.0f);
         else                    // cell (i, ny-1) is below the face
-            G_D[gidx(k, P.ny)] = float4(boundary_flux(3, Flux_y(q, ghost(3, q, z)), q, z), 0.0f);
+            G_D[gidx(k, P.ny)] = float4(boundary_flux(3, Flux_y_dev(q, ghost(3, q, z)).l, q, z), 0.0f);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recorder snapshot: h, hu, hv per cell, either exact (three floats: pack_record32) or packed to 16 bits (h in
+// millimetres, saturating at 65.535 m; hu, hv as half floats: pack_record16), and a wet flag per tile after the
+// cells so that the host only writes the tiles holding water. One workgroup per tile, full grid (the copy to
+// the host buffer follows in the same command buffer).
+// ---------------------------------------------------------------------------------------------
+groupshared uint g_tile_wet;
+
+void tile_wet_flag(bool wet, uint words_per_cell, uint tile, uint gi)
+{
+    if (WaveActiveAnyTrue(wet) && WaveIsFirstLane())
+        InterlockedOr(g_tile_wet, 1u);
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0)
+        record[words_per_cell * P.n_cells + tile] = g_tile_wet;
+}
+
+[shader("compute")]
+GRID_THREADS
+void pack_record32(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    if (gi == 0)
+        g_tile_wet = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint j = tid.x, i = tid.y;
+    bool wet = false;
+    if (i < P.nx && j < P.ny)
+    {
+        uint   c = idx(i, j);
+        float4 q = Q[c];
+        record[3 * c]     = asuint(q.x);
+        record[3 * c + 1] = asuint(q.y);
+        record[3 * c + 2] = asuint(q.z);
+        wet = q.x > 0.0f;
+    }
+    tile_wet_flag(wet, 3, gid.y * tiles_y() + gid.x, gi);
+}
+
+[shader("compute")]
+GRID_THREADS
+void pack_record16(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    if (gi == 0)
+        g_tile_wet = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint j = tid.x, i = tid.y;
+    bool wet = false;
+    if (i < P.nx && j < P.ny)
+    {
+        uint   c = idx(i, j);
+        float4 q = Q[c];
+        uint   hmm = uint(clamp(round(q.x * 1000.0f), 0.0f, 65535.0f));
+        record[2 * c]     = hmm | (f32tof16(q.y) << 16);
+        record[2 * c + 1] = f32tof16(q.z);
+        wet = q.x > 0.0f;
+    }
+    tile_wet_flag(wet, 2, gid.y * tiles_y() + gid.x, gi);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Weak conditions on cell faces (FLAG_FACE_BC)
+// ---------------------------------------------------------------------------------------------
+
+// Face entry of the list -> owning cell, side and group
+void decode_face(uint entry, out uint cell, out uint side, out uint group)
+{
+    group = entry >> FACE_LIST_GROUP_SHIFT;
+    uint code = entry & ((1u << FACE_LIST_GROUP_SHIFT) - 1u);
+    cell = code >> 2;
+    side = code & 3u;
+}
+
+// Inflow groups: sum of h_eff^(5/3) * face width over the group (fixed order, deterministic), into inflow[4 + g].
+// One workgroup per group, runs in the flux phase like bc_fluxes (the fluxes are overridden after the barrier).
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void face_bc_norm(uint3 gid : SV_GroupID, uint3 ltid : SV_GroupThreadID)
+{
+    uint   g  = gid.x;
+    uint   t  = ltid.x;
+    FaceBc fb = face_bcs[g];
+    if (fb.kind != BC_INFLOW)
+        return;
+    float acc = 0.0f;
+    for (uint k = t; k < fb.count; k += 256)
+    {
+        uint cell, side, grp;
+        decode_face(face_list[1 + fb.offset + k], cell, side, grp);
+        float width = side < 2 ? P.dy : P.dx;
+        acc += inflow_weight(inflow_depth_z(fb.zmin, Q[cell].x, zb[cell])) * width;
+    }
+    g_partial[t] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128; stride > 0; stride >>= 1)
+    {
+        if (t < stride)
+            g_partial[t] += g_partial[t + stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (t == 0)
+        inflow[4 + g] = g_partial[0];
+}
+
+// Flux of a wall seen from the cell state q on one side of an x-face (ghost mirrored across it), in deviation
+// form relative to q's own depth
+float3 wall_flux_x(float3 q, bool ghost_right)
+{
+    float3 m = float3(q.x, -q.y, q.z);
+    return ghost_right ? Flux_x_dev(q, m).l : Flux_x_dev(m, q).r;
+}
+float3 wall_flux_y(float3 q, bool ghost_up)
+{
+    float3 m = float3(q.x, q.y, -q.z);
+    return ghost_up ? Flux_y_dev(q, m).l : Flux_y_dev(m, q).r;
+}
+
+// Overrides the face fluxes of the listed faces, after flux_x / flux_y / bc_fluxes: the owning cell sees the
+// HLLC flux against the ghost state of its group, the cell across an interior face sees a wall (the face is a
+// border of the computed domain). The bed-slope sources in .w are kept. One thread per face.
+// Both tiles touching a listed face are seeded (always active), so these faces are always "live".
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void face_bc_apply(uint3 tid : SV_DispatchThreadID)
+{
+    uint n = face_list[0];
+    if (tid.x >= n)
+        return;
+    uint cell, side, g;
+    decode_face(face_list[1 + tid.x], cell, side, g);
+    FaceBc fb = face_bcs[g];
+    uint   i = cell / P.ny, j = cell % P.ny;
+    float3 q = Q[cell].xyz;
+    float  z = zb[cell];
+    float  norm = inflow[4 + g];
+    bool   exact = (P.flags & FLAG_EXACT_INFLOW) != 0 && fb.kind == BC_INFLOW;
+    float  q_n   = exact ? INWARD[side] * unit_discharge(fb.value, fb.zmin, norm, q.x, z) : 0.0f;
+    // The owning cell meets the ghost with its own face state on that side (as at an interior face), and every
+    // flux is in deviation form relative to that state: still water against a wall or its own level is exactly
+    // at rest. The inflow distribution keeps the cell-centred depths (same weights as face_bc_norm).
+    Recon  r  = side < 2 ? reconstruct_X(i, j) : reconstruct_Y(i, j);
+    float4 sf = (side == 0 || side == 2) ? r.m : r.p;        // the cell's face state on that side (h, hu, hv, z)
+    float3 gh = ghost_of(fb.kind, fb.value, fb.zmin, norm, AXIS[side], INWARD[side], sf.xyz, sf.w);
+
+    if (side == 0)              // west face of (i, j): the cell is right of the face
+    {
+        uint   k = fidx(i, j);
+        float3 f = Flux_x_dev(gh, sf.xyz).r;
+        if (exact) f.x = q_n;
+        F_R[k] = float4(f, F_R[k].w);
+        if (i > 0)              // the neighbour's own face state against the wall
+            F_L[k] = float4(wall_flux_x(reconstruct_X(i - 1, j).p.xyz, true), F_L[k].w);
+    }
+    else if (side == 1)         // east face: the cell is left of the face
+    {
+        uint   k = fidx(i + 1, j);
+        float3 f = Flux_x_dev(sf.xyz, gh).l;
+        if (exact) f.x = q_n;
+        F_L[k] = float4(f, F_L[k].w);
+        if (i + 1 < P.nx)
+            F_R[k] = float4(wall_flux_x(reconstruct_X(i + 1, j).m.xyz, false), F_R[k].w);
+    }
+    else if (side == 2)         // south face: the cell is above the face
+    {
+        uint   k = gidx(i, j);
+        float3 f = Flux_y_dev(gh, sf.xyz).r;
+        if (exact) f.x = q_n;
+        G_U[k] = float4(f, G_U[k].w);
+        if (j > 0)
+            G_D[k] = float4(wall_flux_y(reconstruct_Y(i, j - 1).p.xyz, true), G_D[k].w);
+    }
+    else                        // north face: the cell is below the face
+    {
+        uint   k = gidx(i, j + 1);
+        float3 f = Flux_y_dev(sf.xyz, gh).l;
+        if (exact) f.x = q_n;
+        G_D[k] = float4(f, G_D[k].w);
+        if (j + 1 < P.ny)
+            G_U[k] = float4(wall_flux_y(reconstruct_Y(i, j + 1).m.xyz, false), G_U[k].w);
     }
 }
 
@@ -462,7 +684,8 @@ void drain_alpha(uint3 gid : SV_GroupID, uint3 lt : SV_GroupThreadID)
         f = mass_flux[c];
     float  O  = outflow_rate(f);
     float  a  = 1.0f;
-    float  h  = Q[c].x;
+    float4 qc = Q[c];
+    float  h  = stored_at(c, qc.x, qc.w);        // the water the cell holds (bridges: stored depth)
     // h >= dt O: the cell cannot drain whatever it receives (I >= 0), alpha = 1 exactly as the formula would
     // give in floating point too, without reading the neighbours' factors - the common case by far
     if (O > 0.0f && h < dt * O)
@@ -502,6 +725,81 @@ float3 friction(float3 q, float dt)
     return q;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Exact boundary balance: volumes through the open sides / face groups and added by the zones
+// ---------------------------------------------------------------------------------------------
+
+// A value the compiler cannot see through: x itself, OR-ed with a bit that is always 0 at run time but unknown at
+// compile time (nx < 2^31). The GPU compiler otherwise simplifies (a + b) - a into b, which turns any error-free
+// transformation into 0 (as it did the Kahan sum of the aquifer).
+float opaque(float x)
+{
+    return asfloat(asuint(x) | (P.nx >> 31));
+}
+
+// Error-free sum (Knuth's TwoSum): s = fl(a + b) and e with s + e == a + b exactly. Additions only (no product for
+// the compiler to contract into an fma), each intermediate made opaque; checked by tests (slow backwater balance).
+void two_sum(float a, float b, out float s, out float e)
+{
+    s        = opaque(a + b);
+    float bp = opaque(s - a);
+    float ap = opaque(s - bp);
+    e        = opaque(a - ap) + opaque(b - bp);
+}
+
+// Adds v (m3) to the signed 64-bit fixed-point accumulator scalars[slot] (hi), scalars[slot + 1] (lo), units of
+// 2^-32 m3. Integer additions commute: the total does not depend on the order of the threads (deterministic).
+// The two words are not updated as one, but nothing reads them before the step's next barrier.
+void track_volume(uint slot, float v)
+{
+    if (v == 0.0f)
+        return;
+    float a     = abs(v);
+    float whole = floor(a);
+    float frac  = (a - whole) * 4294967296.0f;        // < 2^32 exactly (a - whole < 1)
+    uint  hi    = uint(whole);
+    uint  lo    = frac < 16777216.0f ? uint(frac + 0.5f) : uint(frac);        // above 2^24 the float is an integer
+    if (v < 0.0f)
+    {
+        lo = ~lo + 1u;
+        hi = ~hi + (lo == 0u ? 1u : 0u);
+    }
+    uint old;
+    InterlockedAdd(scalars[slot + 1], lo, old);
+    InterlockedAdd(scalars[slot], hi + (old + lo < old ? 1u : 0u));
+}
+
+// Group of the boundary face on `side` of cell c: 4 + face group when the face carries a weak condition, the
+// side itself when it is on the domain boundary, ~0 for an interior face without condition
+uint boundary_group(uint c, uint i, uint j, uint side)
+{
+    if ((P.flags & FLAG_FACE_BC) != 0)
+    {
+        uint g = (face_cell[c] >> (5 * side)) & 31u;
+        if (g != 0)
+            return 4 + g - 1;
+    }
+    bool edge = side == 0 ? i == 0 : side == 1 ? i + 1 == P.nx : side == 2 ? j == 0 : j + 1 == P.ny;
+    return edge ? side : ~0u;
+}
+
+// Mass that the boundary faces of the cell bring in over this stage (face fluxes as applied, i.e. scaled by the
+// drain limiter), weighted by the stage's share of the full step: the same linear combination as the state, so
+// the sum over the steps is exactly the volume that crossed the boundaries.
+void track_boundaries(uint c, uint i, uint j, float Fw, float Fe, float Gs, float Gn, float wdt)
+{
+    bool edge = i == 0 || i + 1 == P.nx || j == 0 || j + 1 == P.ny;
+    if (!edge && ((P.flags & FLAG_FACE_BC) == 0 || face_cell[c] == 0))
+        return;
+    float in_[4] = { Fw * P.dy, -Fe * P.dy, Gs * P.dx, -Gn * P.dx };        // entering through west, east, south, north
+    for (uint s = 0; s < 4; ++s)
+    {
+        uint g = boundary_group(c, i, j, s);
+        if (g != ~0u)
+            track_volume(S_BND_CUM + 2 * g, in_[s] * wdt);
+    }
+}
+
 // One Runge-Kutta stage in Shu-Osher form: Q <- a Q^n + b (Q + dt L(Q)), then fix_dry; on the last stage
 // (STAGE_LAST) friction and the per-cell zones (sources, sinks, fixed levels) as well, and the wave speed of
 // the new state goes into the s_max accumulator of the next step.
@@ -523,7 +821,9 @@ void euler_stage(uint3 gid : SV_GroupID, uint3 lt : SV_GroupThreadID)
     // stages read it after a barrier)
     if ((pc.flags & (STAGE_FIRST | STAGE_LAST)) == STAGE_FIRST)
         Q_old[c] = q4;
-    // the cell is right of its west face (F_R) and left of its east face (F_L); w = bed-slope source
+    // the cell is right of its west face (F_R) and left of its east face (F_L); fluxes in deviation form, w = the
+    // cell's balanced hydrostatic term (see balanced_source). The drain limiter scales the deviations: the
+    // hydrostatic part of a draining cell stays balanced.
     float4 Fw4 = F_R[fidx(i, j)], Gs4 = G_U[gidx(i, j)];
     float2 sb  = float2(Fw4.w, Gs4.w);
     float3 Fw = Fw4.xyz, Fe = east_face_live(tc) ? F_L[fidx(i + 1, j)].xyz : float3(0.0f);
@@ -553,9 +853,16 @@ void euler_stage(uint3 gid : SV_GroupID, uint3 lt : SV_GroupThreadID)
             h_e = dt * max(I_cur - I_prev, 0.0f);
         }
     }
+    track_boundaries(c, i, j, Fw.x, Fe.x, Gs.x, Gn.x, stage_coef(2) * dt);
     float3 L = -(Fe - Fw) / P.dx - (Gn - Gs) / P.dy + float3(0.0f, sb.x / P.dx, sb.y / P.dy);
+    // Bridge cells: the mass balance is on the stored depth s(h) (bridge.slang), the state keeps h = s^-1.
+    // Elsewhere s = h and the code below is the plain update.
+    bool br  = bridge_at(c);
+    Lid  lid = cell_lid(c, q4.w);
+    // h_e is the stored depth of the Euler state until it is converted back below
+    float m_q = br ? stored(q.x, lid) : q.x;
     if (!limited)
-        h_e = q.x + dt * L.x;
+        h_e = m_q + dt * L.x;
     if (h_e < 0.0f)
     {
         // Limiter off: the usual clamp (creates mass). Limiter on: only a round-off residual of an unlimited
@@ -568,32 +875,82 @@ void euler_stage(uint3 gid : SV_GroupID, uint3 lt : SV_GroupThreadID)
     if (limited && last)
         InterlockedAdd(scalars[S_LIMITED], 1);
 
-    float3 qe = float3(h_e, q.y + dt * L.y, q.z + dt * L.z);
+    float m_e = h_e;        // stored depth of the Euler state
+    float3 qe = float3(br ? depth_from(m_e, q.x, m_q, lid) : m_e, q.y + dt * L.y, q.z + dt * L.z);
     // Convex combination a Q^n + b qe written as Q^n + b (qe - Q^n): h >= 0 holds exactly in floating point
     // (b <= 1 so b (Q^n - qe) <= Q^n when qe < Q^n), and no mass bias when a + b != 1 in f32 (ssprk3: 1/3 + 2/3,
-    // which as a h + b h drifted the volume by 3e-8 per step).
+    // which as a h + b h drifted the volume by 3e-8 per step). Bridges: the depth combines as stored depth.
     float3 qn = qe;
+    float  hn = q.x;        // h^n (first stage: the cell itself)
     if (stage_coef(0) != 0.0f)
     {
         float3 qo = Q_old[c].xyz;
         qn = qo + stage_coef(1) * (qe - qo);
+        hn = qo.x;
+        if (br)
+        {
+            float mo = stored(qo.x, lid);
+            qn.x = depth_from(mo + stage_coef(1) * (m_e - mo), qo.x, mo, lid);
+        }
+    }
+    float mn = br ? stored(hn, lid) : hn;        // stored depth at t^n
+
+    // Exact depth: h^{n+1} - h^n = sum over the stages of w_s dt L_s(h), accumulated apart (small numbers among
+    // themselves, nothing lost), started from the carry of the previous step, then added to h^n with an error-free
+    // sum: what float32 cannot hold is carried to the next step instead of being lost.
+    float2 mc = mass_carry[c];
+    float  A  = ((pc.flags & STAGE_FIRST) != 0 ? mc.y : mc.x) + stage_coef(2) * dt * L.x;
+    if (!last)
+        mass_carry[c] = float2(A, mc.y);
+    else if ((P.flags & FLAG_NO_CARRY) == 0)
+    {
+        float s, e;
+        two_sum(mn, A, s, e);
+        float carry;
+        if (qn.x == 0.0f)        // drained (limiter's exact zero) or dry: keep it exactly dry, the remainder carried
+        {
+            carry = s + e;
+            qn.x  = 0.0f;
+        }
+        else if (!br)
+        {
+            carry = e + min(s, 0.0f);        // a negative round-off residual is owed, not clamped away
+            qn.x  = max(s, 0.0f);
+        }
+        else
+        {
+            // bridge: the depth holding the stored depth s; what its own stored depth misses (rounding of the
+            // conversion) is carried too, so the mass stays exact
+            qn.x = depth_from(max(s, 0.0f), hn, mn, lid);
+            carry = (s - stored(qn.x, lid)) + e;
+        }
+        mass_carry[c] = float2(0.0f, carry);
     }
     qn = fix_dry(qn);
     if (last)
     {
         if ((P.flags & FLAG_FRICTION) != 0)
-            qn = friction(qn, dt);
+            qn = br ? bridge_friction(qn, dt, lid) : friction(qn, dt);
         if ((P.flags & FLAG_ZONES) != 0 && cond[c] != 0)
         {
-            Zone zn = zones[min(cond[c] - 1, MAX_ZONES - 1)];
+            uint  zi = min(cond[c] - 1, MAX_ZONES - 1);
+            Zone  zn = zones[zi];
+            float h0 = qn.x;
             if (zn.kind == ZONE_SINK)
                 qn = float3(0.0f);
             else if (zn.kind == ZONE_SOURCE && zn.ncells > 0)
-                qn.x += zn.value * dt / (float(zn.ncells) * P.dx * P.dy);      // volume per step shared by the zone
+            {
+                float add = zn.value * dt / (float(zn.ncells) * P.dx * P.dy);      // volume per step shared by the zone
+                qn.x = br ? depth_of_stored(stored(qn.x, lid) + add, lid) : qn.x + add;
+            }
             else if (zn.kind == ZONE_LEVEL)
-                qn = float3(max(zn.value - q4.w, 0.0f), 0.0f, 0.0f);          // reservoir at rest
+                qn = float3(depth_for_level(zn.value, q4.w), 0.0f, 0.0f);     // reservoir at rest, flat to the bit
+            float dm = br ? stored(qn.x, lid) - stored(h0, lid) : qn.x - h0;
+            track_volume(S_ZONE_CUM + 2 * zi, dm * (P.dx * P.dy));
+            if (zn.kind != ZONE_SOURCE)
+                mass_carry[c] = float2(0.0f, 0.0f);        // the zone sets the depth: nothing owed
         }
-        accumulate_smax(cell_wave_speed(qn));
+        accumulate_smax(cell_wave_speed(qn, c, q4.w));
         stamp_wet(is_wet(qn), tc.tile, scalars[S_NSTEPS]);
     }
     Q[c] = float4(qn, q4.w);
@@ -726,7 +1083,7 @@ void vertical_step(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID)
 
         if (changed)
             Q[c] = float4(q, q4.w);
-        s   = cell_wave_speed(q);
+        s   = cell_wave_speed(q, c, q4.w);
         wet = is_wet(q);
     }
     accumulate_smax(s);
@@ -782,7 +1139,7 @@ void diag_partial(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint 
     {
         float4 q = Q[idx(i, j)];
         float  h = q.x;
-        d.x = max(h, 0.0f) * P.dx * P.dy;
+        d.x = max(stored_at(idx(i, j), h, q.w), 0.0f) * P.dx * P.dy;        // physical volume (bridges: stored)
         d.y = h > 2e-3f ? 1.0f : 0.0f;
         d.z = h;
         if (h >= P.h_dry)
@@ -936,10 +1293,11 @@ void set_water(uint3 tid : SV_DispatchThreadID)
     switch (pc.mode)
     {
     case WATER_DEPTH: h = value; break;
-    case WATER_LEVEL: h = max(value - q.w, 0.0f); break;
+    case WATER_LEVEL: h = depth_for_level(value, q.w); break;        // flat to the bit: stays at rest
     case WATER_ADD:   h = max(h + value, 0.0f); break;
     default:          h = 0.0f; break;
     }
-    // water placed at rest
-    Q[c] = float4(h, 0.0f, 0.0f, q.w);
+    // water placed at rest, nothing owed
+    Q[c]          = float4(h, 0.0f, 0.0f, q.w);
+    mass_carry[c] = float2(0.0f, 0.0f);
 }

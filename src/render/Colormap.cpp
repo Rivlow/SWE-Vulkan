@@ -29,4 +29,17 @@ glm::vec3 diverging(float x)
 	return x < 0.5f ? glm::mix(blue, white, 2.0f * x) : glm::mix(white, brown, 2.0f * x - 1.0f);
 }
 
+// Same colours as shaders/render/scene.slang bc_color()
+glm::vec3 bcColor(uint32_t kind)
+{
+	switch (kind)
+	{
+	case 1: return {0.25f, 0.55f, 1.00f};        // inflow: blue
+	case 2: return {0.10f, 0.85f, 0.75f};        // level: teal
+	case 3: return {0.72f, 0.48f, 1.00f};        // free outflow: violet
+	case 4: return {0.98f, 0.40f, 0.78f};        // depth: magenta
+	default: return {0.55f, 0.57f, 0.62f};       // wall: grey
+	}
+}
+
 }        // namespace swe

@@ -30,6 +30,14 @@ public static const uint COLOR_RAIN           = 10;  // rain depth since t = 0 (
 
 public static const uint SCENE_CROP      = 64;  // cut box: only the cells crop.xy .. crop.zw are drawn, the walls follow it
 public static const uint SCENE_GW_XRAY   = 128; // water table surface seen through the ground
+public static const uint SCENE_SELECTION = 256; // the selection mask (binding 3) is meaningful
+public static const uint SCENE_BORDERS   = 512; // draw the boundary conditions (open sides, face conditions)
+public static const uint SCENE_MESH      = 1024; // draw the cell boundaries ("Maillage")
+public static const uint SCENE_BLOCKS    = 2048; // raw cells: flat-topped columns, no interpolation (block vertex shaders)
+
+// highlight codes (SC.sel.w): a side of the domain or a group of face conditions, e.g. hovered in the GUI
+public static const uint HIGHLIGHT_SIDE  = 1;   // + side
+public static const uint HIGHLIGHT_GROUP = 16;  // + group
 
 public struct SceneParams           // std140, 208 bytes
 {
@@ -52,16 +60,9 @@ public struct SceneParams           // std140, 208 bytes
     public float    cmap_max;
     public float    cmap_opacity;
     public float    ortho_mix;      // 0 = procedural ground, 1 = orthophoto
-    public uint4    sel;            // selected cell rectangle i0, j0, i1, j1 (inclusive); i1 < i0 = none
+    public uint4    sel;            // hovered cell i, j (~0 = none), unused, highlight code
     public float4   gw;             // x = contour step of the water table (m), y = contour opacity, z = focal length (px)
     public uint4    crop;           // cut box i0, j0, i1, j1 (inclusive, SCENE_CROP)
-};
-
-// Wireframe overlays (terrain and water)
-public struct WireVarying
-{
-    public float4 pos  : SV_Position;
-    public float3 disp : DISP;
 };
 
 // Displayed cell rectangle: the cut box, or the whole domain
@@ -70,14 +71,109 @@ public uint4 crop_rect()
     return (SC.flags & SCENE_CROP) != 0 ? SC.crop : uint4(0, 0, P.nx - 1, P.ny - 1);
 }
 
-// Fragment outside the cut box (the box ends at the centres of its edge cells, like the meshes and walls)
+// Fragment outside the cut box (the box ends at the centres of its edge cells, like the meshes and walls; in the
+// raw-cell mode the cells are whole, so the box ends at their outer edges)
 public bool cropped_out(float3 disp)
 {
     if ((SC.flags & SCENE_CROP) == 0)
         return false;
     float x = disp.x / (SC.S * P.dx) - 0.5f, y = -disp.z / (SC.S * P.dy) - 0.5f;
-    float e = 1e-3f;
+    float e = (SC.flags & SCENE_BLOCKS) != 0 ? 0.5f + 1e-3f : 1e-3f;
     return x < float(SC.crop.x) - e || x > float(SC.crop.z) + e || y < float(SC.crop.y) - e || y > float(SC.crop.w) + e;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Raw cells (SCENE_BLOCKS): every cell is a flat-topped column. 18 vertices per cell, no index buffer: the top
+// quad (part 0), the east wall (part 1, shared with cell i+1) and the north wall (part 2, shared with cell j+1),
+// 6 vertices each. A wall between two columns of the same height, or on the domain's edge (the block skirt
+// draws those), is collapsed to a line (no fragments). The wall belongs to the taller column: its overlays
+// (selection, zones, face conditions) are those of that cell and of the face it exposes.
+// ---------------------------------------------------------------------------------------------
+static const float2 QUAD[6] = { float2(0, 0), float2(1, 0), float2(1, 1), float2(0, 0), float2(1, 1), float2(0, 1) };
+
+// Display position of the cell corner (i, j) (cell units, corners at integers) at physical elevation z
+public float3 corner_pos(float i, float j, float z)
+{
+    return float3(i * P.dx * SC.S, z * SC.z_scale * SC.S, -j * P.dy * SC.S);
+}
+
+public struct BlockVertex
+{
+    public float3 disp;
+    public float3 n;
+    public uint   owner;      // cell whose overlays apply
+    public uint   side;       // walls: face of the owner (0 west, 1 east, 2 south, 3 north); tops: 0
+    public bool   wall;
+};
+
+// Vertex `vid` of the block geometry, given the column tops: z0 of the cell, ze / zn of its east / north
+// neighbours (has_east / has_north false on the domain's edge), and `flat` true to collapse the top (dry water)
+public BlockVertex block_vertex(uint vid, uint cell, float z0, float ze, bool has_east, float zn, bool has_north, bool flat)
+{
+    uint   part = (vid % 18) / 6, k = vid % 6;
+    uint   i = cell / P.ny, j = cell % P.ny;
+    float2 q = QUAD[k];
+    BlockVertex o;
+    o.owner = cell;
+    o.side  = 0;
+    o.wall  = part != 0;
+    if (part == 0)
+    {
+        o.n    = float3(0.0f, 1.0f, 0.0f);
+        o.disp = flat ? corner_pos(float(i), float(j), z0) : corner_pos(float(i) + q.x, float(j) + q.y, z0);
+        return o;
+    }
+    bool  east = part == 1;
+    bool  has  = east ? has_east : has_north;
+    float zn_  = east ? ze : zn;
+    bool  collapse = !has || zn_ == z0;
+    float z    = collapse ? z0 : (q.y == 0.0f ? z0 : zn_);
+    // the taller column owns the wall; the face it exposes looks towards the lower one
+    bool  mine = collapse || z0 >= zn_;
+    o.owner = mine ? cell : (east ? cell + P.ny : cell + 1);
+    o.side  = east ? (mine ? 1u : 0u) : (mine ? 3u : 2u);
+    o.n     = east ? float3(1.0f, 0.0f, 0.0f) : float3(0.0f, 0.0f, -1.0f);
+    o.disp  = east ? corner_pos(float(i) + 1.0f, float(j) + (collapse ? 0.0f : q.x), z)
+                   : corner_pos(float(i) + (collapse ? 0.0f : q.x), float(j) + 1.0f, z);
+    return o;
+}
+
+// Overlays of a block wall: the owner's zone, selection and hover tints, and the condition of the exposed face
+// (face conditions, or the open sides of the domain) over the whole face
+public float3 wall_overlays(float3 col, uint owner, uint side)
+{
+    int2   c = int2(int(owner / P.ny), int(owner % P.ny));
+    float4 z = zone_tint(c);
+    col = lerp(col, z.rgb, z.a);
+    if ((SC.flags & SCENE_BORDERS) != 0)
+    {
+        uint b    = (face_flags[owner] >> (8 * side)) & 0xffu;
+        bool edge = (side == 0 && c.x == 0) || (side == 1 && c.x + 1 == int(P.nx)) || (side == 2 && c.y == 0) || (side == 3 && c.y + 1 == int(P.ny));
+        uint kind = 0;
+        bool hl = false, on = false;
+        if ((b & 7u) != 0)
+        {
+            kind = (b & 7u) - 1u;
+            hl   = SC.sel.w == HIGHLIGHT_GROUP + (b >> 3);
+            on   = true;
+        }
+        else if (edge)
+        {
+            kind = P.bc_kind[side];
+            hl   = SC.sel.w == HIGHLIGHT_SIDE + side;
+            on   = kind != BC_WALL || hl;
+        }
+        if (on)
+        {
+            float3 tint = bc_color(kind);
+            col = lerp(col, hl ? lerp(tint, float3(1.0f), 0.5f) : tint, 0.85f);
+        }
+    }
+    if (in_selection(c))
+        col = lerp(col, SELECTION, 0.32f);
+    if (is_hovered(c))
+        col = lerp(col, float3(1.0f), 0.18f);
+    return col;
 }
 
 // Ground colouring on: a groundwater quantity is chosen and the case has an aquifer, or the cumulated rain and
@@ -127,9 +223,81 @@ public int2 cell_of(float3 disp)
     return int2(int(floor(disp.x / (SC.S * P.dx))), int(floor(-disp.z / (SC.S * P.dy))));
 }
 
+bool in_grid(int2 c)
+{
+    return c.x >= 0 && c.y >= 0 && c.x < int(P.nx) && c.y < int(P.ny);
+}
+
+// Cell of the selection mask (one bit per cell)
 public bool in_selection(int2 c)
 {
-    return SC.sel.z >= SC.sel.x && c.x >= int(SC.sel.x) && c.x <= int(SC.sel.z) && c.y >= int(SC.sel.y) && c.y <= int(SC.sel.w);
+    if ((SC.flags & SCENE_SELECTION) == 0 || !in_grid(c))
+        return false;
+    uint k = idx(uint(c.x), uint(c.y));
+    return ((selmask[k >> 5] >> (k & 31u)) & 1u) != 0;
+}
+
+public bool is_hovered(int2 c)
+{
+    return SC.sel.x != ~0u && c.x == int(SC.sel.x) && c.y == int(SC.sel.y);
+}
+
+// Colour of a boundary condition kind (BC_*), same as src/render/Colormap.cpp bcColor()
+public float3 bc_color(uint kind)
+{
+    switch (kind)
+    {
+    case BC_INFLOW: return float3(0.25f, 0.55f, 1.00f);
+    case BC_LEVEL:  return float3(0.10f, 0.85f, 0.75f);
+    case BC_FREE:   return float3(0.72f, 0.48f, 1.00f);
+    case BC_DEPTH:  return float3(0.98f, 0.40f, 0.78f);
+    default:        return float3(0.55f, 0.57f, 0.62f);
+    }
+}
+
+// Boundary conditions of cell c: for each side, a band along the face coloured by the kind. Face conditions
+// (face_flags: per side a byte kind + 1 | group << 3) and the open sides of the domain; a highlighted side or
+// group is drawn wider and lighter, walls of the domain only when highlighted.
+float3 border_overlay(float3 col, int2 c, float2 f, float2 px)
+{
+    if ((SC.flags & SCENE_BORDERS) == 0 || !in_grid(c))
+        return col;
+    uint   flags = face_flags[idx(uint(c.x), uint(c.y))];
+    float2 wb    = clamp(2.5f * px, 0.06f, 0.5f);        // ~2.5 px on screen
+    for (uint side = 0; side < 4; ++side)
+    {
+        uint b    = (flags >> (8 * side)) & 0xffu;
+        bool edge = (side == 0 && c.x == 0) || (side == 1 && c.x + 1 == int(P.nx)) ||
+                    (side == 2 && c.y == 0) || (side == 3 && c.y + 1 == int(P.ny));
+        uint kind;
+        bool hl;
+        if ((b & 7u) != 0)
+        {
+            kind = (b & 7u) - 1u;
+            hl   = SC.sel.w == HIGHLIGHT_GROUP + (b >> 3);
+        }
+        else
+        {
+            if (!edge)
+                continue;
+            kind = P.bc_kind[side];
+            hl   = SC.sel.w == HIGHLIGHT_SIDE + side;
+            if (kind == BC_WALL && !hl)
+                continue;
+        }
+        float d = side == 0 ? f.x : side == 1 ? 1.0f - f.x : side == 2 ? f.y : 1.0f - f.y;
+        // the meshes join the cell centres: the outer half of an edge cell is not drawn, so a band on a face of
+        // the domain's edge sits against the drawn edge (the cell centre)
+        if (edge)
+            d -= 0.5f;
+        float w = (side < 2 ? wb.x : wb.y) * (hl ? 1.8f : 1.0f);
+        if (d < w)
+        {
+            float3 tint = bc_color(kind);
+            col = lerp(col, hl ? lerp(tint, float3(1.0f), 0.5f) : tint, 0.95f);
+        }
+    }
+    return col;
 }
 
 // zone tint of a cell (alpha 0 = none)
@@ -137,6 +305,8 @@ public float4 zone_tint(int2 c)
 {
     if ((SC.flags & SCENE_ZONES) == 0 || c.x < 0 || c.y < 0 || c.x >= int(P.nx) || c.y >= int(P.ny))
         return float4(0.0f);
+    if (bridge_at(idx(uint(c.x), uint(c.y))))
+        return float4(0.95f, 0.6f, 0.25f, 0.5f);        // under a bridge deck (Conditions > Ouvrages)
     uint z = cond[idx(uint(c.x), uint(c.y))];
     if (z == 0)
         return float4(0.0f);
@@ -179,18 +349,50 @@ float3 chrono_overlay(float3 col, float3 disp, int2 c)
     return col;
 }
 
-// selection + zone overlays applied to a shaded colour
+public static const float3 SELECTION = float3(1.0f, 0.80f, 0.20f);   // src/render/SceneParams.h kSelectionColor
+
+// Cell boundaries ("Maillage"): lines of constant width on screen at the edges of the cells (the render mesh
+// joins the cell centres, so its own edges would sit half a cell off). The lines fade with the size of a cell
+// on screen: far away (cells of a few pixels) they would turn the whole terrain black.
+float3 mesh_overlay(float3 col, float2 f, float2 px)
+{
+    if ((SC.flags & SCENE_MESH) == 0)
+        return col;
+    float cellPx = 1.0f / max(max(px.x, px.y), 1e-6f);
+    float fade   = 0.85f * smoothstep(3.0f, 14.0f, cellPx);
+    if (fade < 0.01f)
+        return col;
+    float2 d    = min(f, 1.0f - f) / max(px, 1e-6f);        // distance to the nearest edge, in pixels
+    float  line = 1.0f - smoothstep(0.5f, 1.5f, min(d.x, d.y));
+    return lerp(col, float3(0.08f, 0.10f, 0.12f), line * fade);
+}
+
+// Mesh, selection, hovered cell, boundary conditions and zone overlays applied to a shaded colour
 public float3 overlays(float3 col, float3 disp)
 {
-    int2   c = cell_of(disp);
-    float4 z = zone_tint(c);
+    int2   c  = cell_of(disp);
+    float2 u  = float2(disp.x / (SC.S * P.dx), -disp.z / (SC.S * P.dy));        // position in cell units
+    float2 f  = u - float2(c);                                                   // position in the cell
+    float2 px = fwidth(u);        // one pixel, in cell units (from the unwrapped coordinate: f jumps at the edges)
+    float4 z  = zone_tint(c);
     col = lerp(col, z.rgb, z.a);
     col = chrono_overlay(col, disp, c);
+    col = mesh_overlay(col, f, px);
+    col = border_overlay(col, c, f, px);
     if (in_selection(c))
     {
-        // orange tint with a 1-cell border
-        bool border = c.x == int(SC.sel.x) || c.x == int(SC.sel.z) || c.y == int(SC.sel.y) || c.y == int(SC.sel.w);
-        col = lerp(col, float3(1.0f, 0.6f, 0.15f), border ? 0.85f : 0.3f);
+        // every selected cell is tinted; the outline of the selected set (faces towards unselected cells) is a
+        // crisp line of constant width on screen
+        float2 w    = clamp(1.6f * px, 0.03f, 0.45f);
+        bool   edge = (f.x < w.x && !in_selection(c - int2(1, 0))) || (f.x > 1.0f - w.x && !in_selection(c + int2(1, 0))) ||
+                      (f.y < w.y && !in_selection(c - int2(0, 1))) || (f.y > 1.0f - w.y && !in_selection(c + int2(0, 1)));
+        col = lerp(col, SELECTION, edge ? 0.95f : 0.32f);
+    }
+    if (is_hovered(c))
+    {
+        float2 w    = clamp(1.3f * px, 0.03f, 0.45f);
+        bool   edge = f.x < w.x || f.x > 1.0f - w.x || f.y < w.y || f.y > 1.0f - w.y;
+        col = lerp(col, float3(1.0f), edge ? 0.9f : 0.18f);
     }
     return col;
 }
@@ -200,6 +402,10 @@ public float3 overlays(float3 col, float3 disp)
 [[vk::binding(1, 2)]] public StructuredBuffer<uint>      outside;
 // orthophoto of the domain, row 0 = north edge; u = x / Lx, v = 1 - y / Ly (physical metres)
 [[vk::binding(2, 2)]] public Sampler2D                   ortho;
+// selected cells, one bit per cell (bit k & 31 of word k >> 5), meaningful with SCENE_SELECTION
+[[vk::binding(3, 2)]] public StructuredBuffer<uint>      selmask;
+// face conditions per cell: one byte per side (west, east, south, north): 0 none, else kind + 1 | group << 3
+[[vk::binding(4, 2)]] public StructuredBuffer<uint>      face_flags;
 
 public float outside_at(uint k)
 {

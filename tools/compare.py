@@ -32,6 +32,11 @@ def main():
     ap.add_argument("--front-cells", type=int, default=0, help="cells allowed above --tol (fronts), L1 still checked")
     ap.add_argument("--front-frac", type=float, default=0.0,
                     help="same as --front-cells as a fraction of the cell count (the larger applies)")
+    ap.add_argument("--still-atol", type=float, default=0.0,
+                    help="cells where the test is exactly at rest (hu = hv = 0) and the reference moves by less than "
+                         "this (m2/s) are not compared in momentum: the Python reference has spurious currents on "
+                         "still water over real beds (2.3e-6 m2/s after 1 step, 6e-5 after 100 on meuse), the C++ "
+                         "none (exact lake at rest)")
     args = ap.parse_args()
 
     q_ref, zb_ref, m_ref = load(args.ref)
@@ -61,6 +66,10 @@ def main():
         scale = scale or max(float(np.abs(a).max()), 1e-30)
         l1 = l1 or max(float(np.abs(a).sum()), 1e-30)
         diff = np.abs(a.astype(np.float64) - b.astype(np.float64))
+        if name in ("hu", "hv") and args.still_atol > 0:
+            # at rest in the test: |q| <= 1e-8 m2/s (exactly 0 for still water; 1e-9 noise next to moving water)
+            still = (np.abs(q_tst[..., 1:3]).max(axis=-1) <= 1e-8) & (np.abs(q_ref[..., 1:3]).max(axis=-1) <= args.still_atol)
+            diff = np.where(still, 0.0, diff)
         rel_max = float(diff.max()) / scale
         rel_l1 = float(diff.sum()) / l1
         n_bad = int((diff > args.tol * scale).sum())

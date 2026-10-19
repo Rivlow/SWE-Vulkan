@@ -1,9 +1,10 @@
 // GUI of the application (ImGui + ImPlot): a four-stage workflow (Map, Terrain, Conditions, Simulation) with a
-// stage bar at the top, one side panel whose content follows the stage, the view in the remaining space and a
-// plots band under it in the Simulation stage. Fixed layout, computed from the viewport every frame.
-// The frame loop is in App.cpp.
+// stepper bar at the top, one side panel whose content follows the stage (sections drawn as cards), the view in
+// the remaining space and a plots band under it in the Simulation stage. Fixed layout, computed from the
+// viewport every frame. The theme and the fonts are set in App::initImGui (App.cpp), the frame loop in App.cpp.
 #include "app/App.h"
 
+#include "util/FileDialog.h"
 #include "util/Log.h"
 #include "util/Paths.h"
 
@@ -21,25 +22,45 @@ namespace swe {
 
 namespace {
 
-constexpr float kSidePanelWidth = 390.0f;
-constexpr float kStageBarHeight = 46.0f;
+constexpr float kSidePanelWidth = 400.0f;        // x dpi
+constexpr float kStageBarHeight = 58.0f;         // x dpi
 
 constexpr ImGuiWindowFlags kFixedWindow = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                                           ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
                                           ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
 
+// palette of the GUI (the widgets' colours come from the style, App.cpp applyTheme)
+constexpr ImVec4 kAccent{0.22f, 0.56f, 0.96f, 1.0f};
+constexpr ImVec4 kAccentHi{0.32f, 0.64f, 1.0f, 1.0f};
+constexpr ImVec4 kAccentLo{0.16f, 0.46f, 0.84f, 1.0f};
+constexpr ImVec4 kWarn{1.0f, 0.72f, 0.25f, 1.0f};
+constexpr ImVec4 kDanger{0.96f, 0.36f, 0.32f, 1.0f};
+constexpr ImVec4 kOk{0.35f, 0.82f, 0.45f, 1.0f};
+constexpr ImVec4 kMuted{0.56f, 0.59f, 0.65f, 1.0f};
+constexpr ImVec4 kCardBg{0.145f, 0.160f, 0.190f, 1.0f};
+constexpr ImVec4 kBarBg{0.085f, 0.095f, 0.11f, 1.0f};
+
+ImVec4 toImVec4(glm::vec3 c, float a = 1.0f)
+{
+	return ImVec4(c.r, c.g, c.b, a);
+}
+
 struct StageInfo
 {
-	char const *number;
 	char const *label;
 	char const *hint;
 };
 constexpr StageInfo kStages[] = {
-    {"1", "Carte", "Choisir une zone sur la carte et importer son relief, ou ouvrir un cas enregistré"},
-    {"2", "Terrain", "Le relief en 3D : exagération verticale, orthophoto, retouches du lit"},
-    {"3", "Conditions", "Eau initiale, sol et nappe, pluie, zones et conditions aux limites, sur le maillage"},
-    {"4", "Simulation", "Lancer, suivre le bilan, colorer, sonder, tracer des courbes"},
+    {"Carte", "Choisir une zone sur la carte et importer son relief, ou ouvrir un cas enregistré"},
+    {"Terrain", "Le relief en 3D : exagération verticale, orthophoto, retouches du lit"},
+    {"Conditions", "Eau initiale, sol et nappe, pluie, zones et conditions aux limites, sur le maillage"},
+    {"Simulation", "Lancer, suivre le bilan, colorer, sonder, tracer des courbes"},
 };
+
+constexpr char const *kSideNames[4]  = {"Ouest", "Est", "Sud", "Nord"};
+constexpr char const *kSideShort[4]  = {"O", "E", "S", "N"};
+constexpr char const *kBcKindNames[] = {"mur", "débit entrant", "niveau imposé", "sortie libre", "hauteur imposée"};
+constexpr int         kBcKinds       = int(std::size(kBcKindNames));
 
 // probe colours (also used by the plots and the 3D markers)
 ImVec4 probeColor(size_t p)
@@ -59,7 +80,7 @@ void tip(char const *text)
 std::string formatTime(double t)
 {
 	if (!std::isfinite(t) || t < 0.0 || t > 1e9)
-		return "—";
+		return "-";
 	if (t < 120.0)
 		return std::format("{:.2f} s", t);
 	int s = static_cast<int>(t);
@@ -78,6 +99,11 @@ std::string formatVolume(double v)
 	if (v >= 1e6)
 		return std::format("{:.4g} hm³", v * 1e-6);
 	return std::format("{:.4g} m³", v);
+}
+
+std::string formatLength(double m)
+{
+	return m >= 1e4 ? std::format("{:.2f} km", m * 1e-3) : std::format("{:.0f} m", m);
 }
 
 struct ColorModeInfo
@@ -113,21 +139,187 @@ ColorModeInfo const &colorModeInfo(ColorMode m)
 	return kColorModes[static_cast<int>(m)];
 }
 
-// Prominent full-width action button (the "next step" of each stage)
-bool primaryButton(char const *label, float height = 0.0f)
-{
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.48f, 0.78f, 1.0f));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.58f, 0.90f, 1.0f));
-	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.40f, 0.68f, 1.0f));
-	bool pressed = ImGui::Button(label, ImVec2(-1, height));
-	ImGui::PopStyleColor(3);
-	return pressed;
-}
-
 std::filesystem::path capturePath(char const *prefix)
 {
 	return paths::dataDir() / "captures" /
 	       std::format("{}_{:%Y%m%d_%H%M%S}.png", prefix, std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()));
+}
+
+// ---- widgets ----------------------------------------------------------------------------------------------
+
+// Full-width accent button (the "next step" of each stage)
+bool primaryButton(char const *label, float height = 0.0f, float width = -1.0f)
+{
+	ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kAccentHi);
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, kAccentLo);
+	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
+	bool pressed = ImGui::Button(label, ImVec2(width, height));
+	ImGui::PopStyleColor(4);
+	return pressed;
+}
+
+// Small flat button (no background until hovered): toolbars, row actions
+bool ghostButton(char const *label, ImVec2 size = ImVec2(0, 0))
+{
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1, 1, 1, 0.08f));
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1, 1, 1, 0.14f));
+	bool pressed = ImGui::Button(label, size);
+	ImGui::PopStyleColor(3);
+	return pressed;
+}
+
+// Row of exclusive buttons; returns true when the value changed
+bool segmented(char const *id, int &value, std::span<char const *const> labels, float width = -1.0f)
+{
+	bool  changed = false;
+	float avail   = width > 0.0f ? width : ImGui::GetContentRegionAvail().x;
+	float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
+	float w       = (avail - spacing * float(labels.size() - 1)) / float(labels.size());
+	ImGui::PushID(id);
+	for (size_t k = 0; k < labels.size(); ++k)
+	{
+		bool on = int(k) == value;
+		if (k > 0)
+			ImGui::SameLine(0.0f, spacing);
+		ImGui::PushStyleColor(ImGuiCol_Button, on ? kAccent : ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? kAccentHi : ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, on ? kAccentLo : ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+		ImGui::PushStyleColor(ImGuiCol_Text, on ? ImVec4(1, 1, 1, 1) : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+		if (ImGui::Button(labels[k], ImVec2(w, 0)) && !on)
+		{
+			value   = int(k);
+			changed = true;
+		}
+		ImGui::PopStyleColor(4);
+	}
+	ImGui::PopID();
+	return changed;
+}
+
+// Small rounded label with a coloured background (status)
+void badge(char const *text, ImVec4 color, bool darkText = true)
+{
+	auto  *dl  = ImGui::GetWindowDrawList();
+	ImVec2 p   = ImGui::GetCursorScreenPos();
+	ImVec2 ts  = ImGui::CalcTextSize(text);
+	float  pad = 7.0f, h = ImGui::GetFrameHeight();
+	ImVec2 a(p.x, p.y), b(p.x + ts.x + 2 * pad, p.y + h);
+	dl->AddRectFilled(a, b, ImGui::GetColorU32(color), h * 0.5f);
+	dl->AddText(ImVec2(a.x + pad, a.y + (h - ts.y) * 0.5f), darkText ? IM_COL32(20, 22, 26, 255) : IM_COL32(245, 246, 248, 255), text);
+	ImGui::Dummy(ImVec2(b.x - a.x, h));
+}
+
+// Filled dot (colour key)
+void dot(ImVec4 color, float r = 5.0f)
+{
+	auto  *dl = ImGui::GetWindowDrawList();
+	ImVec2 p  = ImGui::GetCursorScreenPos();
+	float  h  = ImGui::GetFrameHeight();
+	dl->AddCircleFilled(ImVec2(p.x + r + 1.0f, p.y + h * 0.5f), r, ImGui::GetColorU32(color));
+	ImGui::Dummy(ImVec2(2 * r + 2.0f, h));
+}
+
+// Label on the left (muted), value on the right
+void kv(char const *label, std::string const &value, ImVec4 valueColor = ImVec4(0, 0, 0, 0))
+{
+	ImGui::TextDisabled("%s", label);
+	float w = ImGui::CalcTextSize(value.c_str()).x;
+	ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 8.0f, ImGui::GetContentRegionMax().x - w));
+	if (valueColor.w > 0.0f)
+		ImGui::TextColored(valueColor, "%s", value.c_str());
+	else
+		ImGui::TextUnformatted(value.c_str());
+}
+
+// Muted small heading inside a card
+void sectionLabel(char const *text)
+{
+	ImGui::Spacing();
+	ImGui::TextDisabled("%s", text);
+	ImGui::Spacing();
+}
+
+// Card: bordered child with a title row (bold) and an accent bar on its left. Collapsible cards remember their
+// state in the window's storage. Returns true when the body is to be drawn; always call endCard() afterwards.
+struct CardState
+{
+	bool open;
+};
+
+bool beginCard(char const *id, char const *title, ImFont *bold, bool collapsible = false, bool defaultOpen = true,
+               char const *rightText = nullptr)
+{
+	ImGuiID    key   = ImGui::GetID(id);
+	auto      *store = ImGui::GetStateStorage();
+	bool       open  = collapsible ? store->GetBool(key, defaultOpen) : true;
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, kCardBg);
+	ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+	ImGui::PopStyleColor();
+	auto  *dl   = ImGui::GetWindowDrawList();
+	ImVec2 wmin = ImGui::GetWindowPos(), wmax(wmin.x + ImGui::GetWindowWidth(), wmin.y + ImGui::GetWindowHeight());
+	dl->AddRectFilled(ImVec2(wmin.x, wmin.y + 10.0f), ImVec2(wmin.x + 3.0f, wmax.y - 10.0f), ImGui::GetColorU32(open ? kAccent : kMuted), 2.0f);
+	// title row (clickable when collapsible)
+	ImVec2 rowPos  = ImGui::GetCursorScreenPos();
+	float  rowH    = ImGui::GetFrameHeight();
+	float  rowW    = ImGui::GetContentRegionAvail().x;
+	if (collapsible)
+	{
+		if (ImGui::InvisibleButton("##hdr", ImVec2(rowW, rowH)))
+		{
+			open = !open;
+			store->SetBool(key, open);
+		}
+		if (ImGui::IsItemHovered())
+			dl->AddRectFilled(ImVec2(rowPos.x - 4, rowPos.y), ImVec2(rowPos.x + rowW + 4, rowPos.y + rowH), IM_COL32(255, 255, 255, 10), 4.0f);
+		// chevron
+		float  cx = rowPos.x + rowW - 10.0f, cy = rowPos.y + rowH * 0.5f;
+		ImU32  cc = ImGui::GetColorU32(kMuted);
+		if (open)
+			dl->AddTriangleFilled(ImVec2(cx - 5, cy - 2.5f), ImVec2(cx + 5, cy - 2.5f), ImVec2(cx, cy + 3.5f), cc);
+		else
+			dl->AddTriangleFilled(ImVec2(cx - 2.5f, cy - 5), ImVec2(cx - 2.5f, cy + 5), ImVec2(cx + 3.5f, cy), cc);
+		ImGui::SetCursorScreenPos(rowPos);
+	}
+	ImGui::PushFont(bold, 0.0f);
+	ImGui::AlignTextToFramePadding();
+	ImGui::TextUnformatted(title);
+	ImGui::PopFont();
+	if (rightText && *rightText)
+	{
+		float w = ImGui::CalcTextSize(rightText).x;
+		ImGui::SameLine(rowW - w - (collapsible ? 22.0f : 0.0f));
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextDisabled("%s", rightText);
+	}
+	// (the title text, as high as the invisible button, leaves the cursor under the row: no SetCursorPos here,
+	// ImGui wants an item after any cursor move that extends the window)
+	if (open)
+		ImGui::Spacing();
+	return open;
+}
+
+void endCard()
+{
+	ImGui::EndChild();
+	ImGui::Spacing();
+}
+
+char const *bcUnit(BcKind k)
+{
+	switch (k)
+	{
+	case BcKind::Inflow: return "%.1f m³/s";
+	case BcKind::Level: return "%.2f m DNG";
+	case BcKind::Depth: return "%.2f m";
+	default: return "%.2f";
+	}
+}
+
+bool bcHasValue(BcKind k)
+{
+	return k == BcKind::Inflow || k == BcKind::Level || k == BcKind::Depth;
 }
 
 }        // namespace
@@ -138,7 +330,8 @@ std::filesystem::path capturePath(char const *prefix)
 
 void App::drawGui()
 {
-	if (autoRange_)        // the legend stays in presentation mode: keep its range live there too
+	highlight_ = HIGHLIGHT_NONE;        // set again by the widgets hovered this frame
+	if (autoRange_)                     // the legend stays in presentation mode: keep its range live there too
 		autoColorRange();
 	auto  *vp = ImGui::GetMainViewport();
 	ImVec2 sc = ImGui::GetIO().DisplayFramebufferScale;
@@ -160,10 +353,11 @@ void App::drawGui()
 	float  menuH = ImGui::GetFrameHeight();
 	ImVec2 origin(vp->Pos.x, vp->Pos.y + menuH);
 	ImVec2 work(vp->Size.x, vp->Size.y - menuH);
-	drawStageBar(origin.y, kStageBarHeight);
+	float  barH = std::round(kStageBarHeight * dpi_);
+	drawStageBar(origin.y, barH);
 
-	float  panelW = std::min(kSidePanelWidth, std::round(work.x * 0.42f));
-	ImVec2 panelPos(origin.x, origin.y + kStageBarHeight), panelSize(panelW, work.y - kStageBarHeight);
+	float  panelW = std::min(std::round(kSidePanelWidth * dpi_), std::round(work.x * 0.42f));
+	ImVec2 panelPos(origin.x, origin.y + barH), panelSize(panelW, work.y - barH);
 	ImVec2 viewPos(origin.x + panelW, panelPos.y), viewSize(work.x - panelW, panelSize.y);
 	bool   plots  = stage_ == Stage::Simulation && showPlots_;
 	float  plotsH = plots ? std::round(viewSize.y * 0.30f) : 0.0f;
@@ -181,6 +375,7 @@ void App::drawGui()
 		{
 			drawLegend();
 			drawProbeMarkers();
+			drawViewOverlay();
 		}
 	}
 	if (showPerf_)
@@ -225,6 +420,7 @@ void App::drawMenuBar()
 	if (ImGui::BeginMenu("Affichage"))
 	{
 		ImGui::MenuItem("Courbes (étape Simulation)", nullptr, &showPlots_);
+		ImGui::MenuItem("Conditions aux limites dans la vue", nullptr, &render_.showBorders);
 		ImGui::MenuItem("Performances", nullptr, &showPerf_);
 		if (ImGui::MenuItem("Interface masquée", "F11", hideGui_))
 			hideGui_ = !hideGui_;
@@ -242,67 +438,123 @@ void App::drawMenuBar()
 	ImGui::EndMainMenuBar();
 }
 
-// Stage bar: the four steps of the workflow, the current one highlighted; status on the right
+// Stepper: the four steps as numbered discs joined by a line, the current one filled with the accent, the
+// completed ones outlined; status (case, clock, badges) on the right
 void App::drawStageBar(float y, float height)
 {
 	auto *vp = ImGui::GetMainViewport();
 	ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, y));
 	ImGui::SetNextWindowSize(ImVec2(vp->Size.x, height));
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 7.0f));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 0.0f));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.09f, 0.10f, 0.12f, 1.0f));
-	if (ImGui::Begin("##stagebar", nullptr, kFixedWindow | ImGuiWindowFlags_NoScrollbar))
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, kBarBg);
+	if (ImGui::Begin("##stagebar", nullptr, kFixedWindow | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse))
 	{
-		bool loaded = session_->loaded();
+		auto  *dl     = ImGui::GetWindowDrawList();
+		bool   loaded = session_->loaded();
+		float  r      = std::round(12.0f * dpi_);
+		float  cy     = ImGui::GetWindowPos().y + height * 0.5f;
+		float  x      = ImGui::GetWindowPos().x + 16.0f * dpi_ + r;
+		float  gap    = std::round(26.0f * dpi_);
+		int    cur    = int(stage_);
+		ImGui::PushFont(fontBold_, 0.0f);
 		for (int k = 0; k < 4; ++k)
 		{
-			auto  s      = static_cast<Stage>(k);
-			bool  active = s == stage_;
-			bool  enabled = k == 0 || loaded;
-			auto  label  = std::format("{}  {}", kStages[k].number, kStages[k].label);
+			bool   active  = k == cur, done = k < cur, enabled = k == 0 || loaded;
+			ImVec4 colV    = !enabled ? ImVec4(0.30f, 0.33f, 0.38f, 1) : active ? kAccent : done ? kAccentHi : kMuted;
+			ImU32  col     = ImGui::GetColorU32(colV);
+			auto   label   = kStages[k].label;
+			ImVec2 ts      = ImGui::CalcTextSize(label);
+			float  w       = 2 * r + 8.0f + ts.x;
+			// hit area
+			ImGui::SetCursorScreenPos(ImVec2(x - r, cy - r - 4.0f));
 			ImGui::PushID(k);
+			ImGui::BeginDisabled(!enabled);
+			if (ImGui::InvisibleButton("##step", ImVec2(w, 2 * r + 8.0f)) && !active)
+				setStage(static_cast<Stage>(k));
+			ImGui::EndDisabled();
+			bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
+			if (hovered)
+				ImGui::SetTooltip("%s", kStages[k].hint);
+			ImGui::PopID();
+			// disc
 			if (active)
-			{
-				ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.48f, 0.78f, 1.0f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.48f, 0.78f, 1.0f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.16f, 0.48f, 0.78f, 1.0f));
-			}
+				dl->AddCircleFilled(ImVec2(x, cy), r, col, 32);
 			else
 			{
-				ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.18f, 0.21f, 1.0f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.27f, 0.31f, 1.0f));
-				ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.20f, 0.23f, 0.27f, 1.0f));
+				if (hovered && enabled)
+					dl->AddCircleFilled(ImVec2(x, cy), r, IM_COL32(255, 255, 255, 18), 32);
+				dl->AddCircle(ImVec2(x, cy), r - 1.0f, col, 32, 2.0f);
 			}
-			ImGui::BeginDisabled(!enabled);
-			if (ImGui::Button(label.c_str(), ImVec2(150.0f, height - 14.0f)) && !active)
-				setStage(s);
-			ImGui::EndDisabled();
-			ImGui::PopStyleColor(3);
-			tip(kStages[k].hint);
-			ImGui::PopID();
+			auto   num = std::to_string(k + 1);
+			ImVec2 ns  = ImGui::CalcTextSize(num.c_str());
+			dl->AddText(ImVec2(x - ns.x * 0.5f, cy - ns.y * 0.5f), active ? IM_COL32(255, 255, 255, 255) : col, num.c_str());
+			// label
+			ImU32 tc = !enabled ? ImGui::GetColorU32(ImVec4(0.40f, 0.43f, 0.48f, 1)) : active || hovered ? ImGui::GetColorU32(ImGuiCol_Text) : ImGui::GetColorU32(kMuted);
+			dl->AddText(ImVec2(x + r + 8.0f, cy - ts.y * 0.5f), tc, label);
+			x += w;
 			if (k < 3)
 			{
-				ImGui::SameLine(0.0f, 6.0f);
-				ImGui::TextDisabled(">");
-				ImGui::SameLine(0.0f, 6.0f);
+				// connector
+				ImU32 lc = ImGui::GetColorU32(k < cur ? kAccentHi : ImVec4(0.26f, 0.29f, 0.34f, 1));
+				dl->AddLine(ImVec2(x + 6.0f, cy), ImVec2(x + gap - 6.0f, cy), lc, 2.0f);
+				x += gap + r;
 			}
 		}
+		ImGui::PopFont();
 
-		// status: import in progress, else case / clock / pause
-		std::string status;
+		// status, right-aligned: import progress, else case / clock / badges
+		float right = ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - 16.0f * dpi_;
 		if (map_->importing())
-			status = std::format("Import... {}  {:.0f} %", map_->progressStage(), 100.0f * map_->progressFraction());
-		else
 		{
-			auto const &c = session_->caseData();
-			status        = std::format("{}   t = {}{}{}", c.label, formatTime(scalars_.t),
-			                            stage_ == Stage::Simulation ? (paused_ ? "   EN PAUSE" : "") : "   (t = 0, en pause)",
-			                            recording_ ? "   ● REC" : "");
+			auto  txt = std::format("Import : {}", map_->progressStage());
+			float pw  = std::round(220.0f * dpi_);
+			ImGui::SetCursorScreenPos(ImVec2(right - pw, cy - ImGui::GetFrameHeight() * 0.5f));
+			ImGui::PushStyleColor(ImGuiCol_PlotHistogram, kAccent);
+			ImGui::ProgressBar(map_->progressFraction(), ImVec2(pw, 0), std::format("{:.0f} %", 100.0f * map_->progressFraction()).c_str());
+			ImGui::PopStyleColor();
+			float tw = ImGui::CalcTextSize(txt.c_str()).x;
+			dl->AddText(ImVec2(right - pw - tw - 12.0f, cy - ImGui::GetTextLineHeight() * 0.5f), ImGui::GetColorU32(kMuted), txt.c_str());
 		}
-		float w = ImGui::CalcTextSize(status.c_str()).x;
-		ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 20.0f, ImGui::GetWindowWidth() - w - 16.0f));
-		ImGui::AlignTextToFramePadding();
-		ImGui::TextUnformatted(status.c_str());
+		else if (loaded)
+		{
+			auto const &c    = session_->caseData();
+			std::string name = c.label;
+			std::string clk  = std::format("t = {}", formatTime(scalars_.t));
+			struct Badge { char const *text; ImVec4 color; bool dark; };
+			std::vector<Badge> badges;
+			if (recording_)
+				badges.push_back({"REC", kDanger, false});
+			if (stage_ == Stage::Simulation)
+				badges.push_back(paused_ ? Badge{"EN PAUSE", kWarn, true} : Badge{"EN COURS", kOk, true});
+			else
+				badges.push_back({"t = 0", ImVec4(0.26f, 0.29f, 0.34f, 1), false});
+			float h = ImGui::GetFrameHeight(), xr = right;
+			for (auto it = badges.rbegin(); it != badges.rend(); ++it)
+			{
+				float bw = ImGui::CalcTextSize(it->text).x + 14.0f;
+				xr -= bw;
+				ImGui::SetCursorScreenPos(ImVec2(xr, cy - h * 0.5f));
+				badge(it->text, it->color, it->dark);
+				xr -= 8.0f;
+			}
+			float cw = ImGui::CalcTextSize(clk.c_str()).x;
+			xr -= cw + 8.0f;
+			dl->AddText(ImVec2(xr, cy - ImGui::GetTextLineHeight() * 0.5f), ImGui::GetColorU32(kMuted), clk.c_str());
+			ImGui::PushFont(fontBold_, 0.0f);
+			float nw = ImGui::CalcTextSize(name.c_str()).x;
+			float maxW = std::max(xr - x - 60.0f, 80.0f);
+			if (nw > maxW)
+			{
+				while (name.size() > 4 && ImGui::CalcTextSize((name + "...").c_str()).x > maxW)
+					name.pop_back();
+				name += "...";
+				nw = ImGui::CalcTextSize(name.c_str()).x;
+			}
+			xr -= nw + 16.0f;
+			dl->AddText(ImVec2(xr, cy - ImGui::GetTextLineHeight() * 0.5f), ImGui::GetColorU32(ImGuiCol_Text), name.c_str());
+			ImGui::PopFont();
+		}
 	}
 	ImGui::End();
 	ImGui::PopStyleColor();
@@ -315,41 +567,12 @@ void App::drawSidePanel(ImVec2 pos, ImVec2 size)
 	ImGui::SetNextWindowPos(pos);
 	ImGui::SetNextWindowSize(size);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 12.0f));
 	if (ImGui::Begin("##side", nullptr, kFixedWindow))
 	{
 		switch (stage_)
 		{
-		case Stage::Map:
-		{
-			ImGui::SeparatorText("Cas enregistrés");
-			auto const &current = session_->caseData().name;
-			float       rows    = std::clamp(float(caseList_.size()), 2.0f, 7.0f);
-			if (ImGui::BeginListBox("##cases", ImVec2(-1, rows * ImGui::GetTextLineHeightWithSpacing() + 6.0f)))
-			{
-				for (auto const &info : caseList_)
-				{
-					bool selected = info.name == current;
-					if (ImGui::Selectable(info.label.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick) &&
-					    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-						openCase(info.name);
-					if (ImGui::IsItemHovered())
-						ImGui::SetTooltip("%s  (double-clic : ouvrir)", info.name.c_str());
-					if (ImGui::IsItemClicked() && !selected)
-					{
-						loadCase(info.name);        // shows its footprint on the map
-						setStage(Stage::Map);
-					}
-				}
-				ImGui::EndListBox();
-			}
-			if (primaryButton(std::format("Ouvrir « {} »  >", session_->caseData().label).c_str()))
-				openCase(current);
-			tip("Charge le cas et montre son terrain en 3D");
-			ImGui::Spacing();
-			map_->drawImportSidebar();
-			break;
-		}
+		case Stage::Map: drawMapPanel(); break;
 		case Stage::Terrain: drawTerrainPanel(); break;
 		case Stage::Conditions: drawConditionsPanel(); break;
 		case Stage::Simulation: drawSimulationPanel(); break;
@@ -379,6 +602,44 @@ void App::drawMapStage(ImVec2 pos, ImVec2 size)
 }
 
 // ---------------------------------------------------------------------------------------------
+// Stage 1: Map
+// ---------------------------------------------------------------------------------------------
+
+void App::drawMapPanel()
+{
+	if (beginCard("cases", "Cas enregistrés", fontBold_, false, true, std::format("{}", caseList_.size()).c_str()))
+	{
+		auto const &current = session_->caseData().name;
+		float       rows    = std::clamp(float(caseList_.size()), 2.0f, 7.0f);
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.11f, 0.12f, 0.145f, 1.0f));
+		if (ImGui::BeginListBox("##cases", ImVec2(-1, rows * ImGui::GetTextLineHeightWithSpacing() + 8.0f)))
+		{
+			for (auto const &info : caseList_)
+			{
+				bool selected = info.name == current;
+				if (ImGui::Selectable(info.label.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick) &&
+				    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+					openCase(info.name);
+				if (ImGui::IsItemHovered())
+					ImGui::SetTooltip("%s  (double-clic : ouvrir)", info.name.c_str());
+				if (ImGui::IsItemClicked() && !selected)
+				{
+					loadCase(info.name);        // shows its footprint on the map
+					setStage(Stage::Map);
+				}
+			}
+			ImGui::EndListBox();
+		}
+		ImGui::PopStyleColor();
+		if (primaryButton(std::format("Ouvrir « {} »", session_->caseData().label).c_str()))
+			openCase(current);
+		tip("Charge le cas et montre son terrain en 3D");
+	}
+	endCard();
+	map_->drawImportSidebar();
+}
+
+// ---------------------------------------------------------------------------------------------
 // Stage 2: Terrain
 // ---------------------------------------------------------------------------------------------
 
@@ -397,49 +658,64 @@ void App::drawCameraButtons()
 void App::drawTerrainPanel()
 {
 	auto const &c = session_->caseData();
-	ImGui::SeparatorText("Terrain");
-	ImGui::TextWrapped("%s", c.label.c_str());
-	ImGui::TextDisabled("%u x %u mailles de %.3g m  (%.2f M)", c.nx, c.ny, c.dx(), c.cells() * 1e-6);
-	ImGui::TextDisabled("%.0f x %.0f m, z_ref = %.0f m", c.Lx, c.Ly, c.z_ref);
-	auto [zmin, zmax] = session_->bedRange();
-	ImGui::TextDisabled("relief : %.1f à %.1f m DNG", zmin + c.z_ref, zmax + c.z_ref);
-	if (transition_.active)
-		ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Extrusion du relief... (clic pour passer)");
-
-	ImGui::SeparatorText("Vue");
-	drawCameraButtons();
-	ImGui::SetNextItemWidth(-110);
-	ImGui::SliderFloat("exagération", &render_.z_scale, 1.0f, 2.5f * zScale0_, "x %.2f");
-	tip("Exagération verticale du relief (les ombres suivent)");
-	if (renderer_->hasOrthophoto())
+	if (beginCard("terrain", "Terrain", fontBold_))
 	{
-		ImGui::Checkbox("Orthophoto", &render_.showOrtho);
-		if (render_.showOrtho)
+		ImGui::TextWrapped("%s", c.label.c_str());
+		ImGui::Spacing();
+		kv("Maillage", std::format("{} x {} mailles de {:.3g} m", c.nx, c.ny, c.dx()));
+		kv("Mailles", std::format("{:.2f} M", c.cells() * 1e-6));
+		kv("Emprise", std::format("{} x {}", formatLength(c.Lx), formatLength(c.Ly)));
+		auto [zmin, zmax] = session_->bedRange();
+		kv("Relief", std::format("{:.1f} à {:.1f} m DNG", zmin + c.z_ref, zmax + c.z_ref));
+		if (transition_.active)
+			ImGui::TextColored(kAccentHi, "Extrusion du relief... (clic pour passer)");
+	}
+	endCard();
+
+	if (beginCard("view", "Vue", fontBold_))
+	{
+		drawCameraButtons();
+		ImGui::SetNextItemWidth(-110);
+		ImGui::SliderFloat("exagération", &render_.z_scale, 1.0f, 2.5f * zScale0_, "x %.2f");
+		tip("Exagération verticale du relief (les ombres suivent)");
+		if (renderer_->hasOrthophoto())
 		{
-			ImGui::SameLine();
-			ImGui::SetNextItemWidth(-110);
-			ImGui::SliderFloat("mélange", &render_.orthoMix, 0.0f, 1.0f, "%.2f");
+			ImGui::Checkbox("Orthophoto", &render_.showOrtho);
+			if (render_.showOrtho)
+			{
+				ImGui::SameLine();
+				ImGui::SetNextItemWidth(-110);
+				ImGui::SliderFloat("mélange", &render_.orthoMix, 0.0f, 1.0f, "%.2f");
+			}
 		}
+		ImGui::Checkbox("Maillage", &meshPreference_);
+		render_.showMesh = meshPreference_;
+		ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.5f);
+		ImGui::Checkbox("Mailles brutes", &render_.blocks);
+		tip("Chaque maille dessinée comme une colonne à sommet plat, sans interpolation entre les centres\n"
+		    "(18 sommets par maille : plus lourd sur les grandes grilles)");
 	}
-	ImGui::Checkbox("Maillage", &meshPreference_);
-	render_.showMesh = meshPreference_;
+	endCard();
 
-	ImGui::SeparatorText("Relief");
-	if (caseGeo_)
+	if (beginCard("relief", "Relief", fontBold_))
 	{
-		ImGui::TextWrapped("Le LiDAR mesure la surface de l'eau : là où aucune bathymétrie n'existe, le lit de la rivière se "
-		                   "creuse sur la carte (axe + largeur + profondeur).");
-		if (ImGui::Button("Modifier le lit sur la carte", ImVec2(-1, 0)))
-			setStage(Stage::Map);
-		tip("Retour à la carte : section « Avancé » > « Lit de rivière »");
+		if (caseGeo_)
+		{
+			ImGui::TextWrapped("Le LiDAR mesure la surface de l'eau : là où aucune bathymétrie n'existe, le lit de la rivière se "
+			                   "creuse sur la carte (axe + largeur + profondeur).");
+			if (ImGui::Button("Modifier le lit sur la carte", ImVec2(-1, 0)))
+				setStage(Stage::Map);
+			tip("Retour à la carte : section « Avancé » > « Lit de rivière »");
+		}
+		else
+			ImGui::TextDisabled("Cas analytique : relief fixé par le cas.");
 	}
-	else
-		ImGui::TextDisabled("Cas analytique : relief fixé par le cas.");
+	endCard();
 
 	// footer
 	float footer = ImGui::GetFrameHeightWithSpacing() * 1.6f;
 	ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), ImGui::GetWindowHeight() - footer));
-	if (primaryButton("Suivant : Conditions  >", ImGui::GetFrameHeight() * 1.3f))
+	if (primaryButton("Suivant : Conditions", ImGui::GetFrameHeight() * 1.3f))
 		setStage(Stage::Conditions);
 }
 
@@ -447,257 +723,660 @@ void App::drawTerrainPanel()
 // Stage 3: Conditions
 // ---------------------------------------------------------------------------------------------
 
-void App::drawSelectionHeader()
+// Selection card: mode, statistics of the selected cells, quick selections
+void App::drawSelectionCard()
 {
-	auto const &c   = session_->caseData();
-	auto        sel = render_.selection;
-	bool hasSel     = sel.z >= sel.x && sel.w >= sel.y;
-	ImGui::SeparatorText("Sélection");
-	if (hasSel)
+	auto const &c = session_->caseData();
+	auto        right = hasSelection() ? std::format("{} maille{}", selStats_.count, selStats_.count > 1 ? "s" : "") : std::string("aucune maille");
+	if (!beginCard("selection", "Sélection", fontBold_, false, true, right.c_str()))
 	{
-		uint32_t ni = sel.z - sel.x + 1, nj = sel.w - sel.y + 1;
-		ImGui::Text("mailles (%u..%u, %u..%u) : %u x %u = %u", sel.x, sel.z, sel.y, sel.w, ni, nj, ni * nj);
-		float zmin = 1e30f, zmax = -1e30f;
-		for (uint32_t i = sel.x; i <= sel.z; ++i)
-			for (uint32_t j = sel.y; j <= sel.w; ++j)
-			{
-				float z = c.zb[size_t(i) * c.ny + j];
-				zmin    = std::min(zmin, z);
-				zmax    = std::max(zmax, z);
-			}
-		ImGui::TextDisabled("%.0f x %.0f m, fond %.2f à %.2f m DNG", ni * c.dx(), nj * c.dy(), zmin + c.z_ref, zmax + c.z_ref);
+		endCard();
+		return;
+	}
+	int mode = int(selectMode_);
+	static char const *const kModes[] = {"Rectangle", "Pinceau"};
+	float modeW = ImGui::GetContentRegionAvail().x;
+	if (selectMode_ == SelectMode::Brush)
+		modeW -= 120.0f;
+	if (segmented("mode", mode, kModes, modeW))
+		selectMode_ = static_cast<SelectMode>(mode);
+	tip("Rectangle : glisser dans la vue. Pinceau : peindre les mailles sous le curseur.\n"
+	    "Maj + glisser : ajouter, Ctrl + glisser : retirer, clic simple : une maille.");
+	if (selectMode_ == SelectMode::Brush)
+	{
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(-1);
+		ImGui::SliderInt("##radius", &brushRadius_, 0, 8, "rayon %d");
+		tip("Mailles autour de la maille peinte");
+	}
+
+	if (hasSelection())
+	{
+		auto const &b  = selStats_.bounds;
+		uint32_t    ni = b.i1 - b.i0 + 1, nj = b.j1 - b.j0 + 1;
+		ImGui::TextDisabled("i %u..%u, j %u..%u  (%u x %u)   %s", b.i0, b.i1, b.j0, b.j1, ni, nj,
+		                    formatArea(double(selStats_.count) * c.dx() * c.dy()).c_str());
+		ImGui::TextDisabled("fond %.2f à %.2f m DNG", selStats_.zmin + c.z_ref, selStats_.zmax + c.z_ref);
 	}
 	else
-		ImGui::TextWrapped("Glisser dans la vue : rectangle de mailles (Échap : annuler).");
-	if (ImGui::SmallButton("Tout le domaine"))
-	{
-		selAnchor_        = Probe{0, 0};
-		selCurrent_       = Probe{c.nx - 1, c.ny - 1};
-		render_.selection = {0, 0, c.nx - 1, c.ny - 1};
-	}
-	ImGui::SameLine();
-	ImGui::BeginDisabled(!hasSel);
-	if (ImGui::SmallButton("Effacer"))
-	{
-		selAnchor_.reset();
-		selCurrent_.reset();
-		render_.selection = {1, 0, 0, 0};
-	}
+		ImGui::TextDisabled("Glisser dans la vue.  Maj : ajouter   Ctrl : retirer   Échap : effacer");
+
+	// quick actions
+	ImGui::Spacing();
+	float bw = (ImGui::GetContentRegionAvail().x - 4 * ImGui::GetStyle().ItemInnerSpacing.x) / 5.0f;
+	if (ImGui::Button("Tout", ImVec2(bw, 0)))
+		selectAll();
+	tip("Ctrl + A");
+	ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
+	if (ImGui::Button("Inverser", ImVec2(bw, 0)))
+		invertSelection();
+	tip("Ctrl + I");
+	ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
+	ImGui::BeginDisabled(!hasSelection());
+	if (ImGui::Button("Effacer", ImVec2(bw, 0)))
+		clearSelection();
+	tip("Échap");
+	ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
+	if (ImGui::Button("+ 1", ImVec2(bw, 0)))
+		growSelection(1);
+	tip("Étendre d'une maille (dilatation)");
+	ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
+	if (ImGui::Button("- 1", ImVec2(bw, 0)))
+		growSelection(-1);
+	tip("Réduire d'une maille (érosion)");
 	ImGui::EndDisabled();
-	drawCameraButtons();
+
+	// by elevation: the river bed, a flood plain under a level...
+	if (selectBelow_ == 0.0)
+		selectBelow_ = std::round((session_->bedRange().first + c.z_ref) * 10.0) / 10.0 + 1.0;
+	ImGui::AlignTextToFramePadding();
+	ImGui::TextDisabled("Fond sous");
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(140.0f);
+	ImGui::InputDouble("##below", &selectBelow_, 0.0, 0.0, "%.2f m DNG");
+	ImGui::SameLine();
+	if (ImGui::Button("Sélectionner", ImVec2(-1, 0)))
+		selectBelow(selectBelow_ - c.z_ref, ImGui::GetIO().KeyShift);
+	tip("Mailles dont le fond est sous cette cote (le lit, une plaine inondable...).\nMaj : seulement parmi les mailles déjà sélectionnées.");
+
+	// the boundary cells of a side
+	ImGui::AlignTextToFramePadding();
+	ImGui::TextDisabled("Bord du domaine");
+	ImGui::SameLine();
+	float sw = (ImGui::GetContentRegionAvail().x - 3 * ImGui::GetStyle().ItemInnerSpacing.x) / 4.0f;
+	for (int s = 0; s < 4; ++s)
+	{
+		if (s > 0)
+			ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
+		ImGui::PushID(s);
+		if (ImGui::Button(kSideNames[s], ImVec2(sw, 0)))
+			selectSide(s, ImGui::GetIO().KeyShift ? SelectOp::Add : ImGui::GetIO().KeyCtrl ? SelectOp::Remove : SelectOp::Replace);
+		if (ImGui::IsItemHovered())
+		{
+			highlight_ = HIGHLIGHT_SIDE + uint32_t(s);
+			ImGui::SetTooltip("Mailles du bord %s (Maj : ajouter, Ctrl : retirer)", kSideNames[s]);
+		}
+		ImGui::PopID();
+	}
+	endCard();
 }
 
 void App::drawWaterTab()
 {
-	auto const &c      = session_->caseData();
-	auto        sel    = render_.selection;
-	bool        hasSel = sel.z >= sel.x && sel.w >= sel.y;
-	ImGui::SeparatorText("Bloc d'eau sur la sélection");
-	ImGui::SetNextItemWidth(-110);
-	ImGui::Combo("mode", &waterMode_, "hauteur d'eau (m)\0cote de surface (m DNG)\0ajouter (m)\0");
-	ImGui::SetNextItemWidth(-110);
-	ImGui::InputFloat("valeur", &waterValue_, 0.1f, 1.0f, "%.2f");
-	ImGui::BeginDisabled(!hasSel);
-	if (ImGui::Button("Poser l'eau", ImVec2(-80, 0)))
+	auto const &c = session_->caseData();
+	if (beginCard("water-block", "Bloc d'eau sur la sélection", fontBold_))
 	{
-		WaterEdit mode  = waterMode_ == 0 ? WaterEdit::Depth : waterMode_ == 1 ? WaterEdit::Level : WaterEdit::Add;
-		float     value = waterMode_ == 1 ? waterValue_ - static_cast<float>(c.z_ref) : waterValue_;
-		session_->editWater(selection(), mode, value, true);
-		effects_->reset();
+		static char const *const kModes[] = {"hauteur (m)", "cote (m DNG)", "ajouter (m)"};
+		segmented("wmode", waterMode_, kModes);
+		ImGui::SetNextItemWidth(-110);
+		ImGui::InputFloat("valeur", &waterValue_, 0.1f, 1.0f, "%.2f");
+		ImGui::BeginDisabled(!hasSelection());
+		if (primaryButton("Poser l'eau", 0.0f, -90.0f))
+		{
+			WaterEdit mode  = waterMode_ == 0 ? WaterEdit::Depth : waterMode_ == 1 ? WaterEdit::Level : WaterEdit::Add;
+			float     value = waterMode_ == 1 ? waterValue_ - static_cast<float>(c.z_ref) : waterValue_;
+			session_->editWater(selection(), mode, value);
+			effects_->reset();
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Vider", ImVec2(-1, 0)))
+		{
+			session_->editWater(selection(), WaterEdit::Clear, 0.0f);
+			effects_->reset();
+		}
+		ImGui::EndDisabled();
+		tip("Eau au repos sur les mailles sélectionnées ; fait partie de l'état initial (Recommencer la restaure)");
 	}
-	ImGui::SameLine();
-	if (ImGui::Button("Vider"))
-	{
-		session_->editWater(selection(), WaterEdit::Clear, 0.0f, true);
-		effects_->reset();
-	}
-	ImGui::EndDisabled();
-	tip("Eau au repos dans la sélection ; fait partie de l'état initial (Recommencer la restaure)");
+	endCard();
 
-	ImGui::SeparatorText("Niveau initial sur tout le domaine");
-	if (levelValue_ == 0.0)
-		levelValue_ = c.eta_0 + c.z_ref;
-	ImGui::SetNextItemWidth(-110);
-	ImGui::InputDouble("cote (m DNG)", &levelValue_, 0.5, 5.0, "%.2f");
-	if (ImGui::Button("Remplir jusqu'à cette cote", ImVec2(-1, 0)))
+	if (beginCard("water-level", "Niveau initial sur tout le domaine", fontBold_))
 	{
-		session_->editWater({0, 0, c.nx - 1, c.ny - 1}, WaterEdit::Level, static_cast<float>(levelValue_ - c.z_ref), true);
-		effects_->reset();
+		if (levelValue_ == 0.0)
+			levelValue_ = c.eta_0 + c.z_ref;
+		ImGui::SetNextItemWidth(-110);
+		ImGui::InputDouble("cote (m DNG)", &levelValue_, 0.5, 5.0, "%.2f");
+		if (ImGui::Button("Remplir jusqu'à cette cote", ImVec2(-1, 0)))
+		{
+			session_->editWater(CellRect{0, 0, c.nx - 1, c.ny - 1}, WaterEdit::Level, static_cast<float>(levelValue_ - c.z_ref), true);
+			effects_->reset();
+		}
+		tip("Lac au repos : h = max(cote - fond, 0) partout");
+		ImGui::Checkbox("Eau mince visible", &render_.thinWater);
+		tip("Donne une opacité minimale aux lames d'eau de quelques cm, sinon invisibles");
 	}
-	tip("Lac au repos : h = max(cote - fond, 0) partout");
-	ImGui::Checkbox("Eau mince visible", &render_.thinWater);
-	tip("Donne une opacité minimale aux lames d'eau de quelques cm, sinon invisibles");
+	endCard();
 }
 
 void App::drawSoilTab()
 {
 	auto const &c  = session_->caseData();
 	bool        on = c.gw.enabled;
-	ImGui::SeparatorText("Nappe souterraine");
-	if (ImGui::Checkbox("Aquifère sous le terrain", &on))
+	if (beginCard("aquifer", "Nappe souterraine", fontBold_))
 	{
-		session_->setGroundwater(on ? std::optional(soil_) : std::nullopt);
-		onCaseLoaded();
-		updateProbeList();
-		profileCells_.clear();
-	}
-	tip("Échange vertical avec l'eau de surface (infiltration / résurgence) et écoulement latéral de Boussinesq,\n"
-	    "comme la couche souterraine de wolfgpu. Le cas est rechargé à t = 0.");
-	if (c.gw.wolfgpu)
-		ImGui::TextDisabled("Convention wolfgpu (Sy = 1, aquifère posé sur le lit) : définie par le fichier du cas.");
-
-	ImGui::SeparatorText(on ? "Paramètres du sol" : "Paramètres du sol (à l'activation)");
-	auto param = [&](char const *label, double &v, double step, double big, char const *fmt, char const *help) {
-		ImGui::SetNextItemWidth(-130);
-		bool changed = ImGui::InputDouble(label, &v, step, big, fmt);
-		tip(help);
-		return changed;
-	};
-	param("kv (m/s)", soil_.kv, 1e-6, 1e-5, "%.2e", "Conductivité verticale : vitesse d'infiltration de référence");
-	param("kh (m/s)", soil_.kh, 1e-5, 1e-4, "%.2e", "Conductivité horizontale : écoulement latéral de la nappe (0 = aucun)");
-	param("Sy", soil_.sy, 0.05, 0.1, "%.2f", "Porosité de drainage (0,01 argile ... 0,3 sable)");
-	param("épaisseur (m)", soil_.depth, 0.5, 2.0, "%.2f", "Épaisseur du sol au-dessus du substratum imperméable");
-	param("nappe à (m)", soil_.tableDepth, 0.25, 1.0, "%.2f", "Profondeur initiale de la nappe sous le sol (0 = saturé)");
-	if (on)
-	{
-		auto sel    = render_.selection;
-		bool hasSel = sel.z >= sel.x && sel.w >= sel.y;
-		if (ImGui::Button("Appliquer partout", ImVec2(-150, 0)))
+		if (ImGui::Checkbox("Aquifère sous le terrain", &on))
 		{
-			session_->setSoil({0, 0, c.nx - 1, c.ny - 1}, soil_);
+			session_->setGroundwater(on ? std::optional(soil_) : std::nullopt);
 			onCaseLoaded();
+			updateProbeList();
+			profileCells_.clear();
 		}
-		ImGui::SameLine();
-		ImGui::BeginDisabled(!hasSel);
-		if (ImGui::Button("À la sélection", ImVec2(-1, 0)))
+		tip("Échange vertical avec l'eau de surface (infiltration / résurgence) et écoulement latéral de Boussinesq,\n"
+		    "comme la couche souterraine de wolfgpu. Le cas est rechargé à t = 0.");
+		if (c.gw.wolfgpu)
+			ImGui::TextDisabled("Convention wolfgpu (Sy = 1, aquifère posé sur le lit) : définie par le fichier du cas.");
+	}
+	endCard();
+
+	if (beginCard("soil", on ? "Paramètres du sol" : "Paramètres du sol (à l'activation)", fontBold_))
+	{
+		auto param = [&](char const *label, double &v, double step, double big, char const *fmt, char const *help) {
+			ImGui::SetNextItemWidth(-130);
+			bool changed = ImGui::InputDouble(label, &v, step, big, fmt);
+			tip(help);
+			return changed;
+		};
+		param("kv (m/s)", soil_.kv, 1e-6, 1e-5, "%.2e", "Conductivité verticale : vitesse d'infiltration de référence");
+		param("kh (m/s)", soil_.kh, 1e-5, 1e-4, "%.2e", "Conductivité horizontale : écoulement latéral de la nappe (0 = aucun)");
+		param("Sy", soil_.sy, 0.05, 0.1, "%.2f", "Porosité de drainage (0,01 argile ... 0,3 sable)");
+		param("épaisseur (m)", soil_.depth, 0.5, 2.0, "%.2f", "Épaisseur du sol au-dessus du substratum imperméable");
+		param("nappe à (m)", soil_.tableDepth, 0.25, 1.0, "%.2f", "Profondeur initiale de la nappe sous le sol (0 = saturé)");
+		if (on)
 		{
-			session_->setSoil(selection(), soil_);
-			onCaseLoaded();
+			float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+			if (ImGui::Button("Appliquer partout", ImVec2(bw, 0)))
+			{
+				session_->setSoil(CellRect{0, 0, c.nx - 1, c.ny - 1}, soil_);
+				onCaseLoaded();
+			}
+			ImGui::SameLine();
+			ImGui::BeginDisabled(!hasSelection());
+			if (primaryButton("À la sélection", 0.0f, bw))
+			{
+				session_->setSoil(selection(), soil_);
+				onCaseLoaded();
+			}
+			ImGui::EndDisabled();
+			tip("Sol hétérogène : des valeurs différentes sur les mailles sélectionnées");
+		}
+	}
+	endCard();
+
+	if (beginCard("friction", "Frottement", fontBold_))
+	{
+		float manning = static_cast<float>(c.manning_n);
+		ImGui::SetNextItemWidth(-130);
+		if (ImGui::SliderFloat("Manning n", &manning, 0.0f, 0.1f, "%.3f"))
+			session_->setManning(manning);
+		tip("Frottement de fond (s/m^1/3) : 0.03 lit naturel, 0.04 plaine, 0 sans frottement");
+	}
+	endCard();
+}
+
+// Bridges: a deck over the selected cells (soffit, deck top), the list of the case's decks, the slot width
+void App::drawStructuresTab()
+{
+	auto const &c = session_->caseData();
+	if (beginCard("new-bridge", "Pont sur la sélection", fontBold_))
+	{
+		ImGui::TextWrapped("Tablier au-dessus des mailles sélectionnées. Trois régimes : surface libre sous le tablier, "
+		                   "écoulement en charge dès que l'eau touche l'intrados, surverse au-dessus du tablier.");
+		if (std::isnan(bridgeRoof_) && hasSelection())
+			bridgeRoof_ = std::ceil(selStats_.zmax + c.z_ref + 2.0);        // a first guess: 2 m above the highest bed
+		double roof = std::isnan(bridgeRoof_) ? c.z_ref + 2.0 : bridgeRoof_;
+		ImGui::SetNextItemWidth(-140);
+		if (ImGui::InputDouble("intrados", &roof, 0.1, 1.0, "%.2f m DNG"))
+			bridgeRoof_ = roof;
+		tip("Cote du dessous du tablier (sous-face, intrados) : l'écoulement passe en charge au-dessus");
+		ImGui::SetNextItemWidth(-140);
+		ImGui::InputFloat("épaisseur", &bridgeThick_, 0.1f, 0.5f, "%.2f m");
+		bridgeThick_ = std::max(bridgeThick_, 0.0f);
+		tip("Épaisseur du tablier : l'eau passe par-dessus quand elle dépasse intrados + épaisseur (surverse)");
+		ImGui::SetNextItemWidth(-140);
+		ImGui::InputTextWithHint("nom", "pont", bridgeLabel_, sizeof(bridgeLabel_));
+		if (hasSelection())
+		{
+			double clear = roof - (selStats_.zmax + c.z_ref), clearMax = roof - (selStats_.zmin + c.z_ref);
+			if (clearMax <= 0.0)
+				ImGui::TextColored(kWarn, "Intrados sous le fond partout : le tablier est un seuil (surverse seule).");
+			else
+				ImGui::TextDisabled("hauteur libre %.2f à %.2f m", std::max(clear, 0.0), clearMax);
+		}
+		ImGui::BeginDisabled(!hasSelection());
+		if (primaryButton("Ajouter le pont"))
+		{
+			session_->addBridge(selection(), roof - c.z_ref, roof - c.z_ref + bridgeThick_, bridgeLabel_[0] ? bridgeLabel_ : "pont");
+			bridgeLabel_[0] = 0;
 		}
 		ImGui::EndDisabled();
-		tip("Sol hétérogène : des valeurs différentes sur un rectangle de mailles");
+		tip("Les mailles prises par un autre pont passent à celui-ci. La simulation repart de t = 0.");
 	}
+	endCard();
 
-	ImGui::SeparatorText("Frottement");
-	float manning = static_cast<float>(c.manning_n);
-	ImGui::SetNextItemWidth(-130);
-	if (ImGui::SliderFloat("Manning n", &manning, 0.0f, 0.1f, "%.3f"))
-		session_->setManning(manning);
-	tip("Frottement de fond (s/m^1/3) : 0.03 lit naturel, 0.04 plaine, 0 sans frottement");
+	if (beginCard("bridges", "Ponts du cas", fontBold_, false, true, std::format("{}", c.bridges.size()).c_str()))
+	{
+		if (c.bridges.empty())
+			ImGui::TextDisabled("Aucun pont.");
+		else if (ImGui::BeginTable("bridges", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+		{
+			ImGui::TableSetupColumn("pont");
+			ImGui::TableSetupColumn("intrados", ImGuiTableColumnFlags_WidthFixed, 92);
+			ImGui::TableSetupColumn("dessus", ImGuiTableColumnFlags_WidthFixed, 92);
+			ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 48);
+			ImGui::TableHeadersRow();
+			int remove = -1;
+			for (size_t b = 0; b < c.bridges.size(); ++b)
+			{
+				auto const &bd = c.bridges[b];
+				ImGui::PushID(int(b));
+				ImGui::TableNextRow();
+				ImGui::TableNextColumn();
+				dot(ImVec4(0.95f, 0.6f, 0.25f, 1));
+				ImGui::SameLine();
+				ImGui::AlignTextToFramePadding();
+				ImGui::TextUnformatted(bd.label.c_str());
+				if (ImGui::IsItemHovered())
+					ImGui::SetTooltip("%zu mailles", session_->countOf(bd.cells));
+				double roof = bd.zRoof + c.z_ref, top = bd.zDeck + c.z_ref;
+				ImGui::TableNextColumn();
+				ImGui::SetNextItemWidth(-1);
+				if (ImGui::InputDouble("##r", &roof, 0.0, 0.0, "%.2f", ImGuiInputTextFlags_EnterReturnsTrue))
+					session_->setBridge(b, roof - c.z_ref, std::max(top, roof) - c.z_ref);
+				ImGui::TableNextColumn();
+				ImGui::SetNextItemWidth(-1);
+				if (ImGui::InputDouble("##t", &top, 0.0, 0.0, "%.2f", ImGuiInputTextFlags_EnterReturnsTrue))
+					session_->setBridge(b, roof - c.z_ref, std::max(top, roof) - c.z_ref);
+				ImGui::TableNextColumn();
+				if (ghostButton("sel"))
+					setSelection(bd.cells);
+				tip("Sélectionner les mailles du pont");
+				ImGui::SameLine(0, 2);
+				if (ghostButton("x"))
+					remove = int(b);
+				tip("Supprimer le pont");
+				ImGui::PopID();
+			}
+			ImGui::EndTable();
+			if (remove >= 0)
+				session_->removeBridge(size_t(remove));
+		}
+		ImGui::TextDisabled("Cotes en m DNG ; les mailles sous tablier sont teintées en orange (Afficher les zones).");
+	}
+	endCard();
+
+	if (!c.bridges.empty() && beginCard("bridge-model", "Modèle", fontBold_, true, false))
+	{
+		float slot = static_cast<float>(c.bridgeSlot);
+		ImGui::SetNextItemWidth(-140);
+		if (ImGui::SliderFloat("fente", &slot, 0.01f, 1.0f, "%.2f", ImGuiSliderFlags_Logarithmic))
+			session_->setBridgeSlot(slot);
+		tip("Fente de Preissmann (largeur relative) des mailles en charge : elle garde une célérité finie\n"
+		    "(sqrt(g c / fente)) et ne stocke qu'une fine lame au-dessus de l'intrados. 1 = pas de fente : la maille\n"
+		    "en charge stocke toute la colonne piézométrique (modèle wolfgpu). Plus petite = plus réaliste, pas de\n"
+		    "temps plus court (x 4.5 pour 0.05).");
+		ImGui::TextDisabled("Hauteur efficace min(h, c) + max(h - c - e, 0), frottement sur 1, 2 ou 3 parois.");
+	}
+	endCard();
 }
 
 void App::drawZonesTab()
 {
-	auto const &c      = session_->caseData();
-	auto        sel    = render_.selection;
-	bool        hasSel = sel.z >= sel.x && sel.w >= sel.y;
-	ImGui::SeparatorText("Nouvelle zone sur la sélection");
-	ImGui::TextDisabled("Appliquée à la fin de chaque pas de temps.");
-	ImGui::SetNextItemWidth(-110);
-	ImGui::Combo("type", &zoneKind_, "source : débit (m3/s)\0puits (exutoire)\0niveau fixé (m DNG)\0");
-	if (zoneKind_ != 1)
+	auto const &c = session_->caseData();
+	if (beginCard("new-zone", "Nouvelle zone sur la sélection", fontBold_))
 	{
+		ImGui::TextDisabled("Appliquée à la fin de chaque pas de temps.");
+		static char const *const kKinds[] = {"source", "puits", "niveau fixé"};
+		segmented("zkind", zoneKind_, kKinds);
+		if (zoneKind_ != 1)
+		{
+			ImGui::SetNextItemWidth(-110);
+			ImGui::InputFloat(zoneKind_ == 0 ? "débit" : "cote", &zoneValue_, 1.0f, 10.0f, zoneKind_ == 0 ? "%.2f m³/s" : "%.2f m DNG");
+		}
 		ImGui::SetNextItemWidth(-110);
-		ImGui::InputFloat("##zval", &zoneValue_, 1.0f, 10.0f, zoneKind_ == 0 ? "%.2f m3/s" : "%.2f m DNG");
+		ImGui::InputTextWithHint("nom", "optionnel", zoneLabel_, sizeof(zoneLabel_));
+		ImGui::BeginDisabled(!hasSelection() || c.zones.size() >= MAX_ZONES);
+		if (primaryButton("Créer la zone"))
+		{
+			ZoneKind kind  = zoneKind_ == 0 ? ZoneKind::Source : zoneKind_ == 1 ? ZoneKind::Sink : ZoneKind::Level;
+			double   value = zoneKind_ == 2 ? zoneValue_ - c.z_ref : zoneValue_;
+			std::string label = zoneLabel_[0] ? zoneLabel_ : (zoneKind_ == 0 ? "source" : zoneKind_ == 1 ? "puits" : "niveau");
+			session_->addZone(selection(), kind, value, label);
+			zoneLabel_[0] = 0;
+		}
+		ImGui::EndDisabled();
+		if (c.zones.size() >= MAX_ZONES)
+			ImGui::TextColored(kWarn, "%u zones au plus", MAX_ZONES);
 	}
-	ImGui::SetNextItemWidth(-110);
-	ImGui::InputTextWithHint("nom", "optionnel", zoneLabel_, sizeof(zoneLabel_));
-	ImGui::BeginDisabled(!hasSel || c.zones.size() >= MAX_ZONES);
-	if (ImGui::Button("Créer la zone", ImVec2(-1, 0)))
+	endCard();
+
+	if (beginCard("zones", "Zones du cas", fontBold_, false, true, std::format("{}", c.zones.size()).c_str()))
 	{
-		ZoneKind kind  = zoneKind_ == 0 ? ZoneKind::Source : zoneKind_ == 1 ? ZoneKind::Sink : ZoneKind::Level;
-		double   value = zoneKind_ == 2 ? zoneValue_ - c.z_ref : zoneValue_;
-		std::string label = zoneLabel_[0] ? zoneLabel_ : (zoneKind_ == 0 ? "source" : zoneKind_ == 1 ? "puits" : "niveau");
-		session_->addZone(selection(), kind, value, label);
-		zoneLabel_[0] = 0;
+		if (c.zones.empty())
+			ImGui::TextDisabled("Aucune zone.");
+		else if (ImGui::BeginTable("zones", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+		{
+			ImGui::TableSetupColumn("zone");
+			ImGui::TableSetupColumn("type", ImGuiTableColumnFlags_WidthFixed, 56);
+			ImGui::TableSetupColumn("valeur", ImGuiTableColumnFlags_WidthFixed, 116);
+			ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 24);
+			ImGui::TableHeadersRow();
+			int remove = -1;
+			for (size_t z = 0; z < c.zones.size(); ++z)
+			{
+				auto const &zd = c.zones[z];
+				ImGui::PushID(int(z));
+				ImGui::TableNextRow();
+				ImGui::TableNextColumn();
+				ImVec4 col = zd.kind == ZoneKind::Source ? ImVec4(0.35f, 0.6f, 1, 1) : zd.kind == ZoneKind::Sink ? ImVec4(1, 0.4f, 0.3f, 1) : ImVec4(0.3f, 0.95f, 0.9f, 1);
+				dot(col);
+				ImGui::SameLine();
+				ImGui::AlignTextToFramePadding();
+				ImGui::TextUnformatted(zd.label.c_str());
+				if (ImGui::IsItemHovered())
+					ImGui::SetTooltip("mailles (%u..%u, %u..%u)", zd.i0, zd.i1, zd.j0, zd.j1);
+				ImGui::TableNextColumn();
+				ImGui::AlignTextToFramePadding();
+				ImGui::TextUnformatted(zd.kind == ZoneKind::Source ? "source" : zd.kind == ZoneKind::Sink ? "puits" : "niveau");
+				ImGui::TableNextColumn();
+				if (zd.kind != ZoneKind::Sink)
+				{
+					double v = zd.kind == ZoneKind::Level ? zd.value + c.z_ref : zd.value;
+					ImGui::SetNextItemWidth(-1);
+					if (ImGui::InputDouble("##v", &v, 0.0, 0.0, zd.kind == ZoneKind::Level ? "%.2f m" : "%.1f m³/s", ImGuiInputTextFlags_EnterReturnsTrue))
+						session_->setZoneValue(z, zd.kind == ZoneKind::Level ? v - c.z_ref : v);
+				}
+				ImGui::TableNextColumn();
+				if (ghostButton("x"))
+					remove = int(z);
+				tip("Supprimer la zone");
+				ImGui::PopID();
+			}
+			ImGui::EndTable();
+			if (remove >= 0)
+				session_->removeZone(size_t(remove));
+		}
+		ImGui::Spacing();
+		ImGui::Checkbox("Afficher les zones dans la vue", &render_.showZones);
+		tip("Teinte des zones source / puits / niveau ; hachures des zones de pluie (bleu) et d'infiltration (brun)");
+	}
+	endCard();
+}
+
+// Schematic of the domain with its four sides coloured by condition, and one row per side
+void App::drawDomainSides()
+{
+	auto const &c = session_->caseData();
+	// schematic
+	float  availW = ImGui::GetContentRegionAvail().x;
+	float  boxH   = std::round(110.0f * dpi_);
+	ImVec2 origin = ImGui::GetCursorScreenPos();
+	auto  *dl     = ImGui::GetWindowDrawList();
+	float  margin = 26.0f;
+	float  ratio  = float(c.Lx / std::max(c.Ly, 1e-9));
+	float  w      = availW - 2 * margin, h = boxH - 2 * margin;
+	if (w / h > ratio)
+		w = h * ratio;
+	else
+		h = w / ratio;
+	ImVec2 a(origin.x + (availW - w) * 0.5f, origin.y + (boxH - h) * 0.5f), b(a.x + w, a.y + h);
+	dl->AddRectFilled(a, b, IM_COL32(255, 255, 255, 10), 3.0f);
+	// sides: west (left), east (right), south (bottom), north (top)
+	ImVec2 const p0[4] = {ImVec2(a.x, a.y), ImVec2(b.x, a.y), ImVec2(a.x, b.y), ImVec2(a.x, a.y)};
+	ImVec2 const p1[4] = {ImVec2(a.x, b.y), ImVec2(b.x, b.y), ImVec2(b.x, b.y), ImVec2(b.x, a.y)};
+	ImVec2 const lab[4] = {ImVec2(a.x - 16.0f, (a.y + b.y) * 0.5f), ImVec2(b.x + 8.0f, (a.y + b.y) * 0.5f),
+	                       ImVec2((a.x + b.x) * 0.5f, b.y + 4.0f), ImVec2((a.x + b.x) * 0.5f, a.y - 18.0f)};
+	int hovered = -1;
+	for (int s = 0; s < 4; ++s)
+	{
+		// hit zone around the edge
+		ImVec2 hmin(std::min(p0[s].x, p1[s].x) - 8.0f, std::min(p0[s].y, p1[s].y) - 8.0f);
+		ImVec2 hmax(std::max(p0[s].x, p1[s].x) + 8.0f, std::max(p0[s].y, p1[s].y) + 8.0f);
+		ImGui::SetCursorScreenPos(hmin);
+		ImGui::PushID(s);
+		if (ImGui::InvisibleButton("##side", ImVec2(hmax.x - hmin.x, hmax.y - hmin.y)))
+			bcSide_ = s;
+		if (ImGui::IsItemHovered())
+			hovered = s;
+		ImGui::PopID();
+		auto  &bc    = c.bc[s];
+		ImVec4 col   = toImVec4(bcColor(uint32_t(bc.kind)));
+		bool   sel   = s == bcSide_, hov = s == hovered;
+		float  thick = sel ? 7.0f : 5.0f;
+		if (sel || hov)
+			dl->AddLine(p0[s], p1[s], IM_COL32(255, 255, 255, hov ? 160 : 90), thick + 4.0f);
+		dl->AddLine(p0[s], p1[s], ImGui::GetColorU32(col), thick);
+		// label: short name + value
+		std::string txt = kSideShort[s];
+		if (bc.kind == BcKind::Inflow)
+			txt += std::format(" {:.1f} m³/s", bc.value);
+		else if (bc.kind == BcKind::Level)
+			txt += std::format(" {:.2f} m", bc.value + c.z_ref);
+		else if (bc.kind == BcKind::Depth)
+			txt += std::format(" h {:.2f} m", bc.value);
+		else if (bc.kind == BcKind::Free)
+			txt += " libre";
+		ImVec2 ts = ImGui::CalcTextSize(txt.c_str());
+		ImVec2 tp = lab[s];
+		if (s == 0)
+			tp.x -= ts.x;
+		if (s < 2)
+			tp.y -= ts.y * 0.5f;
+		else
+			tp.x -= ts.x * 0.5f;
+		dl->AddText(tp, ImGui::GetColorU32(sel ? ImGuiCol_Text : ImGuiCol_TextDisabled), txt.c_str());
+	}
+	if (hovered >= 0)
+	{
+		highlight_ = HIGHLIGHT_SIDE + uint32_t(hovered);
+		ImGui::SetTooltip("%s : %s", kSideNames[hovered], kBcKindNames[int(c.bc[hovered].kind)]);
+	}
+	else
+		highlight_ = HIGHLIGHT_SIDE + uint32_t(bcSide_);
+	ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + boxH));
+	ImGui::Spacing();
+
+	// the selected side: kind, value, facts
+	auto bc = c.bc[bcSide_];
+	ImGui::PushFont(fontBold_, 0.0f);
+	ImGui::AlignTextToFramePadding();
+	ImGui::Text("Bord %s", kSideNames[bcSide_]);
+	ImGui::PopFont();
+	ImGui::SameLine();
+	int  kind    = int(bc.kind);
+	bool changed = false;
+	ImGui::SetNextItemWidth(-1);
+	if (ImGui::Combo("##kind", &kind, kBcKindNames, kBcKinds) && kind != int(bc.kind))
+	{
+		bc.kind  = static_cast<BcKind>(kind);
+		bc.value = bc.kind == BcKind::Level ? c.eta_0 : bc.kind == BcKind::Inflow ? 10.0 : bc.kind == BcKind::Depth ? 1.0 : 0.0;
+		changed  = true;
+	}
+	if (bcHasValue(bc.kind))
+	{
+		double v = bc.kind == BcKind::Level ? bc.value + c.z_ref : bc.value;
+		ImGui::SetNextItemWidth(-1);
+		if (ImGui::InputDouble("##value", &v, 0.0, 0.0, bcUnit(bc.kind), ImGuiInputTextFlags_EnterReturnsTrue))
+		{
+			bc.value = bc.kind == BcKind::Level ? v - c.z_ref : v;
+			changed  = true;
+		}
+		tip(bc.kind == BcKind::Inflow ? "Débit total réparti sur le bord au prorata de h^(5/3) (Entrée pour valider)"
+		    : bc.kind == BcKind::Level ? "Cote de surface libre imposée (Entrée pour valider)"
+		                               : "Hauteur d'eau imposée sur le bord (Entrée pour valider)");
+	}
+	if (changed)
+		session_->setBoundary(bcSide_, bc);
+	// facts about the side: lowest point (where an inflow enters), length
+	float    zmin = 1e30f;
+	uint32_t n    = bcSide_ < 2 ? c.ny : c.nx;
+	for (uint32_t k = 0; k < n; ++k)
+		zmin = std::min(zmin, c.zb[bcSide_ < 2 ? c.index(bcSide_ == 0 ? 0 : c.nx - 1, k) : c.index(k, bcSide_ == 2 ? 0 : c.ny - 1)]);
+	ImGui::TextDisabled("%u mailles, %s, point bas %.2f m DNG", n, formatLength(bcSide_ < 2 ? c.Ly : c.Lx).c_str(), zmin + c.z_ref);
+	if (bc.kind == BcKind::Inflow)
+		ImGui::TextDisabled("Bord sec : l'eau entre par les mailles sous %.2f m DNG", zmin + c.z_ref + 0.5);
+	if (bc.kind == BcKind::Level && bc.value < zmin)
+		ImGui::TextColored(kWarn, "Niveau sous le point bas du bord : il se comporte comme une sortie.");
+}
+
+// Weak conditions on the faces of the selected cells
+void App::drawFaceConditions()
+{
+	auto const &c = session_->caseData();
+	ImGui::TextWrapped("La face choisie des mailles sélectionnées devient un bord du domaine : son flux est calculé "
+	                   "pour imposer la condition (mur, débit total, niveau, hauteur ou sortie libre). De l'autre côté "
+	                   "d'une face intérieure, la maille voisine voit un mur.");
+	ImGui::Spacing();
+	ImGui::AlignTextToFramePadding();
+	ImGui::TextDisabled("Face");
+	ImGui::SameLine(60.0f);
+	segmented("fside", faceSide_, kSideNames);
+	tip("Seules les faces tournées vers l'extérieur de la sélection sont prises (son enveloppe de ce côté)");
+	ImGui::AlignTextToFramePadding();
+	ImGui::TextDisabled("Type");
+	ImGui::SameLine(60.0f);
+	ImGui::SetNextItemWidth(-1);
+	if (ImGui::Combo("##fkind", &faceKind_, kBcKindNames, kBcKinds))
+		faceValue_ = faceKind_ == int(BcKind::Level) ? c.eta_0 + c.z_ref : faceKind_ == int(BcKind::Inflow) ? 10.0 : 1.0;
+	auto fk = static_cast<BcKind>(faceKind_);
+	if (bcHasValue(fk))
+	{
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextDisabled("Valeur");
+		ImGui::SameLine(60.0f);
+		ImGui::SetNextItemWidth(-1);
+		ImGui::InputDouble("##fvalue", &faceValue_, fk == BcKind::Inflow ? 1.0 : 0.1, fk == BcKind::Inflow ? 10.0 : 1.0, bcUnit(fk));
+		tip(fk == BcKind::Inflow ? "Débit total du groupe de faces, réparti au prorata de h^(5/3) (comme un bord)"
+		    : fk == BcKind::Level ? "Cote de surface libre imposée faiblement (flux vers la cote)"
+		                          : "Hauteur d'eau imposée faiblement (flux vers la hauteur)");
+	}
+	ImGui::AlignTextToFramePadding();
+	ImGui::TextDisabled("Nom");
+	ImGui::SameLine(60.0f);
+	ImGui::SetNextItemWidth(-1);
+	ImGui::InputTextWithHint("##flabel", "optionnel", faceLabel_, sizeof(faceLabel_));
+	ImGui::BeginDisabled(!hasSelection() || c.faceBcs.size() >= MAX_FACE_BC);
+	if (primaryButton(std::format("Imposer sur le bord {} de la sélection", kSideNames[faceSide_]).c_str()))
+	{
+		double      value = fk == BcKind::Level ? faceValue_ - c.z_ref : faceValue_;
+		std::string label = faceLabel_[0] ? faceLabel_ : std::format("{} {}", kBcKindNames[faceKind_], kSideShort[faceSide_]);
+		if (session_->addFaceBc(selection(), static_cast<Side>(faceSide_), fk, value, label))
+			renderer_->setFaceBcs(session_->caseData());
+		faceLabel_[0] = 0;
 	}
 	ImGui::EndDisabled();
-	if (!c.zones.empty())
-		ImGui::SeparatorText("Zones du cas");
-	if (!c.zones.empty() && ImGui::BeginTable("zones", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+	if (!hasSelection())
+		ImGui::TextDisabled("Sélectionner des mailles d'abord.");
+	else if (c.faceBcs.size() >= MAX_FACE_BC)
+		ImGui::TextColored(kWarn, "%u groupes au plus", MAX_FACE_BC);
+
+	if (!c.faceBcs.empty())
 	{
-		ImGui::TableSetupColumn("zone");
-		ImGui::TableSetupColumn("type", ImGuiTableColumnFlags_WidthFixed, 50);
-		ImGui::TableSetupColumn("valeur", ImGuiTableColumnFlags_WidthFixed, 110);
-		ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 22);
-		ImGui::TableHeadersRow();
-		int remove = -1;
-		for (size_t z = 0; z < c.zones.size(); ++z)
+		sectionLabel("Conditions sur faces du cas");
+		if (ImGui::BeginTable("facebcs", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
 		{
-			auto const &zd = c.zones[z];
-			ImGui::PushID(int(z));
-			ImGui::TableNextRow();
-			ImGui::TableNextColumn();
-			ImVec4 col = zd.kind == ZoneKind::Source ? ImVec4(0.35f, 0.6f, 1, 1) : zd.kind == ZoneKind::Sink ? ImVec4(1, 0.4f, 0.3f, 1) : ImVec4(0.3f, 0.95f, 0.9f, 1);
-			ImGui::TextColored(col, "%s", zd.label.c_str());
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("mailles (%u..%u, %u..%u)", zd.i0, zd.i1, zd.j0, zd.j1);
-			ImGui::TableNextColumn();
-			ImGui::TextUnformatted(zd.kind == ZoneKind::Source ? "source" : zd.kind == ZoneKind::Sink ? "puits" : "niveau");
-			ImGui::TableNextColumn();
-			if (zd.kind != ZoneKind::Sink)
+			ImGui::TableSetupColumn("groupe");
+			ImGui::TableSetupColumn("faces", ImGuiTableColumnFlags_WidthFixed, 50);
+			ImGui::TableSetupColumn("valeur", ImGuiTableColumnFlags_WidthFixed, 116);
+			ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 50);
+			ImGui::TableHeadersRow();
+			int remove = -1;
+			for (size_t g = 0; g < c.faceBcs.size(); ++g)
 			{
-				double v = zd.kind == ZoneKind::Level ? zd.value + c.z_ref : zd.value;
-				ImGui::SetNextItemWidth(-1);
-				if (ImGui::InputDouble("##v", &v, 0.0, 0.0, zd.kind == ZoneKind::Level ? "%.2f m" : "%.1f m3/s", ImGuiInputTextFlags_EnterReturnsTrue))
-					session_->setZoneValue(z, zd.kind == ZoneKind::Level ? v - c.z_ref : v);
+				auto const &f = c.faceBcs[g];
+				ImGui::PushID(int(g));
+				ImGui::TableNextRow();
+				ImGui::TableNextColumn();
+				dot(toImVec4(bcColor(uint32_t(f.kind))));
+				ImGui::SameLine();
+				ImGui::AlignTextToFramePadding();
+				ImGui::TextUnformatted(f.label.c_str());
+				if (ImGui::IsItemHovered())
+				{
+					highlight_ = HIGHLIGHT_GROUP + uint32_t(g);
+					ImGui::SetTooltip("%s", kBcKindNames[int(f.kind)]);
+				}
+				ImGui::TableNextColumn();
+				ImGui::AlignTextToFramePadding();
+				ImGui::Text("%zu", f.faces.size());
+				ImGui::TableNextColumn();
+				if (bcHasValue(f.kind))
+				{
+					double v = f.kind == BcKind::Level ? f.value + c.z_ref : f.value;
+					ImGui::SetNextItemWidth(-1);
+					if (ImGui::InputDouble("##v", &v, 0.0, 0.0, bcUnit(f.kind), ImGuiInputTextFlags_EnterReturnsTrue))
+						session_->setFaceBc(g, f.kind, f.kind == BcKind::Level ? v - c.z_ref : v);
+				}
+				else
+				{
+					ImGui::AlignTextToFramePadding();
+					ImGui::TextDisabled("%s", kBcKindNames[int(f.kind)]);
+				}
+				ImGui::TableNextColumn();
+				if (ghostButton("sel"))
+					setSelection(session_->faceBcCells(g));
+				tip("Sélectionner les mailles du groupe");
+				ImGui::SameLine(0, 2);
+				if (ghostButton("x"))
+					remove = int(g);
+				tip("Supprimer le groupe");
+				ImGui::PopID();
 			}
-			ImGui::TableNextColumn();
-			if (ImGui::SmallButton("x"))
-				remove = int(z);
-			ImGui::PopID();
+			ImGui::EndTable();
+			if (remove >= 0)
+			{
+				session_->removeFaceBc(size_t(remove));
+				renderer_->setFaceBcs(session_->caseData());
+			}
 		}
-		ImGui::EndTable();
-		if (remove >= 0)
-			session_->removeZone(size_t(remove));
 	}
-	ImGui::Spacing();
-	ImGui::Checkbox("Afficher les zones dans la vue", &render_.showZones);
-	tip("Teinte des zones source / puits / niveau ; hachures des zones de pluie (bleu) et d'infiltration (brun)");
 }
 
 void App::drawBoundariesTab()
 {
-	auto const &c = session_->caseData();
-	ImGui::SeparatorText("Bords du domaine");
-	static char const *sideNames[4] = {"Ouest", "Est", "Sud", "Nord"};
-	static char const *kindNames[3] = {"mur", "débit entrant", "niveau imposé"};
-	for (int s = 0; s < 4; ++s)
+	if (beginCard("sides", "Bords du domaine", fontBold_))
+		drawDomainSides();
+	endCard();
+	if (beginCard("facebc", "Conditions sur les faces de la sélection", fontBold_))
+		drawFaceConditions();
+	endCard();
+	if (beginCard("bclegend", "Légende", fontBold_, true, false))
 	{
-		ImGui::PushID(s);
-		auto bc   = c.bc[s];
-		int  kind = static_cast<int>(bc.kind);
-		ImGui::SetNextItemWidth(130);
-		bool changed = ImGui::Combo(sideNames[s], &kind, kindNames, 3);
-		if (changed && kind != static_cast<int>(bc.kind))
+		for (int k = 0; k < kBcKinds; ++k)
 		{
-			bc.kind  = static_cast<BcKind>(kind);
-			bc.value = bc.kind == BcKind::Level ? c.eta_0 : bc.kind == BcKind::Inflow ? 10.0 : 0.0;
+			dot(toImVec4(bcColor(uint32_t(k))));
+			ImGui::SameLine();
+			ImGui::AlignTextToFramePadding();
+			ImGui::TextUnformatted(kBcKindNames[k]);
+			if (k + 1 < kBcKinds && (k % 2 == 0))
+				ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.5f + 20.0f);
 		}
-		if (bc.kind != BcKind::Wall)
-		{
-			ImGui::SetNextItemWidth(-1);
-			double v = bc.kind == BcKind::Level ? bc.value + c.z_ref : bc.value;
-			if (ImGui::InputDouble("##value", &v, 0.0, 0.0, bc.kind == BcKind::Inflow ? "%.1f m3/s" : "%.2f m DNG",
-			                       ImGuiInputTextFlags_EnterReturnsTrue))
-			{
-				bc.value = bc.kind == BcKind::Level ? v - c.z_ref : v;
-				changed  = true;
-			}
-			tip(bc.kind == BcKind::Inflow ? "Débit total réparti sur le bord au prorata de h^(5/3) (Entrée pour valider)"
-			                              : "Cote de surface libre imposée (Entrée pour valider)");
-		}
-		if (changed)
-			session_->setBoundary(s, bc);
-		ImGui::PopID();
+		ImGui::TextDisabled("Les murs du domaine ne sont dessinés que survolés.");
 	}
-	ImGui::TextDisabled("Un bord fermé est un mur. Les débits entrent par les mailles les plus basses du bord.");
+	endCard();
 }
 
 void App::drawConditionsPanel()
 {
-	drawSelectionHeader();
-	ImGui::Spacing();
+	drawSelectionCard();
 	// tabs fill the panel down to the footer
 	float footer = ImGui::GetFrameHeight() * 1.3f + ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y * 2;
 	if (ImGui::BeginChild("tabs", ImVec2(0, -footer), ImGuiChildFlags_None))
@@ -724,6 +1403,11 @@ void App::drawConditionsPanel()
 				drawZonesTab();
 				ImGui::EndTabItem();
 			}
+			if (ImGui::BeginTabItem("Ouvrages"))
+			{
+				drawStructuresTab();
+				ImGui::EndTabItem();
+			}
 			if (ImGui::BeginTabItem("Bords"))
 			{
 				drawBoundariesTab();
@@ -738,11 +1422,11 @@ void App::drawConditionsPanel()
 	{
 		if (ImGui::Button("Enregistrer le cas", ImVec2(-1, 0)))
 			saveCurrentCase();
-		tip("Écrit le lit, l'eau initiale, le sol, les zones et les réglages dans assets/");
+		tip("Écrit le lit, l'eau initiale, le sol, les zones et les conditions dans assets/");
 	}
 	else
 		ImGui::TextDisabled("Cas analytique : les conditions ne sont pas enregistrées.");
-	if (primaryButton("Lancer la simulation  >>", ImGui::GetFrameHeight() * 1.3f))
+	if (primaryButton("Lancer la simulation", ImGui::GetFrameHeight() * 1.3f))
 		setStage(Stage::Simulation);
 }
 
@@ -751,48 +1435,53 @@ void App::drawChronologyEditor()
 {
 	using Kind = Session::ChronologyKind;
 	auto const &c = session_->caseData();
-	ImGui::SeparatorText("Chronologies");
-	ImGui::RadioButton("pluie", &chronoKind_, 1);
-	ImGui::SameLine();
-	ImGui::RadioButton("infiltration", &chronoKind_, 0);
+	if (!beginCard("chrono", "Chronologies", fontBold_))
+	{
+		endCard();
+		return;
+	}
+	static char const *const kKinds[] = {"infiltration", "pluie"};
+	segmented("ckind", chronoKind_, kKinds, ImGui::GetContentRegionAvail().x - 110.0f);
 	tip("Débits par zone au cours du temps, comme add_rain / add_infiltration de wolfgpu.\n"
 	    "Positif : apport d'eau en surface ; une infiltration négative retire au plus l'eau présente.");
 	ImGui::SameLine();
 	ImGui::Checkbox("en mm/h", &chronoMmh_);
-	tip("Coché : lame d'eau par heure ; décoché : m3/s pour toute la zone (convention wolfgpu)");
+	tip("Coché : lame d'eau par heure ; décoché : m³/s pour toute la zone (convention wolfgpu)");
 	Kind        kind  = chronoKind_ == 1 ? Kind::Rain : Kind::Infiltration;
 	auto const &ch    = kind == Kind::Rain ? c.rain : c.infiltration;
 	auto        areas = session_->chronologyZoneAreas(kind);
-	char const *unit  = chronoMmh_ ? "%.4g mm/h" : "%.4g m3/s";
+	char const *unit  = chronoMmh_ ? "%.4g mm/h" : "%.4g m³/s";
 	auto        toUser   = [&](double q, double area) { return chronoMmh_ ? (area > 0.0 ? q / area * 3.6e6 : 0.0) : q; };
 	auto        fromUser = [&](double v, double area) { return chronoMmh_ ? v * area / 3.6e6 : v; };
 
 	// new zone
-	auto sel    = render_.selection;
-	bool hasSel = sel.z >= sel.x && sel.w >= sel.y;
 	ImGui::SetNextItemWidth(-110);
-	ImGui::InputFloat("##cval", &chronoValue_, 1.0f, 10.0f, unit);
-	CellRect all{0, 0, c.nx - 1, c.ny - 1};
-	bool     added = false;
-	auto     add = [&](CellRect const &r) {
-        double area = double(r.i1 - r.i0 + 1) * (r.j1 - r.j0 + 1) * c.dx() * c.dy();
-        session_->addChronologyZone(kind, r, fromUser(chronoValue_, area));
+	ImGui::InputFloat("valeur", &chronoValue_, 1.0f, 10.0f, unit);
+	bool added = false;
+	auto add   = [&](CellMask const &m) {
+        double area = double(session_->countOf(m)) * c.dx() * c.dy();
+        session_->addChronologyZone(kind, m, fromUser(chronoValue_, area));
         added = true;
 	};
-	ImGui::BeginDisabled(!hasSel);
-	if (ImGui::Button("Zone = sélection"))
+	float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+	ImGui::BeginDisabled(!hasSelection());
+	if (primaryButton("Zone = sélection", 0.0f, bw))
 		add(selection());
 	ImGui::EndDisabled();
 	ImGui::SameLine();
-	if (ImGui::Button("Zone = domaine"))
-		add(all);
+	if (ImGui::Button("Zone = domaine", ImVec2(bw, 0)))
+		add(CellMask(c.cells(), 1));
 	tip("La valeur s'applique à toutes les lignes de la table ; une maille appartient à une seule zone de chaque type");
 	if (added)
+	{
+		endCard();
 		return;        // the zone count and areas computed above are stale: the table is drawn next frame
+	}
 
 	if (!ch.active())
 	{
 		ImGui::TextDisabled("aucune zone de %s", kind == Kind::Rain ? "pluie" : "infiltration");
+		endCard();
 		return;
 	}
 	// table: one row per line (start time), one column per zone
@@ -802,13 +1491,14 @@ void App::drawChronologyEditor()
 	bool         lerp = ch.lerp, changed = false;
 	int          removeZone = -1, removeLine = -1;
 	int          cols = int(std::min<size_t>(nz, 62)) + 2;
+	sectionLabel("Table des débits");
 	if (ImGui::BeginTable("chrono", cols, ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollX | ImGuiTableFlags_SizingFixedFit,
-	                      ImVec2(0, std::min(30.0f + 24.0f * float(t.size() + 1), 220.0f))))
+	                      ImVec2(0, std::min(30.0f + 26.0f * float(t.size() + 1), 240.0f))))
 	{
 		ImGui::TableSetupScrollFreeze(1, 1);
 		ImGui::TableSetupColumn("t (s)", 0, 70);
 		for (int z = 0; z + 2 < cols; ++z)
-			ImGui::TableSetupColumn(std::format("zone {}", z + 1).c_str(), 0, 80);
+			ImGui::TableSetupColumn(std::format("zone {}", z + 1).c_str(), 0, 84);
 		ImGui::TableSetupColumn("", 0, 22);
 		ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
 		ImGui::TableNextColumn();
@@ -819,9 +1509,9 @@ void App::drawChronologyEditor()
 			ImGui::PushID(z);
 			ImGui::Text("zone %d", z + 1);
 			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("%.0f m2", areas[z]);
+				ImGui::SetTooltip("%.0f m²", areas[z]);
 			ImGui::SameLine();
-			if (ImGui::SmallButton("x"))
+			if (ghostButton("x"))
 				removeZone = z;
 			ImGui::PopID();
 		}
@@ -852,7 +1542,7 @@ void App::drawChronologyEditor()
 				ImGui::PopID();
 			}
 			ImGui::TableNextColumn();
-			if (t.size() > 1 && ImGui::SmallButton("x"))
+			if (t.size() > 1 && ghostButton("x"))
 				removeLine = int(l);
 			ImGui::PopID();
 		}
@@ -869,7 +1559,8 @@ void App::drawChronologyEditor()
 	if (ImGui::Checkbox("interpolation linéaire", &lerp))
 		changed = true;
 	tip("Sinon les débits sont constants par paliers ; avant la première ligne : rien, après la dernière : constants");
-	ImGui::TextDisabled("valeurs en %s, Entrée pour valider", chronoMmh_ ? "mm/h" : "m3/s par zone");
+	ImGui::TextDisabled("valeurs en %s, Entrée pour valider", chronoMmh_ ? "mm/h" : "m³/s par zone");
+	endCard();
 	if (removeLine >= 0)
 	{
 		t.erase(t.begin() + removeLine);
@@ -906,17 +1597,25 @@ void App::drawTransportSection()
 	float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
 	if (paused_)
 	{
-		if (primaryButton("Lancer  >>", ImGui::GetFrameHeight() * 1.2f))
+		if (primaryButton("Lancer", ImGui::GetFrameHeight() * 1.3f))
 			paused_ = false;
 	}
-	else if (ImGui::Button("Pause  ||", ImVec2(-1, ImGui::GetFrameHeight() * 1.2f)))
-		paused_ = true;
+	else
+	{
+		ImGui::PushStyleColor(ImGuiCol_Button, kWarn);
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.80f, 0.40f, 1.0f));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.9f, 0.62f, 0.18f, 1.0f));
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.08f, 0.09f, 0.1f, 1.0f));
+		if (ImGui::Button("Pause", ImVec2(-1, ImGui::GetFrameHeight() * 1.3f)))
+			paused_ = true;
+		ImGui::PopStyleColor(4);
+	}
 	tip("Espace");
 	if (ImGui::Button("Recommencer", ImVec2(bw, 0)))
 		resetSimulation();
 	tip("R : remet l'état initial (eau, nappe, zones conservés)");
 	ImGui::SameLine();
-	if (ImGui::Button("< Conditions", ImVec2(bw, 0)))
+	if (ImGui::Button("Conditions", ImVec2(bw, 0)))
 		setStage(Stage::Conditions);
 	tip("Retour à l'étape Conditions (la simulation repart de t = 0)");
 	ImGui::SetNextItemWidth(-90);
@@ -924,43 +1623,108 @@ void App::drawTransportSection()
 	tip("Nombre de pas de temps calculés entre deux images : plus = simulation plus rapide, image moins fluide");
 }
 
+// Recording of h, qx, qy to a .swerec file (sim/Recorder)
+void App::drawRecordSection()
+{
+	bool active = recorder_ && recorder_->active();
+	if (!active)
+	{
+		ImGui::SetNextItemWidth(-130);
+		ImGui::InputDouble("tous les (s simulées)", &recordInterval_, 0.1, 1.0, "%.2f");
+		recordInterval_ = std::max(recordInterval_, 0.0);
+		tip("Intervalle de temps simulé entre deux enregistrements (0 = à chaque image)");
+		ImGui::Checkbox("16 bits (moitié de place)", &recordHalf_);
+		tip("Décoché : h, qx, qy en float32, identiques au solveur (12 octets par maille).\n"
+		    "Coché : h au mm (uint16), qx, qy en float16 (6 octets par maille) : pour les longues séquences.");
+		// folder: text field (applied on Enter / focus loss), native picker, explorer
+		ImGui::SetNextItemWidth(-92);
+		if (ImGui::InputTextWithHint("##recdir", "dossier des enregistrements", swerecDirBuf_, sizeof(swerecDirBuf_),
+		                             ImGuiInputTextFlags_EnterReturnsTrue) ||
+		    (ImGui::IsItemDeactivatedAfterEdit()))
+			setRecordDir(std::filesystem::path(swerecDirBuf_));
+		tip("Dossier où les fichiers .swerec sont écrits (gardé dans swe_settings.json ; --record-dir en ligne de\n"
+		    "commande). Vide = records/ à côté de l'exécutable.");
+		ImGui::SameLine();
+		if (ImGui::Button("…"))
+			if (auto dir = dialog::pickFolder(swerecDir_, L"Dossier des enregistrements"))
+				setRecordDir(*dir);
+		tip("Choisir le dossier");
+		ImGui::SameLine();
+		if (ImGui::Button("Ouvrir"))
+			if (!dialog::openInExplorer(swerecDir_))
+				log::warn("cannot open {}", swerecDir_.string());
+		tip("Ouvrir le dossier dans l'explorateur");
+		auto path = defaultRecordPath();
+		ImGui::TextDisabled("%s", path.filename().string().c_str());
+		tip(path.string().c_str());
+		if (primaryButton("Démarrer l'enregistrement"))
+			startRecording(path, recordInterval_, recordHalf_);
+		tip("h, qx, qy des tuiles mouillées, copiés par le GPU et écrits par un thread de fond ;\n"
+		    "lecture : tools/swerec.py, post-traitement : tools/swepost.py. L'enregistrement s'arrête en quittant\n"
+		    "l'étape Simulation.");
+		return;
+	}
+	auto st = recorder_->stats();
+	kv("Fichier", recorder_->path().filename().string());
+	kv("Dossier", recorder_->path().parent_path().string());
+	kv("Enregistrements", std::format("{}   (dernier t = {})", st.records, formatTime(st.lastT)));
+	kv("Taille", std::format("{:.1f} MB", double(st.bytes) / 1048576.0));
+	kv("Intervalle", std::format("{:.3g} s   ({})", recorder_->every(), recorder_->halfPrecision() ? "16 bits" : "float32"));
+	if (st.pending > 0 || st.delayed > 0)
+		kv("File d'attente", std::format("{} en cours, {} différé(s)", st.pending, st.delayed), st.delayed > 0 ? kWarn : ImVec4(0, 0, 0, 0));
+	tip("Différé : aucun tampon libre à l'image voulue (le disque ne suit pas), l'enregistrement est pris à l'image suivante");
+	ImGui::PushStyleColor(ImGuiCol_Button, kDanger);
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.45f, 0.4f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.85f, 0.3f, 0.26f, 1.0f));
+	if (ImGui::Button("Arrêter l'enregistrement", ImVec2(-1, 0)))
+		stopRecording();
+	ImGui::PopStyleColor(3);
+}
+
 void App::drawBalanceSection()
 {
 	auto const &c = session_->caseData();
-	ImGui::Text("t  = %s   (%u pas)", formatTime(scalars_.t).c_str(), scalars_.n_steps);
-	ImGui::Text("dt = %.3e s   s_max = %.3f m/s   %.0f pas/s", scalars_.dt, scalars_.s_max, stepsPerSec_);
+	kv("Temps", std::format("{}   ({} pas)", formatTime(scalars_.t), scalars_.n_steps));
+	kv("Pas de temps", std::format("{:.3e} s", scalars_.dt));
+	kv("Célérité max", std::format("{:.3f} m/s", scalars_.s_max));
+	kv("Cadence", std::format("{:.0f} pas/s", stepsPerSec_));
 	if (!std::isfinite(scalars_.t) || !std::isfinite(scalars_.dt) || !std::isfinite(scalars_.volume))
-		ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "La simulation a divergé : Recommencer");
+		ImGui::TextColored(kDanger, "La simulation a divergé : Recommencer");
 
-	ImGui::Spacing();
+	sectionLabel("Surface");
 	double dV = volume0_ > 0.0 ? (scalars_.volume - volume0_) / volume0_ * 100.0 : 0.0;
-	ImGui::Text("Volume     %s   (%+.4f %%)", formatVolume(scalars_.volume).c_str(), dV);
+	kv("Volume", std::format("{}   ({:+.4f} %)", formatVolume(scalars_.volume), dV));
 	tip("Variation de volume depuis t = 0 : 0 avec des murs partout (conservation), sinon débits entrants / sortants");
-	ImGui::Text("Emprise    %s", formatArea(scalars_.wetCells * c.dx() * c.dy()).c_str());
-	ImGui::Text("h max      %.3f m     |u| max  %.3f m/s", scalars_.hMax, scalars_.uMax);
+	kv("Emprise mouillée", formatArea(scalars_.wetCells * c.dx() * c.dy()));
+	kv("h max", std::format("{:.3f} m", scalars_.hMax));
+	kv("|u| max", std::format("{:.3f} m/s", scalars_.uMax));
 	if (c.drain_passes > 0)
-		ImGui::Text("Limiteur   %u maille(s) au dernier pas", scalars_.limitedCells);
+		kv("Limiteur", std::format("{} maille(s)", scalars_.limitedCells));
 	else
-		ImGui::TextDisabled("Limiteur   désactivé (h < 0 tronqué)");
+		kv("Limiteur", "désactivé (h < 0 tronqué)", kMuted);
 	tip("Mailles dont les flux sortants ont été réduits pour garder h >= 0 (dernier étage du dernier pas)");
 	if (scalars_.clampCells > 0)
-		ImGui::Text("h < 0      %u troncature(s), max %.2e m", scalars_.clampCells, scalars_.clampMax);
-	tip("Hauteurs négatives ramenées à 0 depuis t = 0 (masse créée). Limiteur actif : seulement des résidus d'arrondi");
+	{
+		kv("h < 0", std::format("{} troncature(s), max {:.2e} m", scalars_.clampCells, scalars_.clampMax), kWarn);
+		tip("Hauteurs négatives ramenées à 0 depuis t = 0 (masse créée). Limiteur actif : seulement des résidus d'arrondi");
+	}
 
 	if (c.gw.enabled)
 	{
-		ImGui::SeparatorText("Nappe");
-		ImGui::Text("Volume     %s", formatVolume(scalars_.gwVolume).c_str());
+		sectionLabel("Nappe");
+		kv("Volume", formatVolume(scalars_.gwVolume));
 		tip("Eau stockée dans l'aquifère : somme de Sy h_gw dx dy");
-		ImGui::Text("Infiltré   %s    exfiltré %s", formatVolume(scalars_.gwInfil).c_str(), formatVolume(scalars_.gwExfil).c_str());
-		ImGui::Text("Échange    %+.4g m³/s", scalars_.gwRate);
+		kv("Infiltré", formatVolume(scalars_.gwInfil));
+		kv("Exfiltré", formatVolume(scalars_.gwExfil));
+		kv("Échange", std::format("{:+.4g} m³/s", scalars_.gwRate));
 		tip("Débit net surface -> nappe au dernier pas (> 0 : infiltration)");
 	}
 	bool chronologies = c.infiltration.active() || c.rain.active();
 	if (chronologies)
 	{
-		ImGui::SeparatorText("Pluie / infiltration");
-		ImGui::Text("Pluie      %s    apport net %s", formatVolume(scalars_.srcRain).c_str(), formatVolume(scalars_.srcNet).c_str());
+		sectionLabel("Pluie / infiltration");
+		kv("Pluie", formatVolume(scalars_.srcRain));
+		kv("Apport net", formatVolume(scalars_.srcNet));
 		tip("Volume ajouté à la surface par les chronologies (pluie + infiltration signée), depuis t = 0.\n"
 		    "Une infiltration négative ne retire au plus que l'eau présente.");
 	}
@@ -968,7 +1732,7 @@ void App::drawBalanceSection()
 	{
 		double total0 = balance0_;
 		double total  = double(scalars_.volume) + scalars_.gwVolume - scalars_.srcNet;
-		ImGui::Text("Bilan      %+.4f %% depuis t = 0", total0 > 0.0 ? (total - total0) / total0 * 100.0 : 0.0);
+		kv("Bilan total", std::format("{:+.4f} % depuis t = 0", total0 > 0.0 ? (total - total0) / total0 * 100.0 : 0.0));
 		tip("Surface + nappe - apports des chronologies : 0 avec des murs partout");
 	}
 }
@@ -983,13 +1747,13 @@ void App::drawProbesSection()
 	int             cols       = c.gw.enabled ? 6 : 5;
 	if (!probes_.empty() && ImGui::BeginTable("probes", cols, tableFlags))
 	{
-		ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 22.0f);
+		ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 24.0f);
 		ImGui::TableSetupColumn("h (m)");
 		ImGui::TableSetupColumn("|u| (m/s)");
 		ImGui::TableSetupColumn("eta (m)");
 		if (c.gw.enabled)
 			ImGui::TableSetupColumn("nappe (m)");
-		ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 22.0f);
+		ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 24.0f);
 		ImGui::TableHeadersRow();
 		for (size_t p = 0; p < probes_.size(); ++p)
 		{
@@ -1013,7 +1777,7 @@ void App::drawProbesSection()
 			}
 			ImGui::TableNextColumn();
 			ImGui::PushID(int(p));
-			if (ImGui::SmallButton("x"))
+			if (ghostButton("x"))
 				remove = int(p);
 			ImGui::PopID();
 		}
@@ -1058,21 +1822,27 @@ void App::drawDisplaySection()
 		ImGui::SliderFloat("opacité", &render_.cmapOpacity, 0.2f, 1.0f, "%.2f");
 	}
 
-	ImGui::SeparatorText("Éléments");
+	sectionLabel("Éléments");
+	float colW = ImGui::GetContentRegionAvail().x / 3.0f;
 	ImGui::Checkbox("Eau", &render_.showWater);
-	ImGui::SameLine(110);
+	ImGui::SameLine(colW);
 	ImGui::Checkbox("Maillage", &render_.showMesh);
-	ImGui::SameLine(220);
+	ImGui::SameLine(2 * colW);
 	ImGui::Checkbox("Zones", &render_.showZones);
 	ImGui::Checkbox("Lignes de courant", &render_.showLines);
 	tip("Germes dérivant avec l'écoulement, lignes tracées dans la direction de la vitesse");
-	ImGui::SameLine(220);
+	ImGui::SameLine(2 * colW);
 	ImGui::Checkbox("Eau mince", &render_.thinWater);
 	tip("Opacité minimale des lames d'eau de quelques cm");
 	bool turbid = effects_->turbidity();
 	if (ImGui::Checkbox("Eau turbide (crue chargée)", &turbid))
 		effects_->setTurbidity(turbid);
 	tip("L'eau rapide se charge en sédiments et devient brune, puis décante en eau calme");
+	ImGui::Checkbox("Conditions aux limites", &render_.showBorders);
+	tip("Bords ouverts du domaine et conditions sur faces, colorés par type");
+	ImGui::SameLine(2 * colW);
+	ImGui::Checkbox("Mailles brutes", &render_.blocks);
+	tip("Colonnes à sommet plat, sans interpolation : la valeur de chaque maille telle que le solveur la voit");
 	if (renderer_->hasOrthophoto())
 	{
 		ImGui::Checkbox("Orthophoto", &render_.showOrtho);
@@ -1086,7 +1856,7 @@ void App::drawDisplaySection()
 
 	if (c.gw.enabled)
 	{
-		ImGui::SeparatorText("Souterrain");
+		sectionLabel("Souterrain");
 		ImGui::Checkbox("Nappe en transparence", &render_.gwXray);
 		tip("Surface de la nappe vue à travers le sol (bleu clair : proche de la surface, foncé : profonde)");
 		bool gwLines = effects_->groundwaterLines();
@@ -1104,7 +1874,7 @@ void App::drawDisplaySection()
 	}
 
 	// cut box: a block diagram of part of the domain, its walls show the soil column (groundwater cases)
-	ImGui::SeparatorText("Coupe");
+	sectionLabel("Coupe");
 	if (ImGui::Checkbox("Boîte de coupe", &render_.cropOn) && render_.cropOn && render_.crop.z <= render_.crop.x)
 		render_.crop = {0, 0, c.nx - 1, c.ny / 2};        // first use: the southern half
 	tip("N'affiche qu'un rectangle de mailles : ses parois montrent la colonne de sol\n"
@@ -1126,9 +1896,12 @@ void App::drawDisplaySection()
 		ImGui::SameLine();
 		if (ImGui::SmallButton("Tout"))
 			render_.crop = {0, 0, c.nx - 1, c.ny - 1};
+		ImGui::SameLine();
+		if (hasSelection() && ImGui::SmallButton("Sélection"))
+			render_.crop = {selStats_.bounds.i0, selStats_.bounds.j0, selStats_.bounds.i1, selStats_.bounds.j1};
 	}
 
-	ImGui::SeparatorText("Vue");
+	sectionLabel("Vue");
 	drawCameraButtons();
 	ImGui::SetNextItemWidth(-90);
 	ImGui::SliderFloat("exagération", &render_.z_scale, 1.0f, 2.5f * zScale0_, "x %.2f");
@@ -1175,20 +1948,27 @@ void App::drawAdvancedSection()
 void App::drawSimulationPanel()
 {
 	auto const &c = session_->caseData();
-	ImGui::TextWrapped("%s", c.label.c_str());
-	ImGui::TextDisabled("%u x %u mailles de %.3g m  (%.2f M)", c.nx, c.ny, c.dx(), c.cells() * 1e-6);
-	ImGui::Spacing();
-	drawTransportSection();
-	ImGui::Spacing();
-	if (ImGui::CollapsingHeader("Temps et bilan", ImGuiTreeNodeFlags_DefaultOpen))
+	if (beginCard("run", c.label.c_str(), fontBold_, false, true, std::format("{} x {} · {:.3g} m", c.nx, c.ny, c.dx()).c_str()))
+		drawTransportSection();
+	endCard();
+	if (beginCard("balance", "Temps et bilan", fontBold_, true, true))
 		drawBalanceSection();
-	if (ImGui::CollapsingHeader(probes_.empty() ? "Sondes" : std::format("Sondes ({})###sondes", probes_.size()).c_str(),
-	                            probes_.empty() ? 0 : ImGuiTreeNodeFlags_DefaultOpen))
+	endCard();
+	{
+		bool rec = recorder_ && recorder_->active();
+		if (beginCard("record", "Enregistrement", fontBold_, true, false, rec ? "REC" : nullptr))
+			drawRecordSection();
+		endCard();
+	}
+	if (beginCard("probes", "Sondes", fontBold_, true, !probes_.empty(), probes_.empty() ? nullptr : std::format("{}", probes_.size()).c_str()))
 		drawProbesSection();
-	if (ImGui::CollapsingHeader("Affichage", ImGuiTreeNodeFlags_DefaultOpen))
+	endCard();
+	if (beginCard("display", "Affichage", fontBold_, true, true))
 		drawDisplaySection();
-	if (ImGui::CollapsingHeader("Schéma numérique"))
+	endCard();
+	if (beginCard("numerics", "Schéma numérique", fontBold_, true, false))
 		drawAdvancedSection();
+	endCard();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1200,12 +1980,16 @@ void App::drawPlotsBand(ImVec2 pos, ImVec2 size)
 	ImGui::SetNextWindowPos(pos);
 	ImGui::SetNextWindowSize(size);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
 	if (!ImGui::Begin("##plots", nullptr, kFixedWindow))
 	{
 		ImGui::End();
-		ImGui::PopStyleVar();
+		ImGui::PopStyleVar(2);
 		return;
 	}
+	// top edge line
+	auto *dl = ImGui::GetWindowDrawList();
+	dl->AddLine(pos, ImVec2(pos.x + size.x, pos.y), ImGui::GetColorU32(ImGuiCol_Border), 1.0f);
 	auto const &h = history_;
 	int         n = static_cast<int>(h.t.size());
 	auto const &c = session_->caseData();
@@ -1293,7 +2077,7 @@ void App::drawPlotsBand(ImVec2 pos, ImVec2 size)
 		ImGui::EndTabBar();
 	}
 	ImGui::End();
-	ImGui::PopStyleVar();
+	ImGui::PopStyleVar(2);
 }
 
 // Cells of the profile for the current mode; sent to the solver when they change
@@ -1397,9 +2181,9 @@ void App::drawProfilePlot()
 		else
 			fill("sol", floor, zb, ImVec4(0.55f, 0.40f, 0.25f, 1.0f));
 		fill("eau", zb, eta, ImVec4(0.35f, 0.7f, 1.0f, 0.8f));
-		line("terrain", zb, ImVec4(0.15f, 0.1f, 0.05f, 1.0f), 2.0f);
+		line("terrain", zb, ImVec4(0.85f, 0.80f, 0.72f, 1.0f), 2.0f);
 		if (c.gw.enabled)
-			line("cote de la nappe", head, ImVec4(0.0f, 0.15f, 0.6f, 1.0f), 2.0f);
+			line("cote de la nappe", head, ImVec4(0.45f, 0.70f, 1.0f, 1.0f), 2.0f);
 		ImPlot::EndPlot();
 	}
 }
@@ -1410,7 +2194,7 @@ void App::drawProfilePlot()
 
 void App::drawPerfWindow()
 {
-	ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_FirstUseEver);
 	if (!ImGui::Begin("Performances", &showPerf_))
 	{
 		ImGui::End();
@@ -1419,21 +2203,21 @@ void App::drawPerfWindow()
 	auto const &io = ImGui::GetIO();
 	auto const &c  = session_->caseData();
 	ImGui::TextUnformatted(ctx_->properties.deviceName.data());
-	ImGui::Text("%.1f images/s   (%.2f ms)", io.Framerate, 1000.0f / io.Framerate);
-	ImGui::Text("%.0f pas/s   %.0f M mailles.pas/s", stepsPerSec_, stepsPerSec_ * c.cells() * 1e-6);
+	kv("Images", std::format("{:.1f} /s   ({:.2f} ms)", io.Framerate, 1000.0f / io.Framerate));
+	kv("Pas", std::format("{:.0f} /s   {:.0f} M mailles.pas/s", stepsPerSec_, stepsPerSec_ * c.cells() * 1e-6));
 	if (timestampPeriod_ > 0.0)
 	{
-		ImGui::SeparatorText("GPU par image");
+		sectionLabel("GPU par image");
 		double perStep = stepsPerFrame_ > 0 && !paused_ ? gpu_.solver / stepsPerFrame_ * 1000.0 : 0.0;
-		ImGui::Text("solveur   %7.3f ms  (%.1f us/pas)", gpu_.solver, perStep);
-		ImGui::Text("effets    %7.3f ms", gpu_.effects);
-		ImGui::Text("rendu     %7.3f ms", gpu_.render);
+		kv("solveur", std::format("{:7.3f} ms  ({:.1f} us/pas)", gpu_.solver, perStep));
+		kv("effets", std::format("{:7.3f} ms", gpu_.effects));
+		kv("rendu", std::format("{:7.3f} ms", gpu_.render));
 		tip("Rendu 3D + interface, MSAA 4x");
 	}
 	else
 		ImGui::TextDisabled("Timestamps GPU non disponibles");
-	ImGui::SeparatorText("Rendu");
-	ImGui::Text("vue %.0f x %.0f px, MSAA %ux", viewRect_.z, viewRect_.w, static_cast<unsigned>(renderer_->samples()));
+	sectionLabel("Rendu");
+	kv("vue", std::format("{:.0f} x {:.0f} px, MSAA {}x", viewRect_.z, viewRect_.w, static_cast<unsigned>(renderer_->samples())));
 	ImGui::End();
 }
 
@@ -1450,9 +2234,10 @@ void App::drawLegend()
 	auto  *vp    = ImGui::GetMainViewport();
 	ImVec2 corner(vp->Pos.x + (viewRect_.x + viewRect_.z) / scale.x - 16.0f, vp->Pos.y + (viewRect_.y + viewRect_.w) / scale.y - 16.0f);
 	ImGui::SetNextWindowPos(corner, ImGuiCond_Always, ImVec2(1.0f, 1.0f));
-	ImGui::SetNextWindowBgAlpha(0.75f);
+	ImGui::SetNextWindowBgAlpha(0.82f);
 	ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
 	                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove;
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
 	if (ImGui::Begin("##legend", nullptr, flags))
 	{
 		if (*info.unit)
@@ -1460,7 +2245,7 @@ void App::drawLegend()
 		else
 			ImGui::TextUnformatted(info.label);
 		ImVec2    p0 = ImGui::GetCursorScreenPos();
-		float     w = 240.0f, hbar = 14.0f;
+		float     w = 240.0f, hbar = 12.0f;
 		auto     *dl    = ImGui::GetWindowDrawList();
 		int const steps = 48;
 		for (int k = 0; k < steps; ++k)
@@ -1475,13 +2260,41 @@ void App::drawLegend()
 		double offset   = absolute ? session_->caseData().z_ref : 0.0;
 		auto   label    = [&](float v) { return std::format("{:.3g}", v + offset); };
 		std::string lo = label(render_.cmapMin), mid = label(0.5f * (render_.cmapMin + render_.cmapMax)), hi = label(render_.cmapMax);
-		ImGui::TextUnformatted(lo.c_str());
+		ImGui::TextDisabled("%s", lo.c_str());
 		ImGui::SameLine(w * 0.5f - ImGui::CalcTextSize(mid.c_str()).x * 0.5f + ImGui::GetStyle().WindowPadding.x);
-		ImGui::TextUnformatted(mid.c_str());
+		ImGui::TextDisabled("%s", mid.c_str());
 		ImGui::SameLine(w - ImGui::CalcTextSize(hi.c_str()).x + ImGui::GetStyle().WindowPadding.x);
-		ImGui::TextUnformatted(hi.c_str());
+		ImGui::TextDisabled("%s", hi.c_str());
 	}
 	ImGui::End();
+	ImGui::PopStyleVar();
+}
+
+// Readout over the 3D view (top-left): the cell under the mouse in the Conditions stage
+void App::drawViewOverlay()
+{
+	if (stage_ != Stage::Conditions || !hoverCell_)
+		return;
+	auto const &c = session_->caseData();
+	ImVec2      scale = ImGui::GetIO().DisplayFramebufferScale;
+	auto       *vp    = ImGui::GetMainViewport();
+	ImVec2      corner(vp->Pos.x + viewRect_.x / scale.x + 14.0f, vp->Pos.y + viewRect_.y / scale.y + 14.0f);
+	ImGui::SetNextWindowPos(corner, ImGuiCond_Always);
+	ImGui::SetNextWindowBgAlpha(0.72f);
+	ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+	                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs;
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
+	if (ImGui::Begin("##hover", nullptr, flags))
+	{
+		size_t k = c.index(hoverCell_->i, hoverCell_->j);
+		ImGui::Text("maille (%u, %u)", hoverCell_->i, hoverCell_->j);
+		ImGui::SameLine();
+		ImGui::TextDisabled("  fond %.2f m DNG   h0 %.2f m%s", c.zb[k] + c.z_ref, c.h0[k],
+		                    selMask_.size() == c.cells() && selMask_[k] ? "   sélectionnée" : "");
+	}
+	ImGui::End();
+	ImGui::PopStyleVar(2);
 }
 
 // Numbered markers of the probes, drawn over the 3D view (under the panels)
@@ -1510,6 +2323,7 @@ void App::drawProbeMarkers()
 		              vp->Pos.y + (viewRect_.y + (ndc.y * 0.5f + 0.5f) * viewRect_.w) / scale.y);
 		ImU32     col = ImGui::GetColorU32(probeColor(p));
 		dl->AddLine(pos, ImVec2(pos.x, pos.y - 22.0f), col, 2.0f);
+		dl->AddCircleFilled(ImVec2(pos.x, pos.y - 30.0f), 10.0f, IM_COL32(20, 22, 26, 200));
 		dl->AddCircleFilled(ImVec2(pos.x, pos.y - 30.0f), 9.0f, col);
 		auto label = std::to_string(p + 1);
 		auto ts    = ImGui::CalcTextSize(label.c_str());
@@ -1521,12 +2335,12 @@ void App::drawProbeMarkers()
 
 void App::drawHelp()
 {
-	ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_FirstUseEver);
 	if (ImGui::Begin("Aide", &showHelp_))
 	{
 		auto row = [](char const *key, char const *what) {
-			ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%-18s", key);
-			ImGui::SameLine(150);
+			ImGui::TextColored(kAccentHi, "%s", key);
+			ImGui::SameLine(190);
 			ImGui::TextUnformatted(what);
 		};
 		ImGui::SeparatorText("Étapes");
@@ -1534,17 +2348,23 @@ void App::drawHelp()
 		                   "3 Conditions : eau, sol, pluie, zones et bords sur le maillage, à t = 0. 4 Simulation : lancer et "
 		                   "observer. La barre du haut permet de revenir à une étape précédente.");
 		ImGui::SeparatorText("Souris (vue 3D)");
-		row("Clic gauche", "tourner (étape Conditions : sélectionner des mailles)");
+		row("Clic gauche", "tourner");
 		row("Clic milieu", "déplacer");
 		row("Molette", "zoomer");
-		row("Ctrl + clic", "poser une sonde");
+		row("Ctrl + clic", "poser une sonde (étape Simulation)");
+		ImGui::SeparatorText("Sélection de mailles (étape Conditions)");
+		row("Glisser", "rectangle de mailles, ou coup de pinceau (mode Pinceau)");
+		row("Clic", "une maille");
+		row("Maj + glisser / clic", "ajouter à la sélection");
+		row("Ctrl + glisser / clic", "retirer de la sélection");
+		row("Ctrl + A / Ctrl + I", "tout sélectionner / inverser");
+		row("Échap", "effacer la sélection");
 		ImGui::SeparatorText("Carte");
 		row("Glisser", "déplacer la carte");
 		row("Clic droit + glisser", "tracer la zone à importer");
 		ImGui::SeparatorText("Clavier");
 		row("Espace", "pause / reprise (étape Simulation)");
 		row("R", "recommencer (étape Simulation)");
-		row("Échap", "annuler la sélection");
 		row("Origine", "recadrer la caméra");
 		row("F12", "capture d'écran (captures/)");
 		row("F11", "masquer / afficher l'interface");

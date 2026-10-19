@@ -32,7 +32,14 @@ usage: swe [options]
   --steps-per-frame <n>  solver steps per displayed frame                [30]
   --color <0..10>      colouring: realistic, depth, speed, Froude, elevation; groundwater cases (on the
                        ground): table depth, saturation, exchange, infiltrated depth, head; 10 = rain
-  --mesh               wireframe overlay
+  --mesh               cell boundaries overlay
+  --blocks             raw cells: flat-topped columns, no interpolation
+  --record <file.swerec>   record h, qx, qy every --record-every simulated seconds (tools/swerec.py reads it;
+                       window and --headless runs)
+  --record-dir <dir>   folder of the records started from the GUI (default: records/ next to the executable,
+                       kept in swe_settings.json); with --headless and no --record: <dir>/<case>_<date>.swerec
+  --record-every <s>                                                     [1.0]
+  --record-f16         16-bit cells (h to the mm, q as float16) instead of exact float32: half the bytes
   --gw-contours <m>    water table contour lines with this step (groundwater cases)
   --gw-xray            water table seen through the ground; --gw-lines: streamlines of the aquifer
   --crop i0,j0,i1,j1   cut box: only these cells are drawn, the walls show the soil column
@@ -60,6 +67,8 @@ usage: swe [options]
   --top                start with the top view
   --water i0,j0,i1,j1,h   water block (depth h) on a cell rectangle, repeatable
   --zone kind,value,i0,j0,i1,j1   per-cell zone (source m3/s | sink | level m DNG), repeatable
+  --bridge i0,j0,i1,j1,z,e        bridge deck over a cell rectangle: soffit at z (m, case datum), deck thickness e;
+                       pressurised flow above the soffit, overtopping above the deck (repeatable)
   --rain i0,j0,i1,j1,mm_h         rain zone, constant rate from t = 0 (repeatable; --infiltration: same,
                        signed infiltration chronology zone)
                        (--water and --zone also apply to --headless runs)

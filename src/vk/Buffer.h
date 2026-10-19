@@ -24,6 +24,9 @@ class Buffer
 	static Buffer storage(Context const &ctx, vk::DeviceSize size, std::string const &name, vk::BufferUsageFlags extra = {});
 	// Host-visible, host-coherent, persistently mapped.
 	static Buffer host(Context const &ctx, vk::DeviceSize size, vk::BufferUsageFlags usage, std::string const &name);
+	// Host-visible transfer destination the CPU will read a lot of: host-cached when the device offers it
+	// (reads from uncached memory are many times slower), else like host().
+	static Buffer readback(Context const &ctx, vk::DeviceSize size, std::string const &name);
 
 	// Synchronous upload / download through a staging buffer (case loading, dumps, tests).
 	void upload(Context const &ctx, void const *data, vk::DeviceSize size, vk::DeviceSize offset = 0);

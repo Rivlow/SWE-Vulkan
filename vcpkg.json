@@ -1,6 +1,6 @@
 {
   "name": "swe-vulkan",
-  "version-string": "0.2.0",
+  "version-string": "0.3.0",
   "description": "Saint-Venant 2D shallow-water solver and viewer (C++20 / Vulkan / Slang)",
   "dependencies": [
     "glfw3",

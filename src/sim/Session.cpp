@@ -91,7 +91,7 @@ void Session::editWater(CellRect const &rect, WaterEdit mode, float value, bool 
 			switch (mode)
 			{
 			case WaterEdit::Depth: h = value; break;
-			case WaterEdit::Level: h = std::max(value - case_.zb[k], 0.0f); break;
+			case WaterEdit::Level: h = depthForLevel(value, case_.zb[k]); break;
 			case WaterEdit::Add: h = std::max(h + value, 0.0f); break;
 			case WaterEdit::Clear: h = 0.0f; break;
 			}
@@ -101,11 +101,85 @@ void Session::editWater(CellRect const &rect, WaterEdit mode, float value, bool 
 		}
 }
 
+// ---- cell sets ----------------------------------------------------------------------------------------------
+
+CellMask Session::maskOf(CellRect const &rect) const
+{
+	CellMask m(case_.cells(), 0);
+	CellRect r = rect;
+	r.i1       = std::min(r.i1, case_.nx - 1);
+	r.j1       = std::min(r.j1, case_.ny - 1);
+	if (!r.empty())
+		for (uint32_t i = r.i0; i <= r.i1; ++i)
+			std::fill_n(m.begin() + static_cast<std::ptrdiff_t>(case_.index(i, r.j0)), r.j1 - r.j0 + 1, uint8_t{1});
+	return m;
+}
+
+CellRect Session::boundsOf(CellMask const &cells) const
+{
+	CellRect b{};        // empty
+	if (!validMask(cells))
+		return b;
+	bool any = false;
+	for (uint32_t i = 0; i < case_.nx; ++i)
+		for (uint32_t j = 0; j < case_.ny; ++j)
+			if (cells[case_.index(i, j)])
+			{
+				if (!any)
+					b = {i, j, i, j};
+				else
+				{
+					b.i0 = std::min(b.i0, i);
+					b.j0 = std::min(b.j0, j);
+					b.i1 = std::max(b.i1, i);
+					b.j1 = std::max(b.j1, j);
+				}
+				any = true;
+			}
+	return b;
+}
+
+size_t Session::countOf(CellMask const &cells) const
+{
+	return validMask(cells) ? static_cast<size_t>(std::ranges::count_if(cells, [](uint8_t v) { return v != 0; })) : 0;
+}
+
+void Session::editWater(CellMask const &cells, WaterEdit mode, float value)
+{
+	if (!validMask(cells))
+		return;
+	bool any = false;
+	for (size_t k = 0; k < cells.size(); ++k)
+	{
+		if (!cells[k])
+			continue;
+		any     = true;
+		float h = case_.h0[k];
+		switch (mode)
+		{
+		case WaterEdit::Depth: h = value; break;
+		case WaterEdit::Level: h = depthForLevel(value, case_.zb[k]); break;
+		case WaterEdit::Add: h = std::max(h + value, 0.0f); break;
+		case WaterEdit::Clear: h = 0.0f; break;
+		}
+		case_.h0[k]  = h;
+		case_.hu0[k] = 0.0f;
+		case_.hv0[k] = 0.0f;
+	}
+	if (any)
+		solver_.reset(case_);        // the live state is the initial state (the Conditions stage sits at t = 0)
+}
+
 bool Session::addZone(CellRect const &rect, ZoneKind kind, double value, std::string const &label)
 {
-	CellRect r = rect;
-	r.i1 = std::min(r.i1, case_.nx - 1);
-	r.j1 = std::min(r.j1, case_.ny - 1);
+	return addZone(maskOf(rect), kind, value, label);
+}
+
+bool Session::addZone(CellMask const &cells, ZoneKind kind, double value, std::string const &label)
+{
+	if (!validMask(cells))
+		return false;
+	CellRect r = boundsOf(cells);
 	if (r.empty())
 		return false;
 	if (case_.zones.size() >= MAX_ZONES)
@@ -117,9 +191,9 @@ bool Session::addZone(CellRect const &rect, ZoneKind kind, double value, std::st
 		case_.zoneMask.assign(case_.cells(), 0);
 	case_.zones.push_back({.kind = kind, .value = value, .label = label, .i0 = r.i0, .j0 = r.j0, .i1 = r.i1, .j1 = r.j1});
 	auto id = static_cast<uint8_t>(case_.zones.size());
-	for (uint32_t i = r.i0; i <= r.i1; ++i)
-		for (uint32_t j = r.j0; j <= r.j1; ++j)
-			case_.zoneMask[case_.index(i, j)] = id;
+	for (size_t k = 0; k < cells.size(); ++k)
+		if (cells[k])
+			case_.zoneMask[k] = id;
 	solver_.uploadZones(case_);
 	applyParameters();        // FLAG_ZONES
 	return true;
@@ -150,6 +224,131 @@ void Session::setZoneValue(size_t index, double value)
 	solver_.uploadZones(case_);
 }
 
+// ---- weak face conditions -----------------------------------------------------------------------------------
+
+bool Session::addFaceBc(CellMask const &cells, Side side, BcKind kind, double value, std::string const &label, bool allFaces)
+{
+	if (!validMask(cells))
+		return false;
+	if (case_.faceBcs.size() >= MAX_FACE_BC)
+	{
+		log::warn("at most {} groups of face conditions", MAX_FACE_BC);
+		return false;
+	}
+	CaseData::FaceBcDef def{.kind = kind, .value = value, .label = label};
+	for (uint32_t i = 0; i < case_.nx; ++i)
+		for (uint32_t j = 0; j < case_.ny; ++j)
+		{
+			uint32_t k = static_cast<uint32_t>(case_.index(i, j));
+			if (!cells[k])
+				continue;
+			if (!allFaces)
+			{
+				// skip the faces shared with another selected cell: only the envelope of the set is a border
+				bool shared = false;
+				switch (side)
+				{
+				case SIDE_WEST: shared = i > 0 && cells[case_.index(i - 1, j)]; break;
+				case SIDE_EAST: shared = i + 1 < case_.nx && cells[case_.index(i + 1, j)]; break;
+				case SIDE_SOUTH: shared = j > 0 && cells[case_.index(i, j - 1)]; break;
+				case SIDE_NORTH: shared = j + 1 < case_.ny && cells[case_.index(i, j + 1)]; break;
+				}
+				if (shared)
+					continue;
+			}
+			def.faces.push_back(faceOf(k, side));
+		}
+	if (def.faces.empty())
+		return false;
+	// a face belongs to one group: remove the new faces from the older groups (empty groups disappear)
+	std::vector<uint8_t> taken(case_.cells() * 4, 0);
+	for (uint32_t f : def.faces)
+		taken[f] = 1;
+	for (auto &g : case_.faceBcs)
+		std::erase_if(g.faces, [&](uint32_t f) { return taken[f] != 0; });
+	std::erase_if(case_.faceBcs, [](CaseData::FaceBcDef const &g) { return g.faces.empty(); });
+	case_.faceBcs.push_back(std::move(def));
+	solver_.uploadFaceBcs(case_);
+	applyParameters();        // FLAG_FACE_BC, step structure
+	return true;
+}
+
+bool Session::addBridge(CellMask const &cells, double zRoof, double zDeck, std::string const &label)
+{
+	if (!validMask(cells) || countOf(cells) == 0)
+		return false;
+	CaseData::BridgeDef b{.label = label.empty() ? "pont" : label, .zRoof = zRoof, .zDeck = std::max(zDeck, zRoof), .cells = cells};
+	// a cell is under one deck only: the new one takes its cells from the others
+	for (auto &o : case_.bridges)
+		for (size_t k = 0; k < cells.size(); ++k)
+			if (cells[k])
+				o.cells[k] = 0;
+	std::erase_if(case_.bridges, [&](CaseData::BridgeDef const &o) { return countOf(o.cells) == 0; });
+	case_.bridges.push_back(std::move(b));
+	applyBridges();
+	return true;
+}
+
+void Session::removeBridge(size_t index)
+{
+	if (index >= case_.bridges.size())
+		return;
+	case_.bridges.erase(case_.bridges.begin() + static_cast<std::ptrdiff_t>(index));
+	applyBridges();
+}
+
+void Session::setBridge(size_t index, double zRoof, double zDeck)
+{
+	if (index >= case_.bridges.size())
+		return;
+	case_.bridges[index].zRoof = zRoof;
+	case_.bridges[index].zDeck = std::max(zDeck, zRoof);
+	applyBridges();
+}
+
+void Session::setBridgeSlot(double slot)
+{
+	case_.bridgeSlot = std::clamp(slot, 1e-3, 1.0);
+	applyParameters();
+}
+
+void Session::applyBridges()
+{
+	case_.rebuildBridgeArrays();
+	solver_.uploadBridges(case_);
+	applyParameters();
+	solver_.reset(case_);        // the stored depths change with the decks: back to t = 0
+}
+
+void Session::removeFaceBc(size_t index)
+{
+	if (index >= case_.faceBcs.size())
+		return;
+	case_.faceBcs.erase(case_.faceBcs.begin() + static_cast<std::ptrdiff_t>(index));
+	solver_.uploadFaceBcs(case_);
+	applyParameters();
+}
+
+void Session::setFaceBc(size_t index, BcKind kind, double value)
+{
+	if (index >= case_.faceBcs.size())
+		return;
+	case_.faceBcs[index].kind  = kind;
+	case_.faceBcs[index].value = value;
+	solver_.uploadFaceBcs(case_);
+	applyParameters();
+}
+
+CellMask Session::faceBcCells(size_t index) const
+{
+	CellMask m(case_.cells(), 0);
+	if (index < case_.faceBcs.size())
+		for (uint32_t f : case_.faceBcs[index].faces)
+			if (faceCell(f) < m.size())
+				m[faceCell(f)] = 1;
+	return m;
+}
+
 CaseData::Chronology &Session::chronology(ChronologyKind kind)
 {
 	return kind == ChronologyKind::Rain ? case_.rain : case_.infiltration;
@@ -157,10 +356,12 @@ CaseData::Chronology &Session::chronology(ChronologyKind kind)
 
 bool Session::addChronologyZone(ChronologyKind kind, CellRect const &rect, double q)
 {
-	CellRect r = rect;
-	r.i1 = std::min(r.i1, case_.nx - 1);
-	r.j1 = std::min(r.j1, case_.ny - 1);
-	if (r.empty())
+	return addChronologyZone(kind, maskOf(rect), q);
+}
+
+bool Session::addChronologyZone(ChronologyKind kind, CellMask const &cells, double q)
+{
+	if (!validMask(cells) || countOf(cells) == 0)
 		return false;
 	auto &ch = chronology(kind);
 	if (ch.zones.size() != case_.cells())
@@ -176,9 +377,9 @@ bool Session::addChronologyZone(ChronologyKind kind, CellRect const &rect, doubl
 		return false;
 	for (auto &line : ch.q)
 		line.push_back(q);
-	for (uint32_t i = r.i0; i <= r.i1; ++i)
-		for (uint32_t j = r.j0; j <= r.j1; ++j)
-			ch.zones[case_.index(i, j)] = static_cast<uint16_t>(id);
+	for (size_t k = 0; k < cells.size(); ++k)
+		if (cells[k])
+			ch.zones[k] = static_cast<uint16_t>(id);
 	applyChronologies();
 	return true;
 }
@@ -250,7 +451,7 @@ void Session::setGroundwater(std::optional<SoilParams> const &params)
 		gw.z_sub.assign(n, 0.0f);
 		gw.h0.assign(n, 0.0f);
 		soilDefaults_ = *params;
-		setSoil({0, 0, case_.nx - 1, case_.ny - 1}, *params);
+		setSoil(CellRect{0, 0, case_.nx - 1, case_.ny - 1}, *params);
 		return;        // setSoil reloads
 	}
 	solver_.load(case_);
@@ -259,26 +460,26 @@ void Session::setGroundwater(std::optional<SoilParams> const &params)
 
 void Session::setSoil(CellRect const &rect, SoilParams const &p)
 {
-	if (!case_.gw.enabled)
-		return;
-	CellRect r = rect;
-	r.i1 = std::min(r.i1, case_.nx - 1);
-	r.j1 = std::min(r.j1, case_.ny - 1);
-	if (r.empty())
+	setSoil(maskOf(rect), p);
+}
+
+void Session::setSoil(CellMask const &cells, SoilParams const &p)
+{
+	if (!case_.gw.enabled || !validMask(cells) || countOf(cells) == 0)
 		return;
 	auto &gw = case_.gw;
-	for (uint32_t i = r.i0; i <= r.i1; ++i)
-		for (uint32_t j = r.j0; j <= r.j1; ++j)
-		{
-			size_t k    = case_.index(i, j);
-			float  zb   = case_.zb[k];
-			float  thick = static_cast<float>(std::max(p.depth, 0.01));
-			gw.kv[k]    = static_cast<float>(std::max(p.kv, 0.0));
-			gw.kh[k]    = static_cast<float>(std::max(p.kh, 0.0));
-			gw.sy[k]    = static_cast<float>(std::clamp(p.sy, 1e-3, 1.0));
-			gw.z_sub[k] = zb - thick;
-			gw.h0[k]    = std::clamp(thick - static_cast<float>(p.tableDepth), 0.0f, thick);
-		}
+	for (size_t k = 0; k < cells.size(); ++k)
+	{
+		if (!cells[k])
+			continue;
+		float zb    = case_.zb[k];
+		float thick = static_cast<float>(std::max(p.depth, 0.01));
+		gw.kv[k]    = static_cast<float>(std::max(p.kv, 0.0));
+		gw.kh[k]    = static_cast<float>(std::max(p.kh, 0.0));
+		gw.sy[k]    = static_cast<float>(std::clamp(p.sy, 1e-3, 1.0));
+		gw.z_sub[k] = zb - thick;
+		gw.h0[k]    = std::clamp(thick - static_cast<float>(p.tableDepth), 0.0f, thick);
+	}
 	solver_.load(case_);
 	updateBedRange();
 }
@@ -290,7 +491,7 @@ void Session::replaceBed(std::vector<float> zb)
 	// still water keeps its surface: the initial depth follows the new bed
 	for (size_t k = 0; k < case_.cells(); ++k)
 		if (case_.h0[k] > 0.0f)
-			case_.h0[k] = std::max(case_.zb[k] + case_.h0[k] - zb[k], 0.0f);
+			case_.h0[k] = depthForLevel(case_.zb[k] + case_.h0[k], zb[k]);
 	case_.zb = std::move(zb);
 	// the aquifer stays under the ground: wolfgpu's lies on the bed, a physical one is cut by a lowered bed
 	auto &gw = case_.gw;

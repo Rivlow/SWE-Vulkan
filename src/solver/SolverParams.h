@@ -3,6 +3,7 @@
 #include "cases/CaseTypes.h"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 
 namespace swe {
@@ -19,10 +20,15 @@ enum SolverFlags : uint32_t
 	FLAG_GW_LATERAL   = 32,        //   with lateral flow (some kh > 0)
 	FLAG_GW_WOLFGPU   = 64,        //   wolfgpu convention for the vertical exchange
 	FLAG_SOURCES      = 128,       // infiltration / rain chronologies
+	FLAG_FACE_BC      = 256,       // weak conditions on cell faces (face_bcs / face_list)
+	FLAG_LEGACY_LIMITER = 512,     // Venkatakrishnan limiter as in the Python reference (see CaseData::legacyLimiter)
+	FLAG_NO_CARRY       = 1024,    // depth updates rounded as in the Python reference (CaseData::reference)
+	FLAG_BRIDGE         = 2048,    // bridge decks (bridge buffer)
 };
 
 // The model enums are also the GPU encoding (params.slang BC_*, ZONE_*, WATER_*)
-static_assert(uint32_t(BcKind::Inflow) == 1 && uint32_t(BcKind::Level) == 2);
+static_assert(uint32_t(BcKind::Inflow) == 1 && uint32_t(BcKind::Level) == 2 && uint32_t(BcKind::Free) == 3 &&
+              uint32_t(BcKind::Depth) == 4);
 static_assert(uint32_t(ZoneKind::Source) == 1 && uint32_t(ZoneKind::Sink) == 2 && uint32_t(ZoneKind::Level) == 3);
 static_assert(uint32_t(WaterEdit::Level) == 1 && uint32_t(WaterEdit::Add) == 2 && uint32_t(WaterEdit::Clear) == 3);
 
@@ -34,6 +40,22 @@ struct Zone
 	float    _pad   = 0;
 };
 
+// One group of weak face conditions (params.slang FaceBc): its faces are face_list[1 + offset .. + count)
+struct FaceBc
+{
+	uint32_t kind   = 0;        // BcKind
+	uint32_t offset = 0;
+	uint32_t count  = 0;
+	uint32_t _pad   = 0;
+	float    value  = 0;        // m3/s, level or depth
+	float    zmin   = 0;        // lowest bed of the owning cells (dry-start inflow, like bc_zmin)
+	float    _p0 = 0, _p1 = 0;
+};
+static_assert(sizeof(FaceBc) == 32);
+// face_list entries: group << 28 | cell * 4 + side, so cells must stay below 2^26
+constexpr uint32_t FACE_LIST_GROUP_SHIFT = 28;
+constexpr size_t   MAX_FACE_BC_CELLS     = size_t(1) << 26;
+
 struct SolverParams        // std140 uniform buffer
 {
 	uint32_t nx = 0, ny = 0, n_cells = 0, flags = 0;
@@ -43,8 +65,10 @@ struct SolverParams        // std140 uniform buffer
 	std::array<uint32_t, 4> bc_kind{};        // west, east, south, north
 	std::array<float, 4>    bc_value{};
 	std::array<float, 4>    bc_zmin{};        // lowest bed elevation of each side
+	float    bridge_slot = 0.05f;             // Preissmann slot of pressurised bridge cells (relative width)
+	float    _pad_b[3]{};
 };
-static_assert(sizeof(SolverParams) == 112);
+static_assert(sizeof(SolverParams) == 128);
 
 // GPU parameters of a case (pure function: constants folded in double, then rounded to f32)
 SolverParams buildSolverParams(CaseData const &c);
@@ -100,6 +124,12 @@ enum SolverBinding : uint32_t
 	B_SRC_CUM,
 	B_PROFILE_CELLS,
 	B_PROFILE_OUT,
+	B_FACE_BCS,
+	B_FACE_LIST,
+	B_RECORD,
+	B_FACE_CELL,
+	B_MASS_CARRY,
+	B_BRIDGE,
 	B_COUNT,
 };
 
@@ -130,9 +160,20 @@ enum ScalarSlot : uint32_t
 	S_CLAMP_MAX = 22,        // largest clamped |h| since t = 0 (float bits)
 	S_PROBES    = 32,        // MAX_PROBES x (h, u, v, eta)
 	S_GW_PROBES = 64,        // MAX_PROBES x (water table elevation, exchange rate m/s), groundwater cases
-	S_COUNT     = 80,
+	S_BND_CUM   = 80,        // (4 sides + MAX_FACE_BC groups) x (hi, lo): signed 64-bit volume since t = 0, 2^-32 m3
+	S_ZONE_CUM  = 120,       // MAX_ZONES x (hi, lo): volume added (> 0) or removed by each zone since t = 0
+	S_COUNT     = 152,
 };
-static_assert(S_PROBES + 4 * MAX_PROBES <= S_GW_PROBES && S_GW_PROBES + 2 * MAX_PROBES <= S_COUNT);
+static_assert(S_PROBES + 4 * MAX_PROBES <= S_GW_PROBES && S_GW_PROBES + 2 * MAX_PROBES <= S_BND_CUM);
+static_assert(S_BND_CUM + 2 * (4 + MAX_FACE_BC) <= S_ZONE_CUM && S_ZONE_CUM + 2 * MAX_ZONES <= S_COUNT);
+constexpr uint32_t BOUNDARY_GROUPS = 4 + MAX_FACE_BC;        // sides, then face groups
+
+// Value of a (hi, lo) fixed-point volume of the scalars (m3)
+inline double fixedVolume(uint32_t const *s, uint32_t slot)
+{
+	int64_t v = static_cast<int64_t>((uint64_t(s[slot]) << 32) | s[slot + 1]);
+	return std::ldexp(double(v), -32);
+}
 
 constexpr uint32_t MAX_PROFILE = 2048;        // params.slang
 
@@ -164,6 +205,10 @@ struct SolverScalars
 	float gwVolume = 0, gwInfil = 0, gwExfil = 0, gwRate = 0, gwDiffusivity = 0;
 	// infiltration / rain chronologies: net volume added to the surface, rain volume since t = 0 (m3)
 	float srcNet = 0, srcRain = 0;
+	// exact water balance since t = 0 (m3, > 0 = water added): through each side and face group, by each zone
+	std::array<double, BOUNDARY_GROUPS> boundaryVolume{};
+	std::array<double, MAX_ZONES>       zoneVolume{};
+	double boundaryTotal() const;        // sum of both: what the open boundaries and the zones added
 	std::array<ProbeValue, MAX_PROBES> probes{};
 };
 

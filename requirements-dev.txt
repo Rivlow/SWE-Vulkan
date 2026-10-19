@@ -1,0 +1,5 @@
+# Python tools and tests (tools/, tests/): python -m pip install -r requirements-dev.txt
+numpy
+scipy
+matplotlib
+pytest

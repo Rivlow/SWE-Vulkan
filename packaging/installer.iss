@@ -2,7 +2,7 @@
 ; (CMake target `dist`). Per-user install (no administrator rights), the application writes its settings,
 ; captures and imported cases next to its executable.
 #define AppName "SWE Vulkan"
-#define AppVersion "0.2.0"
+#define AppVersion "0.3.0"
 #define AppExe "SWE-Vulkan.exe"
 #ifndef DistDir
   #define DistDir "..\build\release\dist"

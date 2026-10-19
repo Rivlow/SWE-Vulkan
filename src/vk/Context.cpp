@@ -191,6 +191,8 @@ void Context::pickPhysicalDevice(int forced)
 void Context::createDevice()
 {
 	auto supported = physicalDevice.getFeatures();
+	auto f12       = physicalDevice.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan12Features>()
+	                     .get<vk::PhysicalDeviceVulkan12Features>();
 
 	vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features, vk::PhysicalDeviceVulkan12Features,
 	                   vk::PhysicalDeviceVulkan13Features>
@@ -200,9 +202,10 @@ void Context::createDevice()
 	                      .wideLines                      = supported.wideLines,
 	                      .samplerAnisotropy              = supported.samplerAnisotropy,
 	                      .vertexPipelineStoresAndAtomics = supported.vertexPipelineStoresAndAtomics,
-	                      .fragmentStoresAndAtomics       = supported.fragmentStoresAndAtomics}},
+	                      .fragmentStoresAndAtomics       = supported.fragmentStoresAndAtomics,
+	                      .shaderInt16                    = supported.shaderInt16}},        // 16-bit recorder (f32tof16)
 	        {.shaderDrawParameters = true},        // SV_VertexID is lowered to VertexIndex - BaseVertex
-	        {.scalarBlockLayout = true, .timelineSemaphore = true},
+	        {.shaderFloat16 = f12.shaderFloat16, .scalarBlockLayout = true, .timelineSemaphore = true},
 	        {.synchronization2 = true, .dynamicRendering = true},
 	    };
 

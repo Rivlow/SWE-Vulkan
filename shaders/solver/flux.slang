@@ -9,13 +9,14 @@ public float wave_speed(float h, float u)
     return abs(u) + sqrt(P.g * max(h, 0.0f));
 }
 
-// Depth "seen" at the interface: h* = max(0, h + z - z_face), velocities kept
-public float3 hydrostatic_reconstruct(float3 q, float z, float z_face)
+// Depth "seen" at the interface: h* = max(0, eta - z_face), velocities kept. eta is the face's free surface as
+// reconstructed (h + z mathematically): two faces of a flat surface give the same h* to the bit.
+public float3 hydrostatic_reconstruct(float3 q, float eta, float z_face)
 {
     float h  = q.x;
     float u  = velocity(h, q.y);
     float v  = velocity(h, q.z);
-    float hs = max(0.0f, h + z - z_face);
+    float hs = max(0.0f, eta - z_face);
     return float3(hs, hs * u, hs * v);
 }
 
@@ -48,60 +49,79 @@ public float3 hllc_wave_speeds(float h_l, float u_l, float h_r, float u_r)
     return float3(s_l, s_r, s_star);
 }
 
-// HLLC flux in x through a vertical face.
-// Mass and normal momentum (hu): HLL flux; tangential momentum (hv): carried by the S* wave.
-public float3 Flux_x(float3 q_left, float3 q_right)
+// HLLC flux through a face, in deviation form (exact lake at rest, see solver.slang balanced_source).
+// The physical flux of a state is its advective part a = (q_n, q_n u_n, q_t u_n) plus the pressure g h^2 / 2 in
+// the normal momentum. The face returns the flux minus the pressure of the left state (l) and minus the pressure of
+// the right state (r), which is what each cell's balance needs. Pressures never get subtracted from one another:
+// their difference is g/2 (h_l + h_r)(h_l - h_r), exactly 0 for equal depths (a subtraction of two g h^2 / 2 can
+// be contracted into an fma by the GPU compiler, leaving the rounding error of one of them: 1 ulp of the pressure,
+// which made still water move along the domain borders). Same flux as the plain HLLC formula, mathematically.
+// States in the face's normal frame: (h, normal discharge, tangential discharge).
+// Mass and normal momentum: HLL flux; tangential momentum: carried by the S* wave.
+public struct FaceFlux
 {
-    float3 f = float3(0.0f);
-    float  g = P.g;
-    float h_l = q_left.x, hu_l = q_left.y, hv_l = q_left.z;
-    float h_r = q_right.x, hu_r = q_right.y, hv_r = q_right.z;
+    public float3 l;        // flux - (0, g h_l^2 / 2, 0)
+    public float3 r;        // flux - (0, g h_r^2 / 2, 0)
+};
+
+public FaceFlux hllc_normal(float3 q_left, float3 q_right)
+{
+    FaceFlux o;
+    o.l = float3(0.0f);
+    o.r = float3(0.0f);
+    float h_l = q_left.x, h_r = q_right.x;
     if (h_l > P.h_eps || h_r > P.h_eps)    // otherwise both sides dry -> zero flux
     {
-        float u_l = velocity(h_l, hu_l), v_l = velocity(h_l, hv_l);
-        float u_r = velocity(h_r, hu_r), v_r = velocity(h_r, hv_r);
-        float3 f_left  = float3(hu_l, hu_l * u_l + 0.5f * g * h_l * h_l, hv_l * u_l);
-        float3 f_right = float3(hu_r, hu_r * u_r + 0.5f * g * h_r * h_r, hv_r * u_r);
-        float3 s = hllc_wave_speeds(h_l, u_l, h_r, u_r);
-        float s_l = s.x, s_r = s.y, s_star = s.z;
-        if (s_l >= 0.0f)
-            f = f_left;
-        else if (s_r <= 0.0f)
-            f = f_right;
+        float  u_l = velocity(h_l, q_left.y), v_l = velocity(h_l, q_left.z);
+        float  u_r = velocity(h_r, q_right.y), v_r = velocity(h_r, q_right.z);
+        float3 a_l = float3(q_left.y, q_left.y * u_l, q_left.z * u_l);
+        float3 a_r = float3(q_right.y, q_right.y * u_r, q_right.z * u_r);
+        float  dp  = 0.5f * P.g * (h_l + h_r) * (h_l - h_r);        // pressure left - pressure right
+        float3 s   = hllc_wave_speeds(h_l, u_l, h_r, u_r);
+        float  s_l = s.x, s_r = s.y, s_star = s.z;
+        if (s_l >= 0.0f)                    // flux = left state's
+        {
+            o.l = a_l;
+            o.r = a_l + float3(0.0f, dp, 0.0f);
+        }
+        else if (s_r <= 0.0f)               // flux = right state's
+        {
+            o.r = a_r;
+            o.l = a_r - float3(0.0f, dp, 0.0f);
+        }
         else
         {
-            f   = (s_r * f_left - s_l * f_right + s_l * s_r * (q_right - q_left)) / (s_r - s_l);
-            f.z = f.x * (s_star >= 0.0f ? v_l : v_r);
+            float3 fa = (s_r * a_l - s_l * a_r + s_l * s_r * (q_right - q_left)) / (s_r - s_l);
+            fa.z      = fa.x * (s_star >= 0.0f ? v_l : v_r);
+            o.l = fa + float3(0.0f, s_l * dp / (s_r - s_l), 0.0f);
+            o.r = fa + float3(0.0f, s_r * dp / (s_r - s_l), 0.0f);
         }
     }
-    return f;
+    return o;
 }
 
-// HLLC flux in y through a horizontal face.
-// Mass and normal momentum (hv): HLL flux; tangential momentum (hu): carried by the S* wave.
+// x-faces: the normal frame is (h, hu, hv) itself
+public FaceFlux Flux_x_dev(float3 q_left, float3 q_right)
+{
+    return hllc_normal(q_left, q_right);
+}
+
+// y-faces: (h, hv, hu) in the normal frame, mapped back to (h, hu, hv)
+public FaceFlux Flux_y_dev(float3 q_down, float3 q_up)
+{
+    FaceFlux n = hllc_normal(q_down.xzy, q_up.xzy);
+    FaceFlux o;
+    o.l = n.l.xzy;
+    o.r = n.r.xzy;
+    return o;
+}
+
+// Plain fluxes (the deviation of the left / lower state plus its pressure)
+public float3 Flux_x(float3 q_left, float3 q_right)
+{
+    return Flux_x_dev(q_left, q_right).l + float3(0.0f, pressure(q_left.x), 0.0f);
+}
 public float3 Flux_y(float3 q_down, float3 q_up)
 {
-    float3 f = float3(0.0f);
-    float  g = P.g;
-    float h_d = q_down.x, hu_d = q_down.y, hv_d = q_down.z;
-    float h_u = q_up.x, hu_u = q_up.y, hv_u = q_up.z;
-    if (h_d > P.h_eps || h_u > P.h_eps)    // otherwise both sides dry -> zero flux
-    {
-        float u_d = velocity(h_d, hu_d), v_d = velocity(h_d, hv_d);
-        float u_u = velocity(h_u, hu_u), v_u = velocity(h_u, hv_u);
-        float3 f_down = float3(hv_d, hu_d * v_d, hv_d * v_d + 0.5f * g * h_d * h_d);
-        float3 f_up   = float3(hv_u, hu_u * v_u, hv_u * v_u + 0.5f * g * h_u * h_u);
-        float3 s = hllc_wave_speeds(h_d, v_d, h_u, v_u);
-        float s_d = s.x, s_u = s.y, s_star = s.z;
-        if (s_d >= 0.0f)
-            f = f_down;
-        else if (s_u <= 0.0f)
-            f = f_up;
-        else
-        {
-            f   = (s_u * f_down - s_d * f_up + s_d * s_u * (q_up - q_down)) / (s_u - s_d);
-            f.y = f.x * (s_star >= 0.0f ? u_d : u_u);
-        }
-    }
-    return f;
+    return Flux_y_dev(q_down, q_up).l + float3(0.0f, 0.0f, pressure(q_down.x));
 }

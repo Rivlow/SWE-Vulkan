@@ -53,6 +53,8 @@ swe --case zone_importee              :: ouvre le cas : étape Terrain, extrusio
 swe --case rain_infiltration --run    :: simule tout de suite (captures, scripts)
 swe --case lake_at_rest --scheme ssprk3
 swe --headless --steps 200 --dump out\run   :: Q.npy, zb.npy, meta.json (+ bilan de volume, h min, limiteur)
+swe --headless --time 60 --record out\r.swerec --record-every 1   :: série temporelle en batch
+swe --case zone_importee --bridge 300,200,310,260,62.5,1.2         :: pont (intrados 62,5 m DNG, tablier 1,2 m)
 swe --case drain_test --drain 0             :: limiteur de vidange coupé (h < 0 tronqué, comme le Python)
 swe --headless --selftest
 swe --capture out\vue.png --capture-frames 120   :: capture après 120 images puis quitte
@@ -70,38 +72,192 @@ avant « Lancer la simulation ».
 |---|---|---|
 | **1 Carte** | carte 2D (OSM / orthophoto) plein cadre | cas enregistrés (double-clic ou « Ouvrir ») ; nouvelle zone : rectangle tracé sur la carte, maille, nom, orthophoto, « Importer le terrain » ; « Avancé » : sources de données, lit de rivière, rasters locaux |
 | **2 Terrain** | relief 3D | infos du cas, vue (dessus / 3D animées, exagération, orthophoto, maillage), retour à la carte pour creuser le lit, « Suivant » |
-| **3 Conditions** | 3D avec le **maillage**, outil de sélection actif (glisser) | sélection courante ; onglets **Eau** (bloc d'eau, niveau initial), **Sol** (nappe : kv, kh, Sy, épaisseur, profondeur de nappe, partout ou sur la sélection ; Manning), **Pluie** (chronologies pluie / infiltration), **Zones** (source, puits, niveau), **Bords** (mur / débit / niveau) ; « Enregistrer le cas », « Lancer la simulation » |
+| **3 Conditions** | 3D avec le **maillage**, outil de sélection actif ; la maille sous la souris est surlignée, les mailles sélectionnées sont teintées en ambre avec leur contour, les bords ouverts du domaine et les conditions sur faces sont tracés en couleur | carte **Sélection** (rectangle ou pinceau, statistiques, Tout / Inverser / Effacer / ±1 maille, mailles sous une cote, mailles d'un bord) ; onglets **Eau** (bloc d'eau, niveau initial), **Sol** (nappe : kv, kh, Sy, épaisseur, profondeur de nappe, partout ou sur la sélection ; Manning), **Pluie** (chronologies pluie / infiltration), **Zones** (source, puits, niveau), **Ouvrages** (ponts : intrados,
+épaisseur du tablier, fente), **Bords** (schéma du domaine : mur / débit / niveau / sortie libre / hauteur par côté ; conditions faibles sur les faces de la sélection) ; « Enregistrer le cas », « Lancer la simulation » |
 | **4 Simulation** | 3D, bande **Courbes** en bas | Lancer / Pause, Recommencer, retour aux Conditions, pas par image ; Temps et bilan (volume, nappe, pluie, bilan total) ; Sondes ; Affichage (coloration + légende, éléments, souterrain, coupe, vue) ; Schéma numérique (replié) |
 
 Après un import (ou l'ouverture d'un cas avec orthophoto), la carte s'estompe sur la vue du dessus du relief,
 puis la caméra bascule en 3D pendant que le relief s'extrude ; un clic passe l'animation. Revenir à une étape
 précédente se fait en cliquant dans la barre ; revenir aux Conditions remet t = 0.
 
-Souris (vue 3D) : clic gauche = rotation (étape Conditions : sélection de mailles), molette = zoom, clic milieu =
-translation, Ctrl+clic = sonde. Carte : glisser = déplacer, clic droit + glisser = zone à importer.
-Clavier : Espace pause et R recommencer (étape Simulation), Échap annule la sélection, Origine recadre la
-caméra, F12 capture (`captures\`), F11 masque l'interface, F1 aide.
+Souris (vue 3D) : clic gauche = rotation, molette = zoom, clic milieu = translation, Ctrl+clic = sonde (étape
+Simulation). Carte : glisser = déplacer, clic droit + glisser = zone à importer.
+Clavier : Espace pause et R recommencer (étape Simulation), Origine recadre la caméra, F12 capture (`captures\`),
+F11 masque l'interface, F1 aide.
+
+**Sélection de mailles** (étape Conditions) : la sélection est un ensemble quelconque de mailles (masque par
+maille, pas seulement un rectangle). Glisser = rectangle (mode Rectangle) ou coup de pinceau de rayon réglable
+(mode Pinceau), clic = une maille ; **Maj** ajoute à la sélection, **Ctrl** en retire, Échap efface, Ctrl+A tout,
+Ctrl+I inverse. La carte Sélection propose aussi l'extension / l'érosion d'une maille, les mailles dont le fond
+est sous une cote (le lit d'une rivière, une plaine sous un niveau ; Maj : parmi la sélection) et les mailles d'un
+bord du domaine. Tous les outils des onglets (eau, sol, pluie, zones, conditions sur faces) s'appliquent à cet
+ensemble.
+
+L'interface utilise la police Segoe UI du système (avec Segoe UI Symbol) quand elle existe, sinon la police
+d'ImGui, et suit l'échelle d'affichage (DPI) du moniteur.
 Fichier → Enregistrer une séquence : PNG dans `captures\rec_*\` (écrits en tâche de fond), à assembler avec
 `ffmpeg -framerate 30 -i frame_%05d.png out.mp4`. Les réglages (dernier cas, vue de la carte, pas par image,
 coloration, bande Courbes…) sont gardés dans `swe_settings.json` ; la disposition est fixe (plus d'`imgui.ini`).
 
 Options utiles pour scripter des vues : `--stage carte|terrain|conditions|simulation` (étape de départ : carte,
 ou terrain avec `--case`), `--run` (démarre à l'étape Simulation sans pause), `--color 0..10`, `--probe i,j`
-(répétable), `--mesh`, `--z-scale f`, `--steps-per-frame n`, `--capture fichier.png --capture-frames n`, `--top`,
+(répétable), `--mesh`, `--blocks` (mailles brutes), `--z-scale f`, `--steps-per-frame n`, `--capture fichier.png --capture-frames n`, `--top`,
 `--water i0,j0,i1,j1,h`, `--zone source|sink|level,valeur,i0,j0,i1,j1`, `--rain` / `--infiltration
 i0,j0,i1,j1,mm_h`, `--gw-xray`, `--gw-lines`, `--gw-contours m`, `--crop i0,j0,i1,j1`, `--show-profile`.
 
-**Conditions aux limites sur un domaine sec** : le débit entrant d'un bord est réparti sur les mailles de bord au
+**Conditions aux limites** : chaque bord du domaine est un mur (`wall`), un débit entrant (`inflow`, m³/s), un
+niveau imposé (`level`, cote de surface libre), une sortie libre (`free` : état fantôme égal à la maille, l'eau
+sort sans réflexion) ou une hauteur d'eau imposée (`depth`, m). Toutes sont imposées faiblement, par le flux HLLC
+entre la maille et un état fantôme.
+
+**Conditions sur les faces des mailles** (`face_bc` dans le JSON, onglet Bords) : on choisit un côté (ouest, est,
+sud, nord) des mailles sélectionnées ; les faces de l'enveloppe de la sélection de ce côté forment un **groupe**
+qui se comporte comme un bord du domaine pour la maille qui le possède, avec les mêmes types que les bords (mur,
+débit total du groupe réparti au prorata de h^(5/3), niveau, hauteur, sortie libre). De l'autre côté d'une face
+intérieure, la maille voisine voit un mur : le groupe est une frontière du domaine calculé (une digue intérieure,
+une section d'entrée au milieu d'un lit, une sortie vers l'aval...). 16 groupes au plus ; une face n'appartient
+qu'à un groupe. Les tuiles touchant ces faces sont toujours calculées. Le limiteur de vidange traite l'apport
+d'une face intérieure comme venant de la maille voisine (facteur de celle-ci), ce qui ne le réduit que si cette
+voisine se vide au même pas.
+
+**Débit entrant sur un domaine sec** : le débit d'un bord (ou d'un groupe de faces) est réparti sur ses mailles au
 prorata de h^(5/3) ; quand le bord est sec, la répartition utilise la profondeur fictive obtenue en remplissant
 le bord jusqu'à 0,5 m au-dessus de son point le plus bas (l'eau entre par le lit de la rivière). Le flux de masse
 imposé est **exactement** le débit (`legacy_inflow: true` dans un cas JSON rétablit le flux HLLC de l'état fantôme
 du Python, gardé pour la validation du cas `meuse`). Vérification : `inflow_test` (5 m³/s sur un domaine sec)
-donne 5,001 m³/s (`tools\volume_check.py`).
+donne 5,001 m³/s (`tools\volume_check.py`) ; un groupe de 20 faces intérieures à 5 m³/s donne le même volume.
+
+## Enregistrement de h, qx, qy
+
+Étape Simulation › carte **Enregistrement** (ou `--record fichier.swerec --record-every s`) : l'état est enregistré
+tous les *s* secondes simulées (le premier à l'instant du démarrage) dans `<dossier>\<cas>_<date>.swerec`.
+
+- **Dossier** : champ de la carte, bouton « … » (sélecteur de dossier Windows), « Ouvrir » (explorateur). Par défaut
+  `records\` à côté de l'exécutable ; le choix est gardé dans `swe_settings.json` (`record_dir`, avec
+  `record_every` et `record_f16`). En ligne de commande : `--record-dir <dossier>` (gardé lui aussi à la fermeture).
+- **Mode batch** : `swe --headless ... --record f.swerec` ou `--record-dir d` enregistre aussi, entre deux lots de
+  pas (instantané synchrone au premier pas qui dépasse chaque multiple de l'intervalle).
+
+Le coût CPU sur la boucle d'images est négligeable :
+
+- le GPU extrait h, qx, qy (float32, identiques au solveur ; en option « 16 bits » / `--record-f16` : h au mm
+  en uint16, qx et qy en float16, moitié de place) dans le command buffer de l'image, avec un drapeau
+  « mouillée » par tuile de 16 × 16, et copie le tout dans l'un de trois tampons hôte (mémoire *host-cached*) ;
+  aucune soumission ni attente supplémentaire : le fence de l'image dit quand le tampon est lisible ;
+- un thread d'écriture ne garde que les tuiles mouillées (12 ou 6 octets par maille), libère le tampon, puis
+  ajoute l'enregistrement au fichier ; si les trois tampons sont occupés (disque trop lent), l'enregistrement
+  est pris à l'image suivante (compté « différé » dans la carte) ;
+- le fichier est fermé avec son index (t, pas, offset par enregistrement) quand on arrête, quitte l'étape
+  Simulation ou change de cas.
+
+Lecture : `tools\swerec.py` (`Recording(path).read(k)` → tableaux `h, qx, qy` de forme `(nx, ny)` ;
+`python tools\swerec.py fichier.swerec` liste les enregistrements et leur volume, `--plot k` affiche h).
+Format : en-tête de 256 octets, enregistrements (en-tête t / pas / nb de tuiles, puis — version 2 — les scalaires du
+solveur, dont les **volumes exacts entrés / sortis par chaque bord, groupe de faces et zone**, identifiants de
+tuiles `ti * tilesY + tj`, puis 256 mailles par tuile en ordre `di` majeur), index en fin de fichier ;
+petit-boutiste. `Recording.boundary_volumes(k)` / `added_volume(k)` les lisent.
+
+## Post-traitement (`tools/swepost.py`)
+
+Bibliothèque et ligne de commande sur les `.swerec`, écrites d'abord pour **vérifier** les simulations (les tests
+s'en servent) :
+
+```bat
+python tools\swepost.py f.swerec volume                 :: V(t) et bilan exact V - V0 - apports des bords / zones
+python tools\swepost.py f.swerec section x 25 0 9       :: débit Q(t) à travers les faces i = 25, j = 0..9
+python tools\swepost.py f.swerec gauge 10 5 --csv s.csv :: limnigramme h, eta, u, v, Froude d'une maille
+python tools\swepost.py f.swerec envelope --out env --geotiff assets\cases\zone.json   :: h max, |u| max, h·|u| max,
+                                                         :: temps d'arrivée, durée de submersion (npy + GeoTIFF)
+python tools\swepost.py f.swerec diff autre.swerec      :: surfaces inondées, écart de h max entre deux scénarios
+python tools\swepost.py f.swerec animate film.mp4 --field speed --ortho assets\data\zone_ortho.png
+```
+
+Fonctions : `volume_series`, `exact_balance` (bilan à l'arrondi près grâce aux volumes des bords enregistrés),
+`section_discharge` / `hydrograph_balance` (bilan par sections, pour les fichiers v1 ou une section intérieure ;
+débit estimé aux centres des mailles, à quelques 1e-3 près du flux de face), `gauge`, `profile`, `envelopes`,
+`diff`, `export_npy` / `export_csv` / `export_geotiff`, `animate`, `stored_depth` (volume physique sous les ponts).
+
+Pistes pour la suite : classes d'aléa h·u (cartes réglementaires), surfaces et bâtiments inondés par zone (masques),
+laminage amont / aval d'un hydrogramme, comparaison de scénarios (avec / sans digue ou pont), export NetCDF / VTK
+pour QGIS et Paraview, rééchantillonnage temporel, détection des ressauts (Froude), comparaison à des mesures
+(limnimètres, laisses de crue).
+
+## Tests (`tests/`, pytest)
+
+```bat
+python -m pip install -r requirements-dev.txt     :: une fois (numpy, scipy, matplotlib, pytest)
+python -m pytest tests -q                          :: build\release ; --preset debug ; -m "not slow"
+ctest --test-dir build\release                     :: selftest + la suite pytest
+```
+
+Chaque test génère son cas (JSON + npz dans `out\tests\<test>\assets`), lance `swe --headless --dump --record`, puis
+vérifie **d'abord la masse** — h ≥ 0, aucune troncature, et V − V0 − (volumes exacts des bords, zones, pluie,
+infiltration) nul à l'arrondi près, au dernier pas **et à chaque enregistrement** — puis l'hydraulique. Inspirés des
+tests de wolfgpu (`tests/README.md` donne la correspondance) : lac au repos sur fond rocheux, écoulement uniforme,
+conditions débit / niveau / hauteur, symétries x / y, Ritter, Stoker, bosses SWASHES (fluvial, transcritique, ressaut),
+courbes de remous M1 / M2, hauteur normale de Manning, ponts (repos, charge, surverse, seuil, références wolfgpu),
+limiteur de vidange, nappe, chronologies, tuiles actives au bit près, enregistrements.
+
+## Conservation de la masse, lac au repos exact
+
+- **Bilan exact des bords** : chaque maille de bord ajoute, à chaque étage, le flux de masse de sa face (pondéré par
+  le poids de l'étage dans le pas complet) à un cumul entier 64 bits (2^-32 m³) par côté, groupe de faces et zone.
+  `V − V0 − apports` est alors nul à l'arrondi float32 près (Bilan, `meta.json` `boundary_volume`, `.swerec`).
+- **Incréments perdus** : en float32, un incrément de h inférieur à un demi-ulp disparaissait (h ≈ 1 m : 3e-8 m) ;
+  une évolution lente perdait ainsi 1e-4 du volume en 30 000 pas (courbe de remous). La variation du pas est
+  maintenant accumulée à part puis ajoutée par une somme exacte (TwoSum), le reste étant reporté au pas suivant :
+  écart ramené à 3e-7. (Les opérations sont rendues opaques au compilateur, qui simplifiait (a + b) − a en b.)
+- **Lac au repos au bit près** : la pression des faces est écrite comme écart à la pression hydrostatique de la
+  maille et le terme de pente comme ½g(h₋ + h₊)(η₋ − η₊) ; la surface libre est reconstruite elle-même ; le flux HLLC
+  donne ces écarts sans jamais soustraire deux ½gh² (le GPU fusionnait la soustraction en fma, d'où 1 ulp de
+  pression aux bords). Mathématiquement le même schéma ; une eau calme sur un fond quelconque (rocheux, îles,
+  frottement, murs, conditions de niveau, 1000 m d'altitude absolue) reste au repos **au bit près**, avec les trois
+  schémas. Les états « au niveau » (cas, édition, zones de niveau) sont construits pour que h + zb = η exactement.
+- **Limiteur de Venkatakrishnan** : il recevait l'écart vers la maille voisine au lieu de l'incrément de face
+  (φ = 0,75 sur un profil linéaire : toutes les pentes rabotées d'un quart). Corrigé (φ = 1 sur un profil lisse) ;
+  avec les seuils sec / film mince ramenés de 1e-4 / 1e-3 m à 1e-6 / 1e-5 m (`h_eps`, `h_dry` dans un cas,
+  `--h-eps` / `--h-dry`), le front de Ritter, qui restait 3,5 m en retard quel que soit dx, converge vers la
+  solution exacte (erreur L1 ÷ 7), sans effet sur le pas de temps des cas réels.
+- **Euler** : Euler explicite avec la reconstruction MUSCL est instable (~5 % de croissance par pas d'une
+  perturbation) ; préférer ssprk2 / ssprk3.
+
+## Ponts (Conditions › Ouvrages, `--bridge`, `"bridges"`)
+
+Un tablier au-dessus d'un ensemble de mailles : cote d'intrados (dessous) et de dessus du tablier. h reste la hauteur
+piézométrique ; trois régimes :
+
+| Régime | Condition | Section qui s'écoule | Eau stockée |
+|---|---|---|---|
+| surface libre | h ≤ c (c = intrados − fond) | h | h |
+| en charge | c < h ≤ c + e | c, charge h − c au-dessus de l'intrados | c + ε (h − c) |
+| surverse | h > c + e | c + (h − c − e) au-dessus du tablier | c + ε e + (h − c − e) |
+
+- Pression dP/dh = g·h_eff (couvercle rigide), vitesse q / h_eff, frottement de Manning sur 1, 2 (fond + intrados) ou
+  3 parois ; fente de Preissmann ε (`bridge_slot`, 0,05 par défaut ; 1 = modèle wolfgpu sans fente, qui stocke toute
+  la colonne piézométrique) : célérité finie √(g c / ε) en charge, pas de temps plus court (×4,5 pour 0,05).
+- La masse est conservée sur l'eau stockée (le tablier ne stocke rien), avec le même bilan exact ; le volume affiché
+  est le volume physique. Une face prend l'ouverture la plus petite de ses deux mailles ; un intrados posé sur le
+  fond fait du tablier un **seuil** (surverse seule). Le lac au repos reste exact dans les trois régimes.
+- JSON : `"bridges": [{"label": "pont", "z_roof": 61.2, "z_deck": 62.0, "rect": [i0, j0, i1, j1]}]` (ou
+  `"cells": [...]`), `"bridge_slot": 0.05` ; ligne de commande `--bridge i0,j0,i1,j1,z_intrados,épaisseur`.
+- Validation (`tests/test_bridges.py`) : continuité, pente piézométrique = pente de frottement d'une conduite en
+  charge (R = c/2), perte de charge à l'entrée ≈ Bernoulli (16,5 mm pour 15,6), coefficient de seuil 0,86, profils
+  sauvegardés de wolfgpu (charge sous le pont à 1 mm près sans frottement ; wolfgpu calcule le frottement en charge
+  sur la hauteur piézométrique totale, d'où une pente plus forte que la nôtre).
+- Limites : un pont ne doit pas toucher un bord ouvert du domaine ni un groupe de conditions sur faces (fantômes à
+  pression de surface libre) ; la pluie / infiltration sur une maille de pont modifie h directement ; le tablier
+  n'est pas encore dessiné en 3D (mailles teintées en orange).
 
 ## Rendu
 
 Le terrain, l'eau et le socle sont dessinés directement depuis les buffers du solveur (`Q`, `zb` lus dans les
-vertex shaders, aucun maillage CPU), en MSAA 4×. Les couleurs et l'éclairage reprennent les formules de
+vertex shaders, aucun maillage CPU), en MSAA 4×. Le maillage de rendu relie les centres des mailles (surface
+interpolée) ; la case **Mailles brutes** (étapes Terrain et Simulation) dessine à la place chaque maille comme une
+colonne à sommet plat, lit et eau, avec les parois verticales entre mailles voisines : la valeur de chaque maille
+telle que le solveur la voit, sans interpolation (18 sommets par maille, sans index : plus lourd sur les très
+grandes grilles). Les parois portent les teintes de la maille la plus haute (sélection, zones) et la couleur de
+la condition de la face qu'elles exposent. Le quadrillage « Maillage » est tracé par pixel sur les frontières des
+mailles, dans les deux modes. Les couleurs et l'éclairage reprennent les formules de
 `ui/renderer.py`, mais par pixel. La transparence de l'eau, que le Python simulait par sommet
 (`mix(fond·(0.45+SHALLOW), teinte, opacité)` puis ombrage, Fresnel, reflet, écume), est linéaire en la couleur
 du fond : elle est appliquée exactement avec du *dual-source blending* (`image = fond × K + B`), sur le pixel de
@@ -122,7 +278,10 @@ panneau « Cas » ; les données sont les caches de `../SWE/data` copiés dans `
 
 Le prétraitement numpy (`fill_outside`, `refine_bilinear`, `refine_nearest`, `z_ref`, exutoire) est porté en
 C++ (`src/cases/GridOps`) et redonne exactement le même `zb`. Les conditions aux limites (mur / débit entrant /
-niveau imposé), le CFL et le Manning se modifient à chaud.
+niveau imposé / sortie libre / hauteur, par bord ou par groupe de faces), le CFL et le Manning se modifient à
+chaud. Dans le JSON : `"bc": {"west": ["inflow", 600], "east": ["free"], ...}` et
+`"face_bc": [{"kind": "inflow", "value": 5, "label": "amont", "faces": [maille * 4 + côté, ...]}]` (côté : 0 ouest,
+1 est, 2 sud, 3 nord ; maille = i * ny + j).
 
 Note : `vesdre.json` reprend `lake_level = 1000` de `main.py`, ce qui noie tout le bassin (le commentaire du
 Python évoque plutôt ~10 m d'eau sur un lac à 290 m, soit `lake_level ≈ 300`).
@@ -402,6 +561,11 @@ attendue y est de 2,9167 m³, contrôlée par `validate.py --all`.
 contient alors aussi `gw.npy` et/ou `sources.npy`.
 
 ## Validation contre le Python
+
+Le C++ y tourne en mode `--reference` : limiteur, seuils, états initiaux et arrondi des mises à jour du Python. Seule
+différence voulue : le Python a des courants parasites sur l'eau calme des fonds réels (2,3e-6 m²/s après un pas sur
+la Meuse, 6e-5 après 100), le C++ aucun ; les mailles exactement au repos côté C++ ne sont donc pas comparées en
+quantité de mouvement (`compare.py --still-atol`). Euler 200 pas n'est plus comparé (instable avec MUSCL).
 
 ```bat
 python tools\validate.py --all        :: 3 schémas sur dam_break vs Taichi, meuse, vesdre, débit, limiteur

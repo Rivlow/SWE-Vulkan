@@ -10,6 +10,7 @@
 #include "render/Camera.h"
 #include "render/Effects.h"
 #include "render/Renderer.h"
+#include "sim/Recorder.h"
 #include "sim/Session.h"
 #include "vk/Buffer.h"
 #include "vk/Context.h"
@@ -21,6 +22,7 @@
 #include <array>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -92,6 +94,25 @@ class App
 	};
 	static constexpr float kFadeSeconds = 0.7f, kSwingStart = 0.45f, kSwingSeconds = 2.2f;
 
+	// Cell selection (Conditions stage): an arbitrary set of cells, built with the mouse
+	enum class SelectMode
+	{
+		Rectangle,        // drag = rectangle of cells
+		Brush,            // drag = paint the cells under the cursor (brushRadius_ around it)
+	};
+	enum class SelectOp
+	{
+		Replace,        // plain drag
+		Add,            // Shift
+		Remove,         // Ctrl
+	};
+	struct SelectionStats
+	{
+		size_t   count = 0;
+		CellRect bounds;
+		float    zmin = 0.0f, zmax = 0.0f;        // bed (relative to z_ref)
+	};
+
 	// App.cpp - frame loop
 	void initWindow();
 	void initImGui();
@@ -104,10 +125,13 @@ class App
 	void processMapRequests();
 	void saveCurrentCase();
 	void resetSimulation();
+	// recording of h, qx, qy (sim/Recorder): every `every` simulated seconds into `path`
+	void startRecording(std::filesystem::path const &path, double every, bool halfPrecision);
+	void stopRecording();
+	std::filesystem::path defaultRecordPath() const;
 	void topView();
 	void animateCamera(OrbitCamera::Pose const &target, float seconds = 1.0f);
 	OrbitCamera::Pose topPose() const;
-	CellRect selection() const;
 	void applyScriptedEdits();
 	void handleInput();
 	void drawFrame();
@@ -123,6 +147,19 @@ class App
 	void openCase(std::string const &name);        // from the Map stage: load and show the terrain
 	void startTransition();
 	void tickTransition(float dt);
+	// selection (App.cpp)
+	CellMask const &selection() const { return selMask_; }
+	bool            hasSelection() const { return selStats_.count > 0; }
+	void            setSelection(CellMask mask);        // replaces the selection (stats, renderer bits)
+	void            clearSelection();
+	void            selectAll();
+	void            invertSelection();
+	void            growSelection(int cells);           // dilate (> 0) or erode (< 0) by that many cells
+	void            selectBelow(double level, bool withinSelection);        // cells whose bed is under `level` (relative to z_ref)
+	void            selectSide(int side, SelectOp op);                      // the boundary cells of a side
+	void            applyRectangle(Probe a, Probe b, SelectOp op);          // selBase_ +/- rectangle
+	void            paintCells(Probe from, Probe to, bool value);           // brush stroke from the last cell
+	void            touchSelection();                                       // selMask_ changed in place
 
 	// Gui.cpp - stage bar, side panel, plots band, overlays
 	void drawGui();
@@ -130,18 +167,23 @@ class App
 	void drawStageBar(float y, float height);
 	void drawSidePanel(ImVec2 pos, ImVec2 size);
 	void drawMapStage(ImVec2 pos, ImVec2 size);
+	void drawMapPanel();
 	void drawTerrainPanel();
 	void drawConditionsPanel();
 	void drawSimulationPanel();
 	void drawPlotsBand(ImVec2 pos, ImVec2 size);
 	// panel pieces
-	void drawSelectionHeader();
+	void drawSelectionCard();
 	void drawWaterTab();
 	void drawSoilTab();
 	void drawZonesTab();
+	void drawStructuresTab();        // bridges
 	void drawBoundariesTab();
+	void drawDomainSides();
+	void drawFaceConditions();
 	void drawChronologyEditor();
 	void drawTransportSection();
+	void drawRecordSection();
 	void drawBalanceSection();
 	void drawProbesSection();
 	void drawDisplaySection();
@@ -150,6 +192,7 @@ class App
 	void drawPerfWindow();
 	void drawLegend();
 	void drawProbeMarkers();
+	void drawViewOverlay();
 	void drawHelp();
 	void drawProfilePlot();
 	void updateProfileCells();
@@ -164,6 +207,12 @@ class App
 	std::unique_ptr<vkc::Context>      ctx_;
 	std::unique_ptr<vkc::Swapchain>    swapchain_;
 	std::unique_ptr<Session>           session_;
+	std::unique_ptr<Recorder>          recorder_;
+	double                             recordInterval_ = 1.0;        // simulated seconds between two records (GUI)
+	bool                               recordHalf_     = false;      // 16-bit cells instead of float32
+	std::filesystem::path              swerecDir_;                   // folder of the .swerec files (settings: record_dir)
+	char                               swerecDirBuf_[1024] = "";     // its text field in the Enregistrement card
+	void                               setRecordDir(std::filesystem::path const &dir);
 	std::unique_ptr<Effects>           effects_;
 	std::unique_ptr<Renderer>          renderer_;
 	std::unique_ptr<geo::LocalLibrary>   library_;
@@ -201,14 +250,23 @@ class App
 	float          zScale0_  = 2.0f;
 	bool           autoRange_ = true;
 	glm::vec4      viewRect_{0.0f};           // 3D view rectangle (framebuffer pixels)
+	uint32_t       highlight_ = 0;            // HIGHLIGHT_* of the side / face group hovered in the panel (this frame)
 
 	// Probes
 	std::vector<Probe> probes_;
 
 	// Cell selection in the 3D view (edit tool)
-	bool                 selectTool_ = false;
-	bool                 selecting_  = false;
-	std::optional<Probe> selAnchor_, selCurrent_;
+	bool                  selectTool_  = false;
+	bool                  selecting_   = false;
+	SelectMode            selectMode_  = SelectMode::Rectangle;
+	SelectOp              selectOp_    = SelectOp::Replace;
+	int                   brushRadius_ = 0;
+	CellMask              selMask_;             // one byte per cell (empty = nothing selected yet)
+	CellMask              selBase_;             // selection when the current rectangle drag started
+	std::vector<uint32_t> selBits_;             // packed for the renderer
+	uint64_t              selVersion_ = 1;
+	SelectionStats        selStats_;
+	std::optional<Probe>  selAnchor_, selLast_, hoverCell_;
 	// edit panel state
 	int   waterMode_   = 0;          // 0 depth, 1 level, 2 add
 	float waterValue_  = 1.0f;
@@ -216,7 +274,18 @@ class App
 	int   zoneKind_    = 0;          // 0 source, 1 sink, 2 level
 	float zoneValue_   = 10.0f;
 	char  zoneLabel_[48] = "";
+	double selectBelow_ = 0.0;       // "mailles sous la cote" (m DNG), 0 = not initialised
 	Session::SoilParams soil_;       // soil tab values (defaults of the case when the aquifer is on)
+	// boundaries: side of the domain shown in the schematic, new face condition on the selection
+	int   bcSide_     = 0;
+	int   faceSide_   = SIDE_SOUTH;
+	int   faceKind_   = int(BcKind::Inflow);
+	double faceValue_ = 10.0;
+	char  faceLabel_[48] = "";
+	// bridges (Ouvrages tab): soffit elevation (m DNG, NaN = not set yet: from the selection), deck thickness, name
+	double bridgeRoof_  = std::numeric_limits<double>::quiet_NaN();
+	float  bridgeThick_ = 1.0f;
+	char   bridgeLabel_[48] = "";
 	// infiltration / rain chronologies (edit tools)
 	int   chronoKind_  = 1;          // 0 infiltration, 1 rain
 	float chronoValue_ = 50.0f;      // new zone value
@@ -247,6 +316,9 @@ class App
 	std::vector<CaseInfo> caseList_;
 	bool showPlots_ = true, showPerf_ = false, showHelp_ = false, showDemo_ = false;
 	bool hideGui_ = false;        // F11: 3D view only
+	// theme: fonts (Segoe UI when available, else ImGui's default) and the DPI scale of the window
+	ImFont *fontRegular_ = nullptr, *fontBold_ = nullptr;
+	float   dpi_ = 1.0f;
 };
 
 }        // namespace swe

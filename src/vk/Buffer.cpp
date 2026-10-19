@@ -3,6 +3,7 @@
 #include "vk/Context.h"
 
 #include <cstring>
+#include <stdexcept>
 
 namespace swe::vkc {
 
@@ -32,6 +33,21 @@ Buffer Buffer::storage(Context const &ctx, vk::DeviceSize size, std::string cons
 Buffer Buffer::host(Context const &ctx, vk::DeviceSize size, vk::BufferUsageFlags usage, std::string const &name)
 {
 	return Buffer(ctx, size, usage, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, name);
+}
+
+Buffer Buffer::readback(Context const &ctx, vk::DeviceSize size, std::string const &name)
+{
+	auto const usage = vk::BufferUsageFlagBits::eTransferDst;
+	try
+	{
+		return Buffer(ctx, size, usage,
+		              vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+		              name);
+	}
+	catch (std::runtime_error const &)
+	{
+		return host(ctx, size, usage, name);
+	}
 }
 
 void Buffer::upload(Context const &ctx, void const *data, vk::DeviceSize size, vk::DeviceSize offset)

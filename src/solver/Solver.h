@@ -36,6 +36,11 @@ class Solver
 	void configure(CaseData const &data);
 	// Uploads the per-cell zones of `data` (zones / zoneMask). Waits for the device.
 	void uploadZones(CaseData const &data);
+	// Uploads the weak face conditions of `data` (faceBcs); call configure() afterwards (FLAG_FACE_BC, step
+	// structure). Waits for the device.
+	void uploadFaceBcs(CaseData const &data);
+	// Bridge decks of `data` (bridgeRoof / bridgeDeck); call configure() afterwards (FLAG_BRIDGE). Waits for the device.
+	void uploadBridges(CaseData const &data);
 	// Uploads the infiltration / rain chronologies of `data` (zone maps and tables), turning them on or off. The
 	// cumulated depths are kept. Waits for the device.
 	void setChronologies(CaseData const &data);
@@ -50,6 +55,19 @@ class Solver
 
 	// Appends `steps` time steps followed by a scalar readback into `slot` to a submission batch.
 	void appendSteps(std::vector<vk::CommandBufferSubmitInfo> &batch, uint32_t steps, uint32_t slot);
+
+	// Recorder snapshots (see sim/Recorder): the state per cell, exact (3 floats) or packed to 16 bits (2 words),
+	// plus a wet flag per tile, and the scalars, copied into a host buffer of snapshotBytes(). enableRecording
+	// allocates the device-side snapshot (waits for the device); recordSnapshot records the pack + copies into
+	// `cb` (compute then transfer, visible to the host once the submission's fence has signalled).
+	void           enableRecording(bool on, bool halfPrecision = false);
+	bool           recordingEnabled() const { return static_cast<bool>(recordOn_); }
+	uint32_t       recordWordsPerCell() const { return recordHalf_ ? 2u : 3u; }
+	vk::DeviceSize snapshotBytes() const { return snapshotWords() * sizeof(uint32_t); }
+	vk::DeviceSize snapshotWords() const { return recordWordsPerCell() * cells() + tileCount() + S_COUNT; }
+	void           recordSnapshot(vk::raii::CommandBuffer const &cb, vk::Buffer dst) const;
+	uint32_t       tilesX() const { return tilesX_; }
+	uint32_t       tilesY() const { return tilesY_; }
 	// Scalars copied into `slot` (valid once the submission that filled it has completed).
 	SolverScalars readback(uint32_t slot) const;
 
@@ -102,6 +120,10 @@ class Solver
 		GwLateral,
 		Vertical,        // chronologies + groundwater exchange
 		Profile,
+		FaceBcNorm,
+		FaceBcApply,
+		PackRecord32,
+		PackRecord16,
 		Count,
 	};
 
@@ -133,6 +155,8 @@ class Solver
 	std::string  schemeName_ = "ssprk2";
 	TimeScheme   scheme_;
 	int          drainPasses_ = 0;
+	uint32_t     faceGroups_ = 0, faceCount_ = 0;        // weak face conditions uploaded (step structure)
+	uint32_t     recordedFaceCount_ = ~0u;               //   ... and recorded in the step
 	SolverParams params_{};
 
 	vk::raii::DescriptorSetLayout setLayout_      = nullptr;
@@ -157,6 +181,13 @@ class Solver
 	// infiltration / rain chronologies: zone maps, tables, rates of the step, cumulated depths (1 element when off)
 	vkc::Buffer srcZones_, chrono_, srcRates_, srcCum_;
 	bool        srcOn_ = false;
+	// weak face conditions: MAX_FACE_BC groups, face list (count + entries; 1 element each when none)
+	vkc::Buffer faceBcs_, faceList_, faceCell_;
+	vkc::Buffer massCarry_;        // exact depth updates: (step accumulator, carry) per cell
+	vkc::Buffer bridge_;           // (soffit, deck top) per cell (1 element without bridges)
+	// recorder snapshot (2 words per cell + 1 per tile; 1 element while recording is off)
+	vkc::Buffer record_;
+	bool        recordOn_ = false, recordHalf_ = false;
 	bool        gwOn_ = false, gwLateral_ = false;
 	std::array<vkc::Buffer, kReadbackSlots> readback_;
 

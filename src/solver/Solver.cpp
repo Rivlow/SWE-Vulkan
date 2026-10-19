@@ -8,6 +8,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace swe {
@@ -19,7 +20,9 @@ constexpr uint32_t kTile = 16;        // [numthreads(16, 16, 1)]
 // entry points of solver.slang, in Solver::Kernel order
 constexpr char const *kEntries[] = {"build_tiles", "reduce_smax",  "finalize_dt", "flux_x", "flux_y",   "bc_fluxes",
                                     "drain_alpha", "euler_stage",  "diag_partial", "diag_final", "probes", "set_water",
-                                    "gw_alpha",    "gw_lateral",   "vertical_step", "profile"};
+                                    "gw_alpha",    "gw_lateral",   "vertical_step", "profile", "face_bc_norm", "face_bc_apply",
+                                    "pack_record32", "pack_record16"};
+constexpr uint32_t kFaceGroup = 64;        // face_bc_apply: [numthreads(64, 1, 1)]
 constexpr uint32_t kTileGroup = 64;        // build_tiles: [numthreads(64, 1, 1)]
 static_assert(std::size(kEntries) == size_t(Solver::Kernel::Count));
 
@@ -126,7 +129,9 @@ void Solver::load(CaseData const &data)
 	}
 	if (srcOn_)
 		uploadChronologies(data);
+	uploadFaceBcs(data);
 	uploadZones(data);
+	uploadBridges(data);
 	schemeName_.clear();        // forces the step to be recorded
 	configure(data);
 	reset(data);
@@ -156,7 +161,14 @@ void Solver::allocate()
 	G_U_      = vkc::Buffer::storage(ctx_, gy * f4, "G_U");
 	cond_     = vkc::Buffer::storage(ctx_, n * sizeof(uint32_t), "cond");
 	zones_    = vkc::Buffer::storage(ctx_, MAX_ZONES * sizeof(Zone), "zones");
-	inflow_   = vkc::Buffer::storage(ctx_, 4 * sizeof(float), "inflow_norm");
+	inflow_   = vkc::Buffer::storage(ctx_, (4 + MAX_FACE_BC) * sizeof(float), "inflow_norm");
+	faceBcs_  = vkc::Buffer::storage(ctx_, MAX_FACE_BC * sizeof(FaceBc), "face_bcs");
+	faceList_ = vkc::Buffer::storage(ctx_, sizeof(uint32_t), "face_list");        // resized by uploadFaceBcs
+	faceCell_ = vkc::Buffer::storage(ctx_, sizeof(uint32_t), "face_cell");        //   "
+	massCarry_ = vkc::Buffer::storage(ctx_, n * 2 * sizeof(float), "mass_carry");
+	bridge_    = vkc::Buffer::storage(ctx_, 2 * sizeof(float), "bridge");        // resized by uploadBridges
+	record_   = vkc::Buffer::storage(ctx_, sizeof(uint32_t), "record");           // sized by enableRecording
+	recordOn_ = false;
 	vk::DeviceSize const tiles = tileCount();
 	diag_       = vkc::Buffer::storage(ctx_, tiles * f4, "diag");
 	tileWet_    = vkc::Buffer::storage(ctx_, tiles * sizeof(uint32_t), "tile_wet");
@@ -181,7 +193,7 @@ void Solver::allocate()
 	ctx_.oneShot([&](vk::raii::CommandBuffer &cb) {
 		for (auto *b : {&scalars_, &zb_, &Q_, &Q_old_, &alpha_[0], &alpha_[1], &massFlux_, &F_L_, &F_R_, &G_D_, &G_U_, &cond_, &zones_,
 		                &inflow_, &diag_, &tileWet_, &tileList_, &tileArgs_, &tileSeed_, &soil_, &gw_, &gwAux_, &diagGw_,
-		                &srcZones_, &srcCum_, &chrono_, &srcRates_})
+		                &srcZones_, &srcCum_, &chrono_, &srcRates_, &faceBcs_, &faceList_, &faceCell_, &record_, &massCarry_})
 			cb.fillBuffer(b->handle(), 0, vk::WholeSize, 0);
 	});
 	std::array<uint32_t, 5> const args{0u, 1u, 1u, 0u, 0u};
@@ -201,6 +213,8 @@ void Solver::writeDescriptors()
 	    {B_TILE_ARGS, &tileArgs_}, {B_TILE_SEED, &tileSeed_}, {B_SOIL, &soil_}, {B_GW, &gw_},
 	    {B_GW_AUX, &gwAux_},       {B_DIAG_GW, &diagGw_},  {B_SRC_ZONES, &srcZones_}, {B_CHRONO, &chrono_},
 	    {B_SRC_RATES, &srcRates_}, {B_SRC_CUM, &srcCum_}, {B_PROFILE_CELLS, &profileCells_}, {B_PROFILE_OUT, &profileOut_},
+	    {B_FACE_BCS, &faceBcs_},   {B_FACE_LIST, &faceList_}, {B_RECORD, &record_}, {B_FACE_CELL, &faceCell_},
+	    {B_MASS_CARRY, &massCarry_}, {B_BRIDGE, &bridge_},
 	}};
 	std::array<vk::DescriptorBufferInfo, B_COUNT> infos;
 	std::array<vk::WriteDescriptorSet, B_COUNT>   writes;
@@ -250,6 +264,7 @@ void Solver::reset(CaseData const &data)
 	ctx_.oneShot([&](vk::raii::CommandBuffer &cb) {
 		cb.fillBuffer(srcCum_.handle(), 0, vk::WholeSize, 0);
 		cb.fillBuffer(scalars_.handle(), 0, vk::WholeSize, 0);
+		cb.fillBuffer(massCarry_.handle(), 0, vk::WholeSize, 0);
 		cb.fillBuffer(tileWet_.handle(), 0, vk::WholeSize, ~0u);        // no step count: reduceSmax stamps the wet tiles
 	});
 	for (auto &r : readback_)
@@ -306,10 +321,27 @@ void Solver::uploadTileSeeds(CaseData const &data)
 				if (uint32_t z = data.zoneMask[data.index(i, j)]; z >= 1 && z <= data.zones.size() && z <= MAX_ZONES)
 					if (auto kind = data.zones[z - 1].kind; kind == ZoneKind::Source || kind == ZoneKind::Level)
 						mark(i, j);
+	// faces with a weak condition: both cells touching the face, so the face is always "live" (see solver.slang)
+	for (auto const &f : data.faceBcs)
+		for (uint32_t face : f.faces)
+		{
+			uint32_t cell = faceCell(face);
+			if (cell >= cells())
+				continue;
+			uint32_t i = cell / ny_, j = cell % ny_;
+			mark(i, j);
+			switch (faceSide(face))
+			{
+			case SIDE_WEST: if (i > 0) mark(i - 1, j); break;
+			case SIDE_EAST: if (i + 1 < nx_) mark(i + 1, j); break;
+			case SIDE_SOUTH: if (j > 0) mark(i, j - 1); break;
+			case SIDE_NORTH: if (j + 1 < ny_) mark(i, j + 1); break;
+			}
+		}
 	for (int s = 0; s < 4; ++s)
 	{
-		if (data.bc[s].kind == BcKind::Wall)
-			continue;
+		if (data.bc[s].kind == BcKind::Wall || data.bc[s].kind == BcKind::Free)
+			continue;        // nothing enters through these sides: the tiles wake up when water reaches them
 		if (s < 2)
 			for (uint32_t j = 0; j < ny_; ++j)
 				mark(s == 0 ? 0 : nx_ - 1, j);
@@ -337,12 +369,137 @@ void Solver::configure(CaseData const &data)
 		}
 
 	int passes = std::clamp(data.drain_passes, 0, MAX_DRAIN_PASSES);
-	if (data.scheme != schemeName_ || passes != drainPasses_)
+	if (data.scheme != schemeName_ || passes != drainPasses_ || faceCount_ != recordedFaceCount_)
 	{
-		scheme_      = scheme(data.scheme);
-		schemeName_  = data.scheme;
-		drainPasses_ = passes;
+		scheme_            = scheme(data.scheme);
+		schemeName_        = data.scheme;
+		drainPasses_       = passes;
+		recordedFaceCount_ = faceCount_;
 		recordStep();
+	}
+}
+
+void Solver::enableRecording(bool on, bool halfPrecision)
+{
+	if (on == recordOn_ && (!on || halfPrecision == recordHalf_))
+		return;
+	ctx_.device.waitIdle();
+	recordHalf_ = halfPrecision;
+	vk::DeviceSize words = on ? recordWordsPerCell() * cells() + tileCount() : 1;
+	record_   = vkc::Buffer::storage(ctx_, words * sizeof(uint32_t), "record");
+	recordOn_ = on;
+	writeDescriptors();
+	// new descriptors invalidate every command buffer that bound the set: the step and the readbacks
+	if (nx_ > 0 && !schemeName_.empty())
+	{
+		recordStep();
+		for (uint32_t s = 0; s < kReadbackSlots; ++s)
+			recordReadback(s);
+	}
+}
+
+// pack kernel over the grid, then the snapshot and the scalars copied into `dst` (the frame's fence covers it)
+void Solver::recordSnapshot(vk::raii::CommandBuffer const &cb, vk::Buffer dst) const
+{
+	if (!recordOn_)
+		return;
+	cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipelineLayout_, 0, *set_, nullptr);
+	vkc::memoryBarrier(cb, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite,
+	                   vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
+	dispatchGrid(cb, recordHalf_ ? Kernel::PackRecord16 : Kernel::PackRecord32);
+	vkc::computeToTransfer(cb);
+	vk::DeviceSize packed = (recordWordsPerCell() * cells() + tileCount()) * sizeof(uint32_t);
+	cb.copyBuffer(record_.handle(), dst, vk::BufferCopy{.srcOffset = 0, .dstOffset = 0, .size = packed});
+	cb.copyBuffer(scalars_.handle(), dst, vk::BufferCopy{.srcOffset = 0, .dstOffset = packed, .size = S_COUNT * sizeof(uint32_t)});
+	vkc::memoryBarrier(cb, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+	                   vk::PipelineStageFlagBits2::eHost, vk::AccessFlagBits2::eHostRead);
+}
+
+// Groups table + face list (count, then group << 28 | cell * 4 + side), zmin of each group over its cells
+void Solver::uploadFaceBcs(CaseData const &data)
+{
+	ctx_.device.waitIdle();
+	if (cells() >= MAX_FACE_BC_CELLS)
+		throw std::runtime_error("Solver::uploadFaceBcs: grid too large for the face encoding");
+	std::array<FaceBc, MAX_FACE_BC> table{};
+	std::vector<uint32_t>           list{0u};
+	size_t const                    ng = std::min<size_t>(data.faceBcs.size(), MAX_FACE_BC);
+	for (size_t g = 0; g < ng; ++g)
+	{
+		auto const &f = data.faceBcs[g];
+		table[g].kind   = static_cast<uint32_t>(f.kind);
+		table[g].value  = static_cast<float>(f.value);
+		table[g].offset = static_cast<uint32_t>(list.size() - 1);
+		float zmin      = std::numeric_limits<float>::infinity();
+		for (uint32_t face : f.faces)
+		{
+			uint32_t cell = faceCell(face);
+			if (cell >= cells())
+				continue;
+			list.push_back((static_cast<uint32_t>(g) << FACE_LIST_GROUP_SHIFT) | face);
+			zmin = std::min(zmin, data.zb[cell]);
+		}
+		table[g].count = static_cast<uint32_t>(list.size() - 1) - table[g].offset;
+		table[g].zmin  = std::isfinite(zmin) ? zmin : 0.0f;
+	}
+	list[0]     = static_cast<uint32_t>(list.size() - 1);
+	faceGroups_ = static_cast<uint32_t>(ng);
+	faceCount_  = list[0];
+	faceList_   = vkc::Buffer::storage(ctx_, list.size() * sizeof(uint32_t), "face_list");
+	faceList_.upload(ctx_, list.data(), list.size() * sizeof(uint32_t));
+	// per cell: group + 1 of each of its 4 faces (5 bits per side), for the boundary balance
+	if (faceCount_ > 0)
+	{
+		std::vector<uint32_t> perCell(cells(), 0u);
+		for (size_t k = 1; k < list.size(); ++k)
+		{
+			uint32_t group = list[k] >> FACE_LIST_GROUP_SHIFT;
+			uint32_t face  = list[k] & ((1u << FACE_LIST_GROUP_SHIFT) - 1u);
+			uint32_t shift = 5 * static_cast<uint32_t>(faceSide(face));
+			perCell[faceCell(face)] = (perCell[faceCell(face)] & ~(31u << shift)) | ((group + 1) << shift);
+		}
+		faceCell_ = vkc::Buffer::storage(ctx_, perCell.size() * sizeof(uint32_t), "face_cell");
+		faceCell_.upload(ctx_, perCell.data(), perCell.size() * sizeof(uint32_t));
+	}
+	else
+	{
+		faceCell_ = vkc::Buffer::storage(ctx_, sizeof(uint32_t), "face_cell");
+		ctx_.oneShot([&](vk::raii::CommandBuffer &cb) { cb.fillBuffer(faceCell_.handle(), 0, vk::WholeSize, 0); });
+	}
+	faceBcs_.upload(ctx_, table.data(), sizeof(table));
+	writeDescriptors();        // new list buffer
+	uploadTileSeeds(data);
+}
+
+// (soffit, deck top) per cell, NO_BRIDGE (1e30) where there is none; a single element without bridges
+void Solver::uploadBridges(CaseData const &data)
+{
+	ctx_.device.waitIdle();
+	if (data.hasBridges() && data.bridgeRoof.size() == cells())
+	{
+		std::vector<float> b(cells() * 2, 1e30f);
+		for (size_t k = 0; k < cells(); ++k)
+			if (!std::isnan(data.bridgeRoof[k]))
+			{
+				b[2 * k]     = data.bridgeRoof[k];
+				b[2 * k + 1] = data.bridgeDeck[k];
+			}
+		bridge_ = vkc::Buffer::storage(ctx_, b.size() * sizeof(float), "bridge");
+		bridge_.upload(ctx_, b.data(), b.size() * sizeof(float));
+	}
+	else
+	{
+		std::array<float, 2> none{1e30f, 1e30f};
+		bridge_ = vkc::Buffer::storage(ctx_, sizeof(none), "bridge");
+		bridge_.upload(ctx_, none.data(), sizeof(none));
+	}
+	writeDescriptors();
+	// new descriptors invalidate every command buffer that bound the set (none yet while loading)
+	if (*stepCmd_ && nx_ > 0 && !schemeName_.empty())
+	{
+		recordStep();
+		for (uint32_t s = 0; s < kReadbackSlots; ++s)
+			recordReadback(s);
 	}
 }
 
@@ -444,8 +601,21 @@ void Solver::recordStepCommands(vk::raii::CommandBuffer const &cb, Marker const 
 		dispatchActive(cb, Kernel::FluxY);
 		bind(cb, Kernel::BcFluxes);
 		cb.dispatch(4, 1, 1);        // one workgroup per side
+		if (faceCount_ > 0)
+		{
+			bind(cb, Kernel::FaceBcNorm);
+			cb.dispatch(faceGroups_, 1, 1);        // one workgroup per face group
+		}
 		vkc::computeBarrier(cb);
 		at("fluxes (flux_x, flux_y, bc_fluxes, finalize_dt)");
+		if (faceCount_ > 0)
+		{
+			// weak face conditions override the listed faces (fluxes + norms of the inflow groups are complete)
+			bind(cb, Kernel::FaceBcApply);
+			cb.dispatch(vkc::divUp(faceCount_, kFaceGroup), 1, 1);
+			vkc::computeBarrier(cb);
+			at("face_bc_apply");
+		}
 
 		// drain limiter: K Jacobi passes, each reading the factors of the previous one
 		for (uint32_t k = 0; k < passes; ++k)
@@ -464,6 +634,12 @@ void Solver::recordStepCommands(vk::raii::CommandBuffer const &cb, Marker const 
 		pc.pass    = passes;
 		pc.coef[0] = static_cast<float>(scheme_.stages[s].first);
 		pc.coef[1] = static_cast<float>(scheme_.stages[s].second);
+		// share of this stage's fluxes in the full step: Q^{n+1} - Q^n = sum_s w_s dt L(Q_s) with w_s the product
+		// of the b of stages s..S-1 (a first stage with a = 0 replaces the state: b counts as 1)
+		double w = 1.0;
+		for (int m = s; m < S; ++m)
+			w *= scheme_.stages[m].first == 0.0 ? 1.0 : scheme_.stages[m].second;
+		pc.coef[2] = static_cast<float>(w);
 		pushStage(cb, pc);
 		dispatchActive(cb, Kernel::EulerStage);
 		if (s + 1 < S || mark || gwOn_ || srcOn_)
@@ -598,7 +774,21 @@ static SolverScalars decodeScalars(uint32_t const *s)
 	for (uint32_t p = 0; p < MAX_PROBES; ++p)
 		r.probes[p] = {f(S_PROBES + 4 * p), f(S_PROBES + 4 * p + 1), f(S_PROBES + 4 * p + 2), f(S_PROBES + 4 * p + 3),
 		               f(S_GW_PROBES + 2 * p), f(S_GW_PROBES + 2 * p + 1)};
+	for (uint32_t g = 0; g < BOUNDARY_GROUPS; ++g)
+		r.boundaryVolume[g] = fixedVolume(s, S_BND_CUM + 2 * g);
+	for (uint32_t z = 0; z < MAX_ZONES; ++z)
+		r.zoneVolume[z] = fixedVolume(s, S_ZONE_CUM + 2 * z);
 	return r;
+}
+
+double SolverScalars::boundaryTotal() const
+{
+	double v = 0.0;
+	for (double b : boundaryVolume)
+		v += b;
+	for (double z : zoneVolume)
+		v += z;
+	return v;
 }
 
 void Solver::setProbes(std::vector<uint32_t> const &cells)

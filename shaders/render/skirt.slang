@@ -99,6 +99,63 @@ float4 skirtBedFrag(SoilVarying v) : SV_Target
     return float4(col, 1.0f);
 }
 
+// ---- raw cells (SCENE_BLOCKS): one flat-topped wall per perimeter cell, from corner to corner of its outer edge,
+// so the steps between neighbouring cells come for free (each wall is a full rectangle down to z_base)
+void block_edge(uint vid, out uint p, out uint i, out uint j, out float2 corner, out bool top, out float3 n)
+{
+    uint seg = vid / 6, c = vid % 6;        // (A,top) (A,bot) (B,bot) (A,top) (B,bot) (B,top)
+    uint4 r    = crop_rect();
+    uint  nper = 2 * ((r.z - r.x + 1) + (r.w - r.y + 1));
+    p = seg % nper;
+    perimeter(p, i, j, n);
+    bool useB = c == 2 || c == 4 || c == 5;
+    top       = c == 0 || c == 3 || c == 5;
+    float2 a, b;
+    if (n.z > 0.5f)       { a = float2(i, j);         b = float2(i + 1, j); }          // south edge
+    else if (n.x > 0.5f)  { a = float2(i + 1, j);     b = float2(i + 1, j + 1); }      // east
+    else if (n.z < -0.5f) { a = float2(i + 1, j + 1); b = float2(i, j + 1); }          // north
+    else                  { a = float2(i, j + 1);     b = float2(i, j); }              // west
+    corner = useB ? b : a;
+}
+
+[shader("vertex")]
+SoilVarying skirtBlockBedVert(uint vid : SV_VertexID)
+{
+    uint p, i, j; float2 c; bool top; float3 n;
+    block_edge(vid, p, i, j, c, top, n);
+    uint  k = idx(i, j);
+    float z = zb[k];
+    bool  gw_case = (P.flags & FLAG_GROUNDWATER) != 0;
+
+    SoilVarying o;
+    o.z     = top ? z : SC.z_base;
+    o.pos   = project(corner_pos(c.x, c.y, o.z));
+    o.zb    = z;
+    o.head  = gw_case ? min(gw_head(k), z) : SC.z_base - 1.0f;
+    o.zsub  = gw_case ? soil[k].w : SC.z_base - 1.0f;
+    o.shade = 0.55f + 0.45f * max(dot(n, SC.sun.xyz), 0.0f) + 0.1f;
+    o.along = (float(p) + (vid % 6 == 2 || vid % 6 == 4 || vid % 6 == 5 ? 1.0f : 0.0f)) * min(P.dx, P.dy);
+    return o;
+}
+
+[shader("vertex")]
+SkirtVarying skirtBlockWaterVert(uint vid : SV_VertexID)
+{
+    uint p, i, j; float2 c; bool top; float3 n;
+    block_edge(vid, p, i, j, c, top, n);
+    uint  k     = idx(i, j);
+    float z     = zb[k];
+    float h     = Q[k].x;
+    float eta   = z + (h > 1e-3f ? h : 0.0f);
+    float shade = 0.55f + 0.45f * max(dot(n, SC.sun.xyz), 0.0f) + 0.1f;
+
+    SkirtVarying o;
+    o.disp  = corner_pos(c.x, c.y, top ? eta : z);
+    o.pos   = project(o.disp);
+    o.color = top ? lerp(SHALLOW, DEEP, 0.4f) * shade : DEEP * shade;
+    return o;
+}
+
 [shader("vertex")]
 SkirtVarying skirtWaterVert(uint vid : SV_VertexID)
 {

@@ -22,17 +22,18 @@
   "crs": "EPSG:31370",
   "data": "data/zone_importee.npz",
   "drain_passes": 4,
-  "eta_0": 5.781440734863281,
+  "eta_0": 2.847789764404297,
+  "face_bc": [],
   "label": "zone_importee",
   "manning_n": 0.03,
   "origin": [
-    155100.0,
-    119396.0
+    236058.0,
+    144925.0
   ],
   "orthophoto": "data/zone_importee_ortho.png",
   "render": {
-    "depth_ref": 5.0,
-    "z_scale_0": 5.0
+    "depth_ref": 2.0,
+    "z_scale_0": 2.0
   },
   "scheme": "ssprk2",
   "sources": [
@@ -40,6 +41,6 @@
   ],
   "type": "imported",
   "vertical_datum": "DNG (approx. for foreign sources)",
-  "z_ref": 95.0,
+  "z_ref": 63.0,
   "zones": []
 }

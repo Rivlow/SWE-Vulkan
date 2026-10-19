@@ -9,6 +9,7 @@
 #include <vulkan/vulkan_raii.hpp>
 
 #include <array>
+#include <span>
 
 namespace swe {
 
@@ -31,11 +32,16 @@ struct RenderSettings
 	bool      gwContours = false;      // water table contour lines (groundwater cases)
 	float     gwContourStep = 0.1f;    // m
 	bool      gwXray = false;          // water table surface seen through the ground (groundwater cases)
+	bool      showBorders = true;      // boundary conditions drawn on the cells (always in the Conditions stage)
+	bool      blocks = false;          // raw cells: every cell a flat-topped column (no interpolation between centres)
 	// cut box: only the cells crop.x..crop.z, crop.y..crop.w are drawn, the walls (soil column) follow its sides
 	bool       cropOn = false;
 	glm::uvec4 crop{0, 0, 0, 0};
-	// selected cell rectangle (inclusive), none when i1 < i0
-	glm::uvec4 selection{1, 0, 0, 0};
+	// selected cells, one bit per cell (word k >> 5, bit k & 31); empty = none. Re-uploaded when the version changes.
+	std::span<uint32_t const> selectionBits;
+	uint64_t                  selectionVersion = 0;
+	glm::uvec2                hoverCell{~0u, ~0u};        // cell under the mouse (~0 = none)
+	uint32_t                  highlight = 0;              // HIGHLIGHT_* code (SceneParams.h)
 	// 3D view rectangle in pixels (the central area left free by the docked panels); empty = whole target
 	glm::vec4 viewport{0.0f};
 };
@@ -51,6 +57,8 @@ class Renderer
 
 	// Rebuilds the per-case resources (index buffer, base depth...). Call after Solver::load.
 	void setCase(CaseData const &data);
+	// Re-uploads the face conditions of the case (drawn on the cells with SCENE_BORDERS). Waits for the device.
+	void setFaceBcs(CaseData const &data);
 	// Orthophoto covering the whole domain (row 0 = north), or clears it (rgba = nullptr). Waits for the device.
 	void setOrthophoto(uint32_t width, uint32_t height, uint8_t const *rgba);
 	bool hasOrthophoto() const { return hasOrtho_; }
@@ -86,14 +94,19 @@ class Renderer
 	std::array<vkc::Buffer, kFrames>             sceneUbo_;
 
 	vk::raii::ShaderModule terrainModule_ = nullptr, waterModule_ = nullptr, skirtModule_ = nullptr, linesModule_ = nullptr;
-	vk::raii::Pipeline     terrain_ = nullptr, terrainWire_ = nullptr, water_ = nullptr, waterWire_ = nullptr;
+	vk::raii::Pipeline     terrain_ = nullptr, water_ = nullptr;
 	vk::raii::Pipeline     skirtBed_ = nullptr, skirtWater_ = nullptr, lines_ = nullptr, gwTable_ = nullptr;
+	// raw-cell mode: same fragment shaders, block vertex shaders (18 vertices per cell, per-cell skirt walls)
+	vk::raii::Pipeline     terrainBlocks_ = nullptr, waterBlocks_ = nullptr, skirtBedBlocks_ = nullptr, skirtWaterBlocks_ = nullptr;
 
 	vkc::Image   color_, depth_;
-	vkc::Buffer  indices_, outside_;
+	vkc::Buffer  indices_, outside_, faceFlags_;
+	std::array<vkc::Buffer, kFrames> selection_;        // host-visible selection bits, one per frame in flight
+	std::array<uint64_t, kFrames>    selectionVersion_{};
 	vkc::Texture ortho_, white_;
 	bool         hasOrtho_ = false;
 	void         writeOrthoDescriptors();
+	void         writeBuffer(uint32_t binding, uint32_t frame, vkc::Buffer const &buffer);
 	uint32_t    indexCount_ = 0;
 
 	// case-dependent scene constants

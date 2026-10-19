@@ -205,7 +205,7 @@ CaseData TerrainBuilder::toCase(ImportResult const &result, ImportRequest const 
 				}
 				if (!c.outside.empty() && c.outside[k])
 					continue;
-				c.h0[k] = std::max(level - c.zb[k], 0.0f);
+				c.h0[k] = depthForLevel(level, c.zb[k]);
 			}
 	return c;
 }

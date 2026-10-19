@@ -30,7 +30,8 @@ SolverParams buildSolverParams(CaseData const &c)
 	// first drop of water is resolved and the clock stays meaningful (no effect on the reference cases)
 	p.dt_max  = static_cast<float>(c.cfl * std::min(dx, dy) / std::sqrt(c.g * 0.05));
 	p.flags   = (c.zones.empty() ? 0u : FLAG_ZONES) | (c.manning_n > 0.0 ? FLAG_FRICTION : 0u) |
-	            (c.legacyInflow ? 0u : FLAG_EXACT_INFLOW);
+	            (c.legacyInflow ? 0u : FLAG_EXACT_INFLOW) | (c.legacyLimiter ? FLAG_LEGACY_LIMITER : 0u) |
+	            (c.reference ? FLAG_NO_CARRY : 0u);
 	// lowest bed point of each side: a dry inflow side feeds the cells near it (river channel)
 	auto sideMin = [&](int s) {
 		float m = std::numeric_limits<float>::infinity();
@@ -52,6 +53,11 @@ SolverParams buildSolverParams(CaseData const &c)
 	}
 	if (c.infiltration.active() || c.rain.active())
 		p.flags |= FLAG_SOURCES;
+	if (!c.faceBcs.empty())
+		p.flags |= FLAG_FACE_BC;
+	if (c.hasBridges())
+		p.flags |= FLAG_BRIDGE;
+	p.bridge_slot = static_cast<float>(c.bridgeSlot);
 	p.bc_fill = 0.5f;
 	for (int s = 0; s < 4; ++s)
 	{
