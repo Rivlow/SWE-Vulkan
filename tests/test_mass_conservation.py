@@ -33,6 +33,8 @@ def test_drain_test_limiter(run, passes):
 def test_drain_test_without_limiter_creates_mass(run):
     """Sanity check of the case: without the limiter h < 0 is clamped, which creates mass."""
     r = run("drain_test", steps=1000, drain=0)
+    r.plot.bars("clamp_mass", [("volume created", r.meta["volume"] - r.meta["volume0"], None), ("clamped cells", r.meta["clamp_cells"], None)],
+                title="Without the drain limiter: negative depths clamped to 0 create mass", ylabel="m3 / cells")
     assert r.meta["clamp_cells"] > 0
     assert r.meta["volume"] > r.meta["volume0"]
 
@@ -42,18 +44,19 @@ def test_lake_at_rest_closed(run):
     assert_mass(r, tol=1e-6)
 
 
-def test_cube_drop(run):
+def test_cube_drop(run, plot):
     """wolfgpu test_cube_drop: a column of water dropped in a dry pool, walls."""
     n = 118
     h = np.zeros((n, n))
     h[49:69, 49:69] = 2.0
     c = swetest.pool("cube_drop", n, n, 1.0, h=h)
     r = run(c, time=60.0, record_every=2.0)
+    plot.fields("final_depth", [("initial h (m)", c.h0), ("h at t = 60 s (m)", r.h)], extent=(0, n, 0, n), title="Column of water dropped in a dry pool")
     assert_mass(r, tol=1e-6, volume0=c.volume0())
 
 
 @pytest.mark.parametrize("scheme", SCHEMES)
-def test_sine_bed_sine_water(run, scheme):
+def test_sine_bed_sine_water(run, plot, scheme):
     """wolfgpu test_sine_ground_sine_water_3lanes: sinusoidal bed and free surface, wet and dry areas."""
     nx, ny, cell = 200, 3, 0.5
     x = swetest.centres(nx, cell)
@@ -62,10 +65,12 @@ def test_sine_bed_sine_water(run, scheme):
     h = np.maximum(eta[:, None] - zb, 0.0)
     c = swetest.pool("sine", nx, ny, cell, zb=zb, h=h, scheme=scheme)
     r = run(c, time=30.0, record_every=1.0)
+    plot.lines("sine", [x] * 3, [("bed", zb[:, 1], "aux"), ("initial surface", zb[:, 1] + c.h0[:, 1], "ref"), ("surface at t = 30 s", r.eta[:, 1], "num")],
+               title="Sinusoidal bed and surface, wet and dry areas", ylabel="elevation (m)")
     assert_mass(r, tol=1e-6, volume0=c.volume0())
 
 
-def test_rocky_bed_splash(run):
+def test_rocky_bed_splash(run, plot):
     """Random bed, a raised block of water: fronts over rough dry ground."""
     n = 96
     zb = swetest.rocky_bed(n, n, 0.5, seed=3)
@@ -73,6 +78,7 @@ def test_rocky_bed_splash(run):
     h[30:50, 30:50] = np.maximum(2.0 - zb[30:50, 30:50], 0.0)
     c = swetest.pool("rocky_splash", n, n, 1.0, zb=zb, h=h)
     r = run(c, time=40.0, record_every=2.0)
+    plot.fields("splash", [("bed zb (m)", zb), ("h at t = 40 s (m)", r.h), ("|q| (m2/s)", np.hypot(r.hu, r.hv))], title="Splash over a rough dry bed")
     assert_mass(r, tol=1e-6, volume0=c.volume0())
 
 
@@ -141,6 +147,9 @@ def test_active_tiles_bitwise(run, args):
     case, extra = args
     a = run(case, extra=extra, name="active")
     b = run(case, extra=extra, all_tiles=True, name="all")
+    a.plot.fields("tiles_difference", [("h active tiles (m)", a.h), ("bit difference: h active - h full grid", a.h - b.h)], symmetric=False,
+                  title="Active-tile scheme against the full grid (must be identical to the bit)",
+                  note=f"max |dQ| = {np.abs(a.Q.astype(np.float64) - b.Q).max():.1e}")
     assert np.array_equal(a.Q.view(np.uint32), b.Q.view(np.uint32))
 
 
@@ -152,6 +161,8 @@ def test_rain_volume(run):
     relative); what the surface received is checked exactly by test_surface_plus_aquifer."""
     r = run("rain_infiltration", steps=20000)
     swetest.assert_positive(r)
+    r.plot.bars("rain_volume", [("rain volume | table - swe |", abs(r.meta["rain_volume"] - 35.0 / 12.0), 1e-3 * 35.0 / 12.0)],
+                title=f"Rain volume: swe {r.meta['rain_volume']:.5f} m3, table {35.0 / 12.0:.5f} m3", ylabel="m3")
     assert abs(r.meta["rain_volume"] - 35.0 / 12.0) <= 1e-3 * 35.0 / 12.0
 
 
@@ -166,6 +177,9 @@ def test_surface_plus_aquifer(run, case, extra):
     m = r.meta
     total0 = m["volume0"] + m.get("gw_volume0", 0.0)
     total = m["volume"] + m.get("gw_volume", 0.0) - m.get("sources_net", 0.0)
+    r.plot.bars("surface_plus_aquifer", [("surface V0", m["volume0"], None), ("surface V", m["volume"], None), ("aquifer V0", m.get("gw_volume0", 0.0), None),
+                                         ("aquifer V", m.get("gw_volume", 0.0), None), ("|total - total0|", abs(total - total0), 1e-5 * max(total0, 1e-30))],
+                title="Surface + aquifer - inputs is conserved", ylabel="m3")
     assert abs(total - total0) <= 1e-5 * max(total0, 1e-30), f"{total0} -> {total}"
     if r.gw is not None:
         assert r.gw[..., 0].min() >= 0.0

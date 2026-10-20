@@ -26,11 +26,14 @@ sys.path.insert(0, str(ROOT / "tests"))
 import swepost  # noqa: E402
 import swerec  # noqa: E402
 import swetest  # noqa: E402
+import plots  # noqa: E402
 
 
 def pytest_addoption(parser):
     parser.addoption("--preset", default=os.environ.get("SWE_PRESET", "release"), help="build preset (build/<preset>/bin/swe.exe)")
     default_repo = Path(r"C:\Users\lucas\Dev\wolfgpu\Repository")
+    parser.addoption("--exe", default=os.environ.get("SWE_EXE"), help="swe executable (default: build/<preset>/bin/swe.exe)")
+    parser.addoption("--no-plots", action="store_true", default=False, help="do not write the PNG plots of the tests")
     parser.addoption("--wolfgpu", default=os.environ.get("WOLFGPU_REPO", str(default_repo) if default_repo.exists() else None),
                      help="wolfgpu repository for the comparison tests (its saved reference results)")
     parser.addoption("--wolfgpu-python", default=os.environ.get("WOLFGPU_PYTHON", r"C:\Users\lucas\miniconda3\envs\wolf_env\python.exe"),
@@ -43,6 +46,8 @@ def pytest_configure(config):
 
 @pytest.fixture(scope="session")
 def swe_exe(request):
+    if request.config.getoption("--exe"):
+        return Path(request.config.getoption("--exe"))
     preset = request.config.getoption("--preset")
     exe = ROOT / "build" / preset / "bin" / "swe.exe"
     if not exe.exists():
@@ -70,10 +75,17 @@ def workdir(request):
     return d
 
 
+@pytest.fixture
+def plot(request, workdir):
+    """Plotter writing PNGs to <workdir>/plots (tests/plots.py)."""
+    return plots.Plotter(workdir / "plots", enabled=not request.config.getoption("--no-plots"))
+
+
 class Run:
     """Result of a headless run: Q (nx, ny, 3), zb, meta.json, the recording (when asked) and the case."""
 
-    def __init__(self, dump, case=None, record=None):
+    def __init__(self, dump, case=None, record=None, plot=None):
+        self.plot = plot or plots.Plotter(Path(dump).parent / "plots", enabled=False)
         self.dump = Path(dump)
         self.Q = np.load(self.dump / "Q.npy")
         self.zb = np.load(self.dump / "zb.npy")
@@ -127,7 +139,7 @@ class Run:
 
 
 @pytest.fixture
-def run(swe_exe, workdir):
+def run(swe_exe, workdir, plot):
     """run(case, steps=..., time=..., scheme=None, drain=None, record_every=None, record_f16=False, all_tiles=False,
     extra=[], name=None) -> Run. `case` is a swetest.Case (written to <workdir>/assets) or the name of a case of
     assets/. The log of swe goes to <workdir>/<name>.log."""
@@ -164,6 +176,6 @@ def run(swe_exe, workdir):
         r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
         (workdir / f"{tag}.log").write_text(" ".join(cmd) + "\n\n" + r.stdout + r.stderr, encoding="utf-8")
         assert r.returncode == 0, f"swe failed ({r.returncode}):\n{' '.join(cmd)}\n{r.stdout}{r.stderr}"
-        return Run(dump, case if isinstance(case, swetest.Case) else None, record)
+        return Run(dump, case if isinstance(case, swetest.Case) else None, record, plot)
 
     return _run

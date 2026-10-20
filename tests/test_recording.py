@@ -5,9 +5,11 @@ import swepost
 import swerec
 
 
-def test_record_times_and_final_state(run):
+def test_record_times_and_final_state(run, plot):
     r = run("dam_break", time=1.0, record_every=0.1)
     t = np.asarray(r.rec.times)
+    plot.lines("record_times", np.arange(len(t)), [("record time", t, "num"), ("due: 0.1 k", 0.1 * np.arange(len(t)), "ref")], xlabel="record k", ylabel="t (s)",
+               title="Recording times: each record is the first state past a multiple of the interval", note="lateness (t_k - 0.1 k) is below one step")
     assert t[0] == 0.0
     assert len(r.rec) >= 10
     assert np.all(np.diff(t) > 0)
@@ -20,10 +22,14 @@ def test_record_times_and_final_state(run):
         assert np.array_equal(h, r.Q[..., 0]) and np.array_equal(qx, r.Q[..., 1]) and np.array_equal(qy, r.Q[..., 2])
 
 
-def test_record_f16_accuracy(run):
+def test_record_f16_accuracy(run, plot):
     a = run("dam_break", time=0.5, record_every=0.25, name="f32")
     b = run("dam_break", time=0.5, record_every=0.25, record_f16=True, name="f16")
     assert len(a.rec) == len(b.rec)
+    ha_, _, _ = a.rec.read(len(a.rec) - 1)
+    hb_, _, _ = b.rec.read(len(b.rec) - 1)
+    plot.fields("f16", [("h float32 (m)", ha_), ("h float16 - h float32 (m)", hb_ - ha_)], title="float16 recording: depth error (limit 5e-4 m)",
+                note=f"max |dh| = {np.abs(ha_ - hb_).max():.1e}")
     for k in range(len(a.rec)):
         ha, qxa, _ = a.rec.read(k)
         hb, qxb, _ = b.rec.read(k)
@@ -42,7 +48,7 @@ def test_record_dir(swe_exe, workdir):
     assert len(swerec.Recording(files[0])) >= 2
 
 
-def test_section_discharge_matches_inflow(run):
+def test_section_discharge_matches_inflow(run, plot):
     """Post-processing check: the discharge through a section is the imposed discharge once the flow is steady
     (uniform flow at normal depth started at equilibrium). swepost estimates it from the cell-centred unit
     discharges, not from the face mass fluxes the solver exchanges: the friction step and the first-order boundary
@@ -55,7 +61,9 @@ def test_section_discharge_matches_inflow(run):
                         bc={"west": ["inflow", q * ny * cell], "east": ["depth", hn]})
     r = run(c, time=200.0, record_every=50.0)
     for index in (1, nx // 2, nx - 1):
-        _, Q = swepost.section_discharge(r.rec, "x", index, 0, ny - 1)
+        tq, Q = swepost.section_discharge(r.rec, "x", index, 0, ny - 1)
+        plot.lines(f"section_{index}", tq, [(f"Q through face {index}", Q, "num"), ("imposed inflow", np.full_like(tq, q * ny * cell), "ref")], xlabel="t (s)",
+                   ylabel="Q (m3/s)", title=f"Discharge through a section estimated from the recording (face {index})", note="limit: 5e-3 relative")
         assert abs(Q[-1] - q * ny * cell) <= 5e-3 * q * ny * cell, f"face {index}: Q = {Q[-1]}"
     h = r.h[:, 1]
     assert np.abs(h - hn).max() <= 5e-3 * hn, f"normal depth {hn:.5f}, computed {h.min():.5f}..{h.max():.5f}"

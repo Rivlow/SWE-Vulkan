@@ -302,6 +302,7 @@ def assert_mass(run, tol=1e-6, volume0=None, stored=None, expected_added=None, a
         # about sqrt(N) float32 ulps of the volume); a closed domain stays far below that (1e-8 observed)
         tol = max(tol, 4.0 * np.sqrt(max(run.meta["steps"], 1)) * 2.0 ** -24)
         series_tol = max(series_tol or 0.0, tol)
+    run.plot.mass(run, err, tol, volume0, V, added, stored, series_tol)
     assert err <= tol, (f"mass not conserved: V = {V:.9g} m3, V0 = {volume0:.9g}, added by the boundaries/zones "
                         f"{added:+.9g} -> closure error {V - volume0 - added:+.3e} m3 ({err:.3e} relative > {tol:.1e})")
     if expected_added is not None:

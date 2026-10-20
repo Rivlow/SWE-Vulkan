@@ -32,6 +32,23 @@ def channel(name, h, q=0.0, roof=5.0, deck=6.0, manning=0.0, bed=None, scheme="s
     return c
 
 
+def profile_plot(r, c, name="profile", q=None, title="", note="", extra=()):
+    """Longitudinal section along the channel axis: bed, free / piezometric surface, soffit and deck of the bridge,
+    and the unit discharge (continuity: constant in steady state)."""
+    j = NY // 2
+    x = swetest.centres(NX, CELL)
+    roof, deck = c.bridge_arrays()
+    zb = r.zb[:, j].astype(np.float64)
+    curves = [("bed", zb, "aux"), ("water / piezometric surface", r.eta[:, j], "num"), ("soffit", roof[:, j], "ref"), ("deck top", deck[:, j], "wolf")]
+    curves += list(extra)
+    r.plot.lines(name, [x] * len(curves), curves, title=title, ylabel="elevation (m)", note=note,
+                 vlines=[(BRIDGE[0] * CELL, "bridge"), ((BRIDGE[2] + 1) * CELL, "")])
+    if q is not None:
+        r.plot.lines(name + "_discharge", x, [("hu (cell-centred)", r.hu[:, j], "num"), ("imposed q", np.full(NX, q), "ref")],
+                     title="Unit discharge along the channel (continuity)", ylabel="q (m2/s)",
+                     note="2e-3 q tolerance away from the deck ends, 1e-2 q on the 2 cells of each transition")
+
+
 def under(r, i0=BRIDGE[0], i1=BRIDGE[2]):
     return slice(i0, i1 + 1)
 
@@ -87,6 +104,7 @@ def test_pressurised_flow(run, manning):
     q = 5.0
     c = channel(f"pressure_{manning}", 6.0, q=q, roof=5.0, deck=6.5, manning=manning, up=q * NY * CELL, down=6.0)
     r = run(c, time=600.0, record_every=50.0)
+    profile_plot(r, c, q=q, title=f"Pressurised flow under the deck (Manning {manning}), steady state")
     assert_mass(r, tol=1e-5, stored=r.stored())
     h = r.h[:, NY // 2]
     assert np.all(h[under(r)] > 5.0), "the opening must run full"
@@ -120,6 +138,7 @@ def test_overtopping(run):
     q = 3.0
     c = channel("overtop", 7.0, q=q, roof=5.0, deck=6.0, manning=0.03, up=q * NY * CELL, down=7.0)
     r = run(c, time=600.0, record_every=50.0)
+    profile_plot(r, c, q=q, title="Overtopping: downstream level above the deck top")
     assert_mass(r, tol=1e-5, stored=r.stored())
     h = r.h[:, NY // 2]
     assert np.all(h[under(r)] > 6.0), "the water must cover the deck"
@@ -133,6 +152,10 @@ def test_rising_flood_through_all_regimes(run):
     q = 2.0
     c = channel("rising", 2.0, roof=4.0, deck=5.0, manning=0.03, up=q * NY * CELL)
     r = run(c, time=1500.0, record_every=25.0)
+    t_, h_ = r.rec.times, [r.rec.read(k)[0][30, NY // 2] for k in range(len(r.rec))]
+    r.plot.lines("rising", np.asarray(t_), [("depth under the deck", np.asarray(h_), "num"), ("soffit (4 m) minus bed", np.full(len(h_), 4.0), "ref"),
+                                             ("deck top (5 m)", np.full(len(h_), 5.0), "wolf")], xlabel="t (s)", ylabel="h (m)",
+                 title="Rising flood: free surface -> pressurised -> overtopping")
     assert_mass(r, tol=1e-6, stored=r.stored(), expected_added=lambda t: q * NY * CELL * t)
     assert r.h[under(r), NY // 2].max() > 5.0, "the flood must reach the overtopping regime"
     b = swepost.exact_balance(r.rec, r.stored())
@@ -173,6 +196,12 @@ def test_against_wolfgpu_reference(run, wolfgpu, manning):
     r = run(c, time=600.0)
     assert_mass(r, tol=1e-5, stored=r.stored())
     h, hu = r.h[:, ny // 2], r.hu[:, ny // 2]
+    xs = swetest.centres(nx, 1.0)
+    r.plot.lines("depth_vs_wolfgpu", xs, [("swe h", h, "num"), ("wolfgpu h", ref_h, "wolf")], title=f"Pressurised bridge (Manning {manning}): piezometric depth, swe vs wolfgpu",
+                 ylabel="h (m)", vlines=[(15, "bridge"), (35, "")],
+                 note=f"max |dh| = {np.abs(h - ref_h).max() * 1e3:.1f} mm (limit 20 mm); entrance drop swe {(h[12] - h[17]) * 1e3:.1f} mm, wolfgpu {(ref_h[12] - ref_h[17]) * 1e3:.1f} mm")
+    r.plot.lines("discharge_vs_wolfgpu", xs, [("swe hu", hu, "num"), ("wolfgpu qx", ref_q, "wolf")], title="Unit discharge, swe vs wolfgpu", ylabel="q (m2/s)",
+                 note=f"max |dq| (away from the ends) = {np.abs(hu[2:-2] - ref_q[2:-2]).max():.3f} m2/s (limit {2e-2 * q:.2f})")
     assert np.abs(hu[2:-2] - ref_q[2:-2]).max() <= 2e-2 * q
     drop, ref_drop = h[12] - h[17], ref_h[12] - ref_h[17]
     assert abs(drop - ref_drop) <= 0.15 * ref_drop, f"entrance drop {drop * 1e3:.1f} mm, wolfgpu {ref_drop * 1e3:.1f} mm"
@@ -189,11 +218,14 @@ def test_weir_deck_on_the_bed(run):
         {"label": "seuil", "z_roof": 0.0, "z_deck": 1.0, "rect": [24, 0, 25, NY - 1]}])
     c.bc["east"] = ["free"]
     r = run(c, time=800.0, record_every=50.0)
+    profile_plot(r, c, q=None, title="Deck on the bed = broad-crested weir")
     assert_mass(r, tol=1e-5, stored=r.stored())
     eta_up = r.eta[15, NY // 2]
     head = eta_up - 1.0 + (q / r.h[15, NY // 2]) ** 2 / (2 * swetest.G)
     q_weir = np.sqrt(swetest.G) * (2.0 / 3.0 * head) ** 1.5        # ideal discharge for that head
     cd = q / q_weir
+    r.plot.bars("weir_cd", [("Cd = q / q_ideal", cd, None)], title="Discharge coefficient of the weir (limits 0.8 .. 1.0)",
+                note=f"head {head:.3f} m above the crest, Cd = {cd:.3f}")
     assert 0.8 <= cd <= 1.0, f"upstream head {head:.3f} m: Cd = {cd:.3f}"
     # nothing below the crest passes: the weir cells hold no water under the deck (soffit on the bed)
     assert r.meta["boundary_volume"][1] < 0        # and it does flow out downstream

@@ -32,15 +32,23 @@ def test_uniform_flow_stays_uniform(run, axis, sign):
     assert_mass(r, tol=1e-6, volume0=c.volume0())
     q_n = r.hu if axis == "x" else r.hv
     q_t = r.hv if axis == "x" else r.hu
+    r.plot.bars("deviations", [("max |h - 5|", np.abs(r.h - 5.0).max(), 1e-6), ("max |q_n - q|", np.abs(q_n - sign * 1.0).max(), 1e-6),
+                               ("max |q_t| (must be 0)", np.abs(q_t).max(), None)],
+                title="Uniform flow after 2000 steps: departure from the initial state", ylabel="h (m) / q (m2/s)",
+                note="blue: measured (0 is drawn at the 1e-18 floor), red: limit. A uniform flow must not change.")
+    r.plot.lines("profile", np.arange(r.h.shape[0 if axis == "x" else 1]) + 0.5, [("h (mean across)", r.h.mean(axis=1 if axis == "x" else 0)),
+                 ("q normal (mean across)", q_n.mean(axis=1 if axis == "x" else 0) * sign)], title="Profile along the flow", xlabel="distance (m)")
     assert np.abs(r.h - 5.0).max() <= 1e-6
     assert np.abs(q_n - sign * 1.0).max() <= 1e-6
     assert np.abs(q_t).max() == 0.0
 
 
-def test_uniform_flow_x_y_symmetry(run):
+def test_uniform_flow_x_y_symmetry(run, plot):
     """The same flow along x and along y gives the same field (transposed)."""
     a = run(_uniform("sym_x", "x", 1), steps=1000, name="x")
     b = run(_uniform("sym_y", "y", 1), steps=1000, name="y")
+    plot.bars("symmetry", [("max |h_x - h_y^T|", np.abs(a.h - b.h.T).max(), 1e-6), ("max |hu_x - hv_y^T|", np.abs(a.hu - b.hv.T).max(), 1e-6)],
+              title="Same flow along x and along y: difference of the transposed fields", ylabel="difference")
     assert np.abs(a.h - b.h.T).max() <= 1e-6
     assert np.abs(a.hu - b.hv.T).max() <= 1e-6
 
@@ -63,6 +71,12 @@ def test_normal_depth(run, q, n, slope):
     assert_mass(r, tol=1e-5)
     # the first cells feel the inflow side (first-order boundary cell, observed +-1.5 % on the first 3 cells)
     h = r.h[5: nx // 3, 1]
+    x = swetest.centres(nx, cell)
+    r.plot.lines("normal_depth", x, [("swe h(x)", r.h[:, 1], "num"), ("normal depth hn", np.full(nx, hn), "ref")],
+                 title=f"Manning flow from 1.3 hn: steady depth against hn (q = {q}, n = {n}, S = {slope})", ylabel="h (m)",
+                 vlines=[(x[5], "checked zone"), (x[nx // 3 - 1], "")],
+                 note=f"checked zone: max |h - hn| = {np.abs(h - hn).max():.2e} m (limit {3e-4 * hn:.1e}); the bumps at the ends are the boundary cells")
+    r.plot.error("normal_depth_error", x[5: nx // 3], h - hn, tol=3e-4 * hn, title="|h - hn| on the checked zone")
     assert np.abs(h - hn).max() <= 3e-4 * hn, f"h_n = {hn:.5f}, h in [{h.min():.5f}, {h.max():.5f}]"
     # steady: the discharge leaving through the east side over the last interval equals the inflow
     b = swepost.exact_balance(r.rec)

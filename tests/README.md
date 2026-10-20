@@ -12,6 +12,12 @@ Chaque test écrit son cas dans `out/tests/<test>/assets` (type `imported` : JSO
 `Case`), lance `swe --headless --no-validation --dump ... [--record ...]` (fixture `run`, `tests/conftest.py`) et lit
 le dump et l'enregistrement (`tools/swerec.py`, `tools/swepost.py`). Le journal de chaque exécution est à côté.
 
+## Plots PNG
+
+Chaque test écrit ses figures dans `out/tests/<test>/plots/*.png` (fixture `plot`, `tests/plots.py`) : la grandeur
+mesurée (profil calculé / solution exacte, erreur ponctuelle contre sa tolérance, convergence en dx, fermeture de
+masse, écart à wolfgpu...). Un plot ne fait jamais échouer un test ; `--no-plots` les désactive.
+
 ## Masse d'abord
 
 `swetest.assert_mass` est appelée par presque tous les tests :

@@ -22,6 +22,12 @@ def assert_still(r, h0):
     """Same depths to the bit, zero discharges to the bit, mass."""
     assert_mass(r, tol=0.0) if r.meta.get("boundary_total", 0.0) == 0.0 else assert_mass(r, tol=1e-9)
     moved = np.abs(r.Q[..., 1:]).max()
+    dh_all = np.abs(r.Q[..., 0].astype(np.float64) - np.asarray(h0, dtype=np.float32).astype(np.float64))
+    r.plot.bars("still_water", [("max |q| (spurious current)", moved, None), ("max |h - h0|", dh_all.max(), None)],
+                title="Lake at rest: what moved (criterion: exactly 0, drawn at the 1e-18 floor)", ylabel="m2/s / m",
+                note="wolfgpu tolerates |q| < 1e-5 or sum|q| < 2e-4; here the bits must be identical")
+    r.plot.fields("setup", [("bed zb (m)", r.zb), ("initial depth h0 (m)", np.asarray(h0, dtype=np.float64)),
+                            ("final |q| (m2/s)", np.hypot(r.hu, r.hv))], title="Lake at rest: bed, water and final discharge (all zero)")
     assert moved == 0.0, f"spurious discharge up to {moved:.3e} m2/s"
     dh = np.abs(r.Q[..., 0].astype(np.float64) - np.asarray(h0, dtype=np.float32).astype(np.float64)).max()
     assert dh == 0.0, f"depth changed by up to {dh:.3e} m"
